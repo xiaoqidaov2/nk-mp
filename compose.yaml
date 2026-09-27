@@ -1,0 +1,71 @@
+name: nike-mp
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: nike_mp
+      POSTGRES_USER: nike_mp
+      POSTGRES_PASSWORD: nike_mp
+      TZ: Asia/Shanghai
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nike_mp -d nike_mp"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./apps/api
+    environment:
+      NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@db:5432/nike_mp
+      NIKE_MP_CREDENTIAL_KEY: ${NIKE_MP_CREDENTIAL_KEY:-}
+      TZ: Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./apps/api
+    environment:
+      NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@db:5432/nike_mp
+      NIKE_MP_CREDENTIAL_KEY: ${NIKE_MP_CREDENTIAL_KEY:-}
+      TZ: Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m app.worker
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ./apps/api
+    environment:
+      NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@db:5432/nike_mp
+      NIKE_MP_CREDENTIAL_KEY: ${NIKE_MP_CREDENTIAL_KEY:-}
+      TZ: Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m app.scheduler_main
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./apps/web
+    depends_on:
+      - api
+    ports:
+      - "5173:5173"
+    restart: unless-stopped
+
+volumes:
+  db-data:
