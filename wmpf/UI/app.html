@@ -1,0 +1,1339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kissya</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      /* 深邃太空主题 */
+      --bg-void: #04050a;
+      --bg-deep: #080b14;
+      --bg-surface: #0d1221;
+      --bg-elevated: #131929;
+      --bg-hover: #1a2135;
+
+      /* 极光霓虹色系 */
+      --aurora-cyan: #00f5d4;
+      --aurora-emerald: #00d9a5;
+      --aurora-violet: #a855f7;
+      --aurora-rose: #f472b6;
+      --aurora-amber: #fbbf24;
+      --aurora-sky: #38bdf8;
+
+      /* 功能色 */
+      --success: #10b981;
+      --success-glow: rgba(16, 185, 129, 0.4);
+      --warning: #f59e0b;
+      --warning-glow: rgba(245, 158, 11, 0.4);
+      --error: #ef4444;
+      --error-glow: rgba(239, 68, 68, 0.4);
+      --info: #00f5d4;
+      --info-glow: rgba(0, 245, 212, 0.4);
+
+      /* 文字色系 */
+      --text-bright: #f8fafc;
+      --text-primary: #e2e8f0;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+
+      /* 边框 */
+      --border-subtle: rgba(148, 163, 184, 0.08);
+      --border-default: rgba(148, 163, 184, 0.15);
+      --border-bright: rgba(148, 163, 184, 0.25);
+
+      /* Glow效果 */
+      --glow-cyan: 0 0 30px rgba(0, 245, 212, 0.3);
+      --glow-violet: 0 0 30px rgba(168, 85, 247, 0.3);
+      --glow-emerald: 0 0 30px rgba(0, 217, 165, 0.3);
+    }
+
+    html, body {
+      height: 100%;
+      width: 100%;
+      overflow-x: hidden;
+    }
+
+    body {
+      background: var(--bg-void);
+      color: var(--text-primary);
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      position: relative;
+    }
+
+    /* 动态背景 */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 100% 80% at 10% 0%, rgba(0, 245, 212, 0.06) 0%, transparent 50%),
+        radial-gradient(ellipse 80% 60% at 90% 10%, rgba(168, 85, 247, 0.05) 0%, transparent 50%),
+        radial-gradient(ellipse 60% 50% at 50% 90%, rgba(0, 217, 165, 0.04) 0%, transparent 50%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* 网格 */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+      background-size: 80px 80px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      width: 100%;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* Header */
+    header {
+      padding: 2.5rem 2rem 2rem;
+      border-bottom: 1px solid var(--border-subtle);
+      background: linear-gradient(180deg, rgba(8, 11, 20, 0.9) 0%, rgba(8, 11, 20, 0.6) 100%);
+      backdrop-filter: blur(20px);
+      position: relative;
+    }
+
+    header::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(0, 245, 212, 0.3), rgba(168, 85, 247, 0.3), transparent);
+    }
+
+    .header-content {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 2rem;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+    }
+
+    .brand-text h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, #ff6b6b 0%, #feca57 15%, #48dbfb 30%, var(--aurora-cyan) 45%, var(--aurora-emerald) 60%, var(--aurora-violet) 80%, var(--aurora-rose) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -0.5px;
+      margin-bottom: 0.25rem;
+    }
+
+    .brand-text p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      font-weight: 500;
+      letter-spacing: 0.5px;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: flex-end;
+      gap: 1.5rem;
+    }
+
+    .status-indicator {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 0.5rem;
+    }
+
+    .status-label {
+      font-size: 1.0rem;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      font-weight: 600;
+    }
+
+    .status-badge {
+      padding: 0.625rem 1.25rem;
+      border-radius: 14px;
+      font-size: 0.875rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      min-width: 120px;
+      justify-content: center;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      position: relative;
+    }
+
+    .status-dot::after {
+      content: '';
+      position: absolute;
+      inset: -4px;
+      border-radius: 50%;
+      background: inherit;
+      opacity: 0.4;
+      animation: ripple 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+
+    @keyframes ripple {
+      0% { transform: scale(1); opacity: 0.4; }
+      100% { transform: scale(2.5); opacity: 0; }
+    }
+
+    .status-idle {
+      background: rgba(100, 116, 139, 0.12);
+      color: var(--text-secondary);
+      border: 1px solid rgba(100, 116, 139, 0.2);
+    }
+
+    .status-idle .status-dot {
+      background: var(--text-muted);
+    }
+
+    .status-loading {
+      background: rgba(0, 245, 212, 0.1);
+      color: var(--aurora-cyan);
+      border: 1px solid rgba(0, 245, 212, 0.3);
+      box-shadow: 0 0 20px rgba(0, 245, 212, 0.15);
+    }
+
+    .status-loading .status-dot {
+      background: var(--aurora-cyan);
+    }
+
+    .status-running {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--aurora-emerald);
+      border: 1px solid rgba(0, 217, 165, 0.3);
+      box-shadow: 0 0 20px rgba(0, 217, 165, 0.15);
+    }
+
+    .status-running .status-dot {
+      background: var(--aurora-emerald);
+    }
+
+    .version-badge {
+      padding: 0.75rem 1.5rem;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(0, 245, 212, 0.08), rgba(168, 85, 247, 0.08));
+      border: 1px solid rgba(0, 245, 212, 0.2);
+      color: var(--aurora-cyan);
+      font-weight: 700;
+      font-size: 1rem;
+      letter-spacing: 0.5px;
+    }
+
+    /* Control Panel */
+    .control-panel {
+      padding: 1.75rem 2rem;
+      border-bottom: 1px solid var(--border-subtle);
+      background: rgba(8, 11, 20, 0.5);
+    }
+
+    .control-content {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: none;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.9375rem;
+      border-radius: 14px;
+      padding: 0.875rem 2rem;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      position: relative;
+      overflow: hidden;
+      letter-spacing: 0.3px;
+    }
+
+    button::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.15) 0%, transparent 50%);
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+
+    button:hover::before {
+      opacity: 1;
+    }
+
+    button:active {
+      transform: scale(0.96);
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--aurora-cyan), var(--aurora-emerald));
+      color: var(--bg-void);
+      box-shadow: 0 4px 20px rgba(0, 245, 212, 0.3);
+      font-weight: 700;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      box-shadow: 0 8px 30px rgba(0, 245, 212, 0.4);
+      transform: translateY(-2px);
+    }
+
+    .btn-stop {
+      background: linear-gradient(135deg, var(--aurora-amber), #f97316);
+      color: var(--bg-void);
+      box-shadow: 0 4px 20px rgba(251, 191, 36, 0.3);
+      font-weight: 700;
+    }
+
+    .btn-stop:hover:not(:disabled) {
+      box-shadow: 0 8px 30px rgba(251, 191, 36, 0.4);
+      transform: translateY(-2px);
+    }
+
+    .btn-secondary {
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border-default);
+    }
+
+    .btn-secondary:hover:not(:disabled) {
+      background: var(--bg-hover);
+      border-color: var(--border-bright);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+    }
+
+    .btn-accent {
+      background: linear-gradient(135deg, rgba(168, 85, 247, 0.15), rgba(244, 114, 182, 0.15));
+      color: var(--aurora-violet);
+      border: 1px solid rgba(168, 85, 247, 0.3);
+    }
+
+    .btn-accent:hover:not(:disabled) {
+      background: linear-gradient(135deg, rgba(168, 85, 247, 0.25), rgba(244, 114, 182, 0.25));
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(168, 85, 247, 0.25);
+    }
+
+    .btn-save {
+      background: linear-gradient(135deg, rgba(0, 217, 165, 0.15), rgba(16, 185, 129, 0.15));
+      color: var(--aurora-emerald);
+      border: 1px solid rgba(0, 217, 165, 0.3);
+    }
+
+    .btn-save:hover:not(:disabled) {
+      background: linear-gradient(135deg, rgba(0, 217, 165, 0.25), rgba(16, 185, 129, 0.25));
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(0, 217, 165, 0.25);
+    }
+
+    /* Main Content */
+    .main-content {
+      flex: 1;
+      padding: 2.5rem 2rem;
+      max-width: 1400px;
+      margin: 0 auto;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 2rem;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .section-title h2 {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--text-bright);
+      letter-spacing: -0.3px;
+    }
+
+    .section-title p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-top: 0.25rem;
+    }
+
+    /* Log Container */
+    .log-container {
+      flex: 1;
+      border-radius: 24px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 500px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,0.03),
+        0 25px 60px rgba(0, 0, 0, 0.5),
+        0 0 80px rgba(0, 245, 212, 0.03);
+    }
+
+    .log-header {
+      padding: 1.25rem 2rem;
+      background: var(--bg-surface);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .log-header-left {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .log-status-icon {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--aurora-cyan);
+      box-shadow: var(--glow-cyan);
+      animation: pulseGlow 2s ease-in-out infinite;
+    }
+
+    @keyframes pulseGlow {
+      0%, 100% { box-shadow: 0 0 15px rgba(0, 245, 212, 0.5); }
+      50% { box-shadow: 0 0 5px rgba(0, 245, 212, 0.3); }
+    }
+
+    .log-info {
+      display: flex;
+      flex-direction: column;
+      gap: 0.125rem;
+    }
+
+    .log-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .log-subtitle {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .log-count {
+      padding: 0.5rem 1rem;
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(0, 245, 212, 0.1), rgba(168, 85, 247, 0.1));
+      color: var(--aurora-cyan);
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      border: 1px solid rgba(0, 245, 212, 0.2);
+    }
+
+    .log-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem 2rem;
+      font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Monaco', monospace;
+      font-size: 0.875rem;
+      line-height: 1.8;
+    }
+
+    .log-content::-webkit-scrollbar {
+      width: 10px;
+    }
+
+    .log-content::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .log-content::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, rgba(0, 245, 212, 0.4), rgba(168, 85, 247, 0.4));
+      border-radius: 5px;
+    }
+
+    .log-content::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(180deg, rgba(0, 245, 212, 0.6), rgba(168, 85, 247, 0.6));
+    }
+
+    .log-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      flex-direction: column;
+      gap: 1rem;
+      color: var(--text-muted);
+    }
+
+    .log-empty-icon {
+      font-size: 4rem;
+      opacity: 0.4;
+      animation: float 3s ease-in-out infinite;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-10px); }
+    }
+
+    .log-empty-text {
+      font-size: 1rem;
+      font-weight: 500;
+    }
+
+    .log-entry {
+      padding: 0.875rem 1.25rem;
+      margin-bottom: 0.5rem;
+      border-left: 4px solid;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.02);
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .log-entry:hover {
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .log-system {
+      color: var(--text-muted);
+      border-left-color: var(--text-muted);
+      font-style: italic;
+    }
+
+    .log-guide {
+      color: #c4b5fd;
+      border-left-color: #a78bfa;
+      background: rgba(167, 139, 250, 0.05);
+    }
+
+    .log-success {
+      color: var(--aurora-emerald);
+      border-left-color: var(--aurora-emerald);
+      background: rgba(0, 217, 165, 0.05);
+    }
+
+    .log-warning {
+      color: var(--aurora-amber);
+      border-left-color: var(--aurora-amber);
+      background: rgba(251, 191, 36, 0.05);
+    }
+
+    .log-info {
+      color: var(--aurora-cyan);
+      border-left-color: var(--aurora-cyan);
+      background: rgba(0, 245, 212, 0.05);
+    }
+
+    .log-error {
+      color: var(--aurora-rose);
+      border-left-color: var(--aurora-rose);
+      background: rgba(244, 114, 182, 0.05);
+    }
+
+    .log-init {
+      color: var(--aurora-sky);
+      border-left-color: var(--aurora-sky);
+      background: rgba(56, 189, 248, 0.05);
+    }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(4, 5, 10, 0.85);
+      backdrop-filter: blur(12px);
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+      animation: fadeIn 0.3s ease;
+    }
+
+    .modal-overlay.active {
+      display: flex;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .modal-content {
+      width: 100%;
+      max-width: 700px;
+      border-radius: 28px;
+      overflow: hidden;
+      background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-deep) 100%);
+      border: 1px solid var(--border-default);
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,0.05),
+        0 30px 80px rgba(0, 0, 0, 0.6),
+        0 0 100px rgba(0, 245, 212, 0.05);
+      animation: modalSlide 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+
+    @keyframes modalSlide {
+      from {
+        transform: scale(0.9) translateY(40px);
+        opacity: 0;
+      }
+      to {
+        transform: scale(1) translateY(0);
+        opacity: 1;
+      }
+    }
+
+    .modal-header {
+      padding: 2rem;
+      background: linear-gradient(135deg, rgba(0, 245, 212, 0.08), rgba(168, 85, 247, 0.08));
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .modal-title {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .modal-title-icon {
+      font-size: 1.5rem;
+    }
+
+    .modal-title h3 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--aurora-cyan), var(--aurora-violet));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .modal-close {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-secondary);
+      font-size: 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s;
+      padding: 0;
+      border: 1px solid var(--border-subtle);
+    }
+
+    .modal-close:hover {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--aurora-rose);
+      transform: rotate(90deg);
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+
+    .btn-refresh {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      background: rgba(0, 245, 212, 0.08);
+      color: var(--aurora-cyan);
+      font-size: 1.35rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s;
+      padding: 0;
+      border: 1px solid rgba(0, 245, 212, 0.2);
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .btn-refresh:hover {
+      background: rgba(0, 245, 212, 0.18);
+      border-color: rgba(0, 245, 212, 0.4);
+      transform: rotate(180deg);
+    }
+
+    .btn-refresh.spinning {
+      animation: spin 0.6s linear;
+    }
+
+    .modal-body {
+      max-height: 450px;
+      overflow-y: auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .modal-body::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .modal-body::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .modal-body::-webkit-scrollbar-thumb {
+      background: rgba(0, 245, 212, 0.3);
+      border-radius: 4px;
+    }
+
+    .target-item {
+      padding: 1.5rem;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-subtle);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .target-item:hover {
+      background: rgba(0, 245, 212, 0.08);
+      border-color: rgba(0, 245, 212, 0.3);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 30px rgba(0, 245, 212, 0.1);
+    }
+
+    .target-item:active {
+      transform: translateY(0);
+    }
+
+    .target-left {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .target-avatar {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, var(--aurora-cyan), var(--aurora-violet));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+      box-shadow: 0 4px 15px rgba(0, 245, 212, 0.2);
+    }
+
+    .target-info h4 {
+      color: var(--text-bright);
+      font-weight: 600;
+      font-size: 1rem;
+      margin-bottom: 0.25rem;
+    }
+
+    .target-status {
+      font-size: 0.8125rem;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .target-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .target-status.ready {
+      color: var(--text-muted);
+    }
+
+    .target-status.ready .target-status-dot {
+      background: var(--text-muted);
+    }
+
+    .target-status.connected {
+      color: var(--aurora-emerald);
+    }
+
+    .target-status.connected .target-status-dot {
+      background: var(--aurora-emerald);
+      box-shadow: 0 0 10px var(--success-glow);
+    }
+
+    .target-status.busy {
+      color: var(--aurora-amber);
+    }
+
+    .target-status.busy .target-status-dot {
+      background: var(--aurora-amber);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    .target-icon {
+      font-size: 1.5rem;
+      color: var(--aurora-emerald);
+      transition: all 0.3s;
+    }
+
+    .target-item:hover .target-icon {
+      color: var(--aurora-cyan);
+      transform: translateX(4px);
+    }
+
+    .modal-footer {
+      padding: 1.5rem 2rem;
+      background: rgba(0, 0, 0, 0.2);
+      border-top: 1px solid var(--border-subtle);
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      padding: 1rem 1.75rem;
+      border-radius: 16px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-default);
+      color: var(--text-primary);
+      font-weight: 600;
+      font-size: 0.9375rem;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+      z-index: 200;
+      transform: translateY(120px);
+      opacity: 0;
+      transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .toast.show {
+      transform: translateY(0);
+      opacity: 1;
+    }
+
+    .toast.success {
+      border-color: rgba(0, 217, 165, 0.4);
+      background: linear-gradient(135deg, var(--bg-elevated), rgba(0, 217, 165, 0.1));
+    }
+
+    .toast.success .toast-icon {
+      color: var(--aurora-emerald);
+    }
+
+    .toast-icon {
+      font-size: 1.25rem;
+    }
+
+    /* 响应式 */
+    @media (max-width: 768px) {
+      header {
+        padding: 1.5rem 1rem;
+      }
+
+      .header-content {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 1.5rem;
+      }
+
+      .brand-text h1 {
+        font-size: 2rem;
+      }
+
+      .header-actions {
+        width: 100%;
+        justify-content: space-between;
+      }
+
+      .control-panel {
+        padding: 1.5rem 1rem;
+      }
+
+      .button-group {
+        gap: 0.75rem;
+      }
+
+      button {
+        padding: 0.75rem 1.5rem;
+        font-size: 0.875rem;
+      }
+
+      .main-content {
+        padding: 1.5rem 1rem;
+      }
+
+      .section-title h2 {
+        font-size: 1.5rem;
+      }
+
+      .modal-overlay {
+        padding: 1rem;
+      }
+
+      .modal-header {
+        padding: 1.5rem;
+      }
+
+      .modal-title h3 {
+        font-size: 1.25rem;
+      }
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="header-content">
+        <div class="brand">
+          <div class="brand-text">
+            <h1>小程序和网页调试工具-kiss</h1>
+            <p style="color:#c4b5fd;">先打开小程序建立调试会话，然后点"可用目标"可选择要调试的H5页面</p>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <div class="status-indicator">
+            <div class="status-label">反馈→: <a href="#" onclick="require('electron').shell.openExternal('https://github.com/Bai-Ye-Yi/WMPFDebugger-kiss/issues');return false;" style="color:var(--aurora-cyan);text-decoration:none;cursor:pointer;">Kissya</a></div>
+            <div id="statusBadge" class="status-badge status-idle">
+              <div class="status-dot"></div>
+              <span id="statusText">未运行</span>
+            </div>
+          </div>
+          <div class="version-badge">v5.2</div>
+        </div>
+      </div>
+    </header>
+
+    <div class="control-panel">
+      <div class="control-content">
+        <div class="button-group">
+          <button id="startBtn" class="btn-primary">启动调试器</button>
+          <button id="stopBtn" class="btn-stop" disabled>停止调试器</button>
+          <button id="clearBtn" class="btn-secondary">清空日志</button>
+          <button id="saveBtn" class="btn-save">保存日志</button>
+          <button id="targetsBtn" class="btn-accent">可用目标</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="main-content">
+      <div class="log-container">
+        <div class="log-header">
+          <div class="log-header-left">
+            <div class="log-status-icon"></div>
+            <div class="log-info">
+              <div class="log-title">控制台输出</div>
+            </div>
+          </div>
+          <div class="log-header-right" style="display:flex;align-items:center;gap:1rem;">
+            <a href="#" onclick="require('electron').shell.openExternal('https://github.com/Bai-Ye-Yi/WMPFDebugger-kiss');return false;" style="color:var(--aurora-cyan);text-decoration:none;font-size:0.8rem;font-weight:600;">本项目GitHub地址</a>
+            <select id="logLevelFilter" style="background:var(--bg-elevated);color:var(--text-primary);border:1px solid var(--border-default);border-radius:10px;padding:0.4rem 0.75rem;font-family:inherit;font-size:0.8rem;font-weight:600;cursor:pointer;outline:none;">
+              <option value="important">仅提醒和报错</option>
+              <option value="all">全部日志</option>
+            </select>
+            <div class="log-count"><span id="logCount">1</span> 条记录</div>
+          </div>
+        </div>
+
+        <div id="logContent" class="log-content">
+          <div class="log-entry log-guide">[指南] 1. 点击「启动调试器」，等待日志显示 Frida 已就绪</div>
+          <div class="log-entry log-guide">[指南] 2. 打开小程序，调试窗口会自动弹出；如果没有自动弹出，关闭小程序重新打开，或查看日志排查原因</div>
+          <div class="log-entry log-guide">[指南] 3. 如需调试 H5 网页，先通过小程序进入调试会话，然后打开目标网页，点击「可用目标」选择要调试的页面</div>
+          <div class="log-entry log-guide">[指南] 4. 小程序及其调试窗口不要关闭，可以最小化到后台，否则已连接的 H5 网页调试也会断开</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-icon">🎯</span>
+          <h3>可用调试目标</h3>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.75rem;">
+          <button class="btn-refresh" id="modalRefreshBtn" title="刷新列表">&#x21bb;</button>
+          <button class="modal-close" id="modalCloseBtn">×</button>
+        </div>
+      </div>
+
+      <div id="modalBody" class="modal-body"></div>
+
+      <div class="modal-footer">
+        <button id="modalFooterBtn" class="btn-secondary">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast">
+    <span class="toast-icon">✓</span>
+    <span id="toastMessage"></span>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    const state = {
+      status: 'idle',
+      logs: [
+        { text: '[指南] 1. 点击「启动调试器」，等待日志显示 Frida 已就绪', type: 'guide' },
+        { text: '[指南] 2. 打开小程序，调试窗口会自动弹出；如果没有自动弹出，关闭小程序重新打开，或查看日志排查原因', type: 'guide' },
+        { text: '[指南] 3. 如需调试 H5 网页，先通过小程序进入调试会话，然后打开目标网页，点击「可用目标」选择要调试的页面', type: 'guide' },
+        { text: '[指南] 4. 小程序及其调试窗口不要关闭，可以最小化到后台，否则已连接的 H5 网页调试也会断开', type: 'guide' }
+      ],
+      logLevel: 'important',
+      startupDone: false
+    };
+
+    const elements = {
+      startBtn: document.getElementById('startBtn'),
+      stopBtn: document.getElementById('stopBtn'),
+      clearBtn: document.getElementById('clearBtn'),
+      saveBtn: document.getElementById('saveBtn'),
+      targetsBtn: document.getElementById('targetsBtn'),
+      statusBadge: document.getElementById('statusBadge'),
+      statusText: document.getElementById('statusText'),
+      logContent: document.getElementById('logContent'),
+      logCount: document.getElementById('logCount'),
+      modal: document.getElementById('modal'),
+      modalBody: document.getElementById('modalBody'),
+      modalCloseBtn: document.getElementById('modalCloseBtn'),
+      modalFooterBtn: document.getElementById('modalFooterBtn'),
+      modalRefreshBtn: document.getElementById('modalRefreshBtn'),
+      toast: document.getElementById('toast'),
+      toastMessage: document.getElementById('toastMessage'),
+      logLevelFilter: document.getElementById('logLevelFilter')
+    };
+
+    function formatTime() {
+      return new Date().toLocaleTimeString('zh-CN', {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+    }
+
+    function getLogFilename() {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      return `log_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.txt`;
+    }
+
+    function showToast(message, type = 'success') {
+      elements.toastMessage.textContent = message;
+      elements.toast.className = `toast ${type} show`;
+      setTimeout(() => {
+        elements.toast.classList.remove('show');
+      }, 3500);
+    }
+
+    function saveLogs() {
+      if (state.logs.length === 0) {
+        showToast('没有日志可保存', 'warning');
+        return;
+      }
+
+      const logText = state.logs.map(log => log.text).join('\n');
+      const filename = getLogFilename();
+
+      const blob = new Blob([logText], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      showToast(`日志已保存: ${filename}`);
+    }
+
+    function addLog(text, type = 'system') {
+      if (state.logLevel === 'important' && type === 'info' && !state.startupDone) {
+        type = 'init';
+      }
+      state.logs.push({ text, type });
+      updateLogs();
+    }
+
+    function updateLogs() {
+      elements.logContent.innerHTML = '';
+
+      const visibleLogs = state.logLevel === 'all'
+        ? state.logs
+        : state.logs.filter(log => log.type !== 'info');
+
+      if (visibleLogs.length === 0) {
+        elements.logContent.innerHTML = `
+          <div class="log-empty">
+            <div class="log-empty-icon">📋</div>
+            <div class="log-empty-text">暂无日志记录</div>
+          </div>
+        `;
+      } else {
+        visibleLogs.forEach((log) => {
+          const div = document.createElement('div');
+          div.className = `log-entry log-${log.type}`;
+          div.textContent = log.text;
+          elements.logContent.appendChild(div);
+        });
+
+        elements.logContent.scrollTop = elements.logContent.scrollHeight;
+      }
+
+      elements.logCount.textContent = visibleLogs.length;
+    }
+
+    function updateStatus() {
+      const statusMap = {
+        idle: { text: '未运行', class: 'status-idle' },
+        loading: { text: '加载中', class: 'status-loading' },
+        running: { text: '运行中', class: 'status-running' }
+      };
+
+      const current = statusMap[state.status];
+      elements.statusText.textContent = current.text;
+      elements.statusBadge.className = `status-badge ${current.class}`;
+
+      elements.startBtn.disabled = state.status !== 'idle';
+      elements.stopBtn.disabled = state.status === 'idle';
+    }
+
+    // 真实 IPC 调用 - 启动调试器
+    function startDebugger() {
+      if (state.status !== 'idle') return;
+
+      state.status = 'loading';
+      updateStatus();
+      addLog(`[${formatTime()}] 正在初始化调试环境`, 'info');
+
+      // 真实调用后端
+      ipcRenderer.send('start-server');
+    }
+
+    // 真实 IPC 调用 - 停止调试器
+    function stopDebugger() {
+      if (state.status !== 'running') return;
+
+      addLog(`[${formatTime()}] 正在停止调试器`, 'warning');
+      ipcRenderer.send('stop-server');
+    }
+
+    // 真实 IPC 调用 - 打开 DevTools
+    function openDevTools() {
+      ipcRenderer.send('open-devtools');
+    }
+
+    // 真实 IPC 调用 - 获取目标列表
+    function openTargets() {
+      elements.modalBody.innerHTML = `
+        <div class="loading-state">
+          <div class="spinner"></div>
+          <p>正在加载可用目标</p>
+        </div>
+      `;
+      elements.modal.classList.add('active');
+      ipcRenderer.send('list-targets');
+    }
+
+    // 真实 IPC 调用 - 附加到目标
+    function selectTarget(targetId, targetTitle) {
+      ipcRenderer.send('attach-to-target', targetId, targetTitle);
+      closeModal();
+    }
+
+    function closeModal() {
+      elements.modal.classList.remove('active');
+    }
+
+    // 渲染真实目标列表
+    function renderTargets(targets) {
+      if (!targets || targets.length === 0) {
+        elements.modalBody.innerHTML = `
+          <div class="empty-state">
+            <p>未找到可调试目标，请先打开一个小程序</p>
+          </div>
+        `;
+        return;
+      }
+
+      const icons = { page: '📄', webview: '🌐', iframe: '📑', other: '📱' };
+      const statusLabels = { ready: '就绪', connected: '已连接', busy: '忙碌' };
+
+      elements.modalBody.innerHTML = targets.map((t, index) => `
+        <button class="target-item" onclick="selectTarget('${t.targetId}', '${(t.title || '无标题').replace(/'/g, "\\'")}')">
+          <div class="target-left">
+            <div class="target-avatar">${icons[t.type] || icons.other}</div>
+            <div class="target-info">
+              <h4>${t.title || '无标题'}</h4>
+              <div class="target-status ${t.attached ? 'connected' : 'ready'}">
+                <div class="target-status-dot"></div>
+                ${t.attached ? '已附加' : statusLabels[t.type] || '就绪'}
+              </div>
+            </div>
+          </div>
+          <div class="target-icon">→</div>
+        </button>
+      `).join('');
+    }
+
+    // IPC 事件监听 - 真实后端通信
+    ipcRenderer.on('server-status', (e, data) => {
+      if (data.running && state.status === 'loading') {
+        state.status = 'running';
+        state.startupDone = true;
+        updateStatus();
+        addLog(`[${formatTime()}] ✓ 调试器启动成功`, 'success');
+      } else if (!data.running) {
+        state.status = 'idle';
+        state.startupDone = false;
+        updateStatus();
+        addLog(`[${formatTime()}] ✓ 调试器已停止`, 'warning');
+      }
+    });
+
+    ipcRenderer.on('log-message', (e, data) => {
+      addLog(`[${data.timestamp || formatTime()}] ${data.message}`, data.type);
+    });
+
+    ipcRenderer.on('targets-list', (e, data) => {
+      renderTargets(data.targets);
+    });
+
+    ipcRenderer.on('debugger-started', (e, data) => {
+      state.status = 'running';
+      updateStatus();
+      addLog(`[${formatTime()}] ✓ 调试器启动成功`, 'success');
+    });
+
+    ipcRenderer.on('debugger-stopped', (e, data) => {
+      state.status = 'idle';
+      updateStatus();
+      addLog(`[${formatTime()}] ✓ 调试器已停止`, 'warning');
+    });
+
+    ipcRenderer.on('devtools-opened', (e, data) => {
+      addLog(`[${formatTime()}] DevTools 已打开: ${data.title || '未知'}`, 'info');
+    });
+
+    ipcRenderer.on('target-attached', (e, data) => {
+      addLog(`[${formatTime()}] ✓ 已附加到: ${data.title || '未知目标'}`, 'success');
+      // 刷新目标列表
+      ipcRenderer.send('list-targets');
+    });
+
+    ipcRenderer.on('error', (e, data) => {
+      addLog(`[${formatTime()}] 错误: ${data.message}`, 'error');
+      state.status = 'idle';
+      updateStatus();
+    });
+
+    // 事件绑定
+    elements.startBtn.addEventListener('click', startDebugger);
+    elements.stopBtn.addEventListener('click', stopDebugger);
+    elements.clearBtn.addEventListener('click', () => {
+      state.logs = [];
+      addLog(`[${formatTime()}] 日志已清空`, 'info');
+    });
+    elements.saveBtn.addEventListener('click', saveLogs);
+    elements.targetsBtn.addEventListener('click', openTargets);
+    elements.logLevelFilter.addEventListener('change', () => {
+      state.logLevel = elements.logLevelFilter.value;
+      updateLogs();
+    });
+    elements.modalCloseBtn.addEventListener('click', closeModal);
+    elements.modalFooterBtn.addEventListener('click', closeModal);
+    elements.modalRefreshBtn.addEventListener('click', () => {
+      elements.modalRefreshBtn.classList.add('spinning');
+      elements.modalBody.innerHTML = `
+        <div class="loading-state">
+          <div class="spinner"></div>
+          <p>正在刷新目标列表</p>
+        </div>
+      `;
+      ipcRenderer.send('list-targets');
+      setTimeout(() => { elements.modalRefreshBtn.classList.remove('spinning'); }, 600);
+    });
+
+    elements.modal.addEventListener('click', (e) => {
+      if (e.target === elements.modal) closeModal();
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && elements.modal.classList.contains('active')) {
+        closeModal();
+      }
+    });
+
+    updateStatus();
+    updateLogs();
+  </script>
+</body>
+</html>

@@ -1,0 +1,75 @@
+# ---- Credentials and session material (never commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# ---- Local watchlist ----
+watch.txt
+
+# ---- Root-level generated data, dumps and captures ----
+/*.json
+!/all_stores.json
+!/*.example.json
+/*.txt
+!/.gitattributes
+/*.log
+/*.db
+/*.sqlite3
+/*.xml
+/*.html
+/*.png
+/*.jpg
+/*.jpeg
+/*.pdf
+/*.sh
+/*.js.tmp
+/*.tmp
+/state*.json
+/new_arrivals_*.json
+/gtin_cache.json
+/oracle_*.json
+/probe_*.json
+/scan_*.json
+/storehome_*.json
+/thread_*.json
+
+# ---- Extracted reference artifacts ----
+unpacked/
+WACloud.js/
+WAServiceMainContext.js/
+*.wxapkg
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- Node ----
+node_modules/
+dist/
+build/
+.vite/
+coverage/
+
+# ---- Editors and OS ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- Local scratch ----
+.tmp-patches/
+*.tmp
+
+# ---- Runtime logs ----
+*.log

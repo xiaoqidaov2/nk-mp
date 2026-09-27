@@ -1,0 +1,35 @@
+{
+  "name": "wmpf-debugger-kiss",
+  "version": "5.2.0",
+  "description": "WeChat Mini Program and Browser F12 Debugger",
+  "main": "UI/main.js",
+  "license": "GPL-2.0-only",
+  "author": "evi0s",
+  "bin": {
+    "wmpf-cli": "dist/cli.js"
+  },
+  "dependencies": {
+    "frida": "^17.3.2",
+    "protobufjs": "^7.5.4",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/ws": "^8.18.1",
+    "electron": "^31.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  },
+  "scripts": {
+    "build": "tsc && npm run copy-files",
+    "copy-files": "xcopy src\\third-party dist\\third-party /E /I /Y",
+    "start": "node dist/index.js",
+    "cli": "ts-node src/cli.ts",
+    "ui": "electron UI/main.js",
+    "dev": "ts-node src/index.ts",
+    "list-targets": "ts-node src/cli.ts list",
+    "attach-target": "ts-node src/cli.ts auto-attach",
+    "watch-targets": "ts-node src/cli.ts watch",
+    "postinstall": "npm run build"
+  }
+}

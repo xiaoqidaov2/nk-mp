@@ -1,0 +1,17 @@
+{
+  "Version": 25715,
+  "LoadStartHookOffset": "0x2D450F0",
+  "LoadStartHookMode": "disabled",
+  "CDPFilterHookOffset": "0x39F5310",
+  "SceneOffsets": [
+    0,
+    0,
+    0
+  ],
+  "ScenePath": {
+    "pointerOffsets": [
+      0
+    ],
+    "sceneOffset": 0
+  }
+}
