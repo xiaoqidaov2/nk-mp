@@ -20,7 +20,7 @@ from app.nike.client import NikeClient
 from app.services import quota as quota_module
 from app.services.quota import QuotaGuard
 
-from .helpers import make_tenant
+from .helpers import login, make_tenant, make_user
 
 
 @pytest.fixture
@@ -152,3 +152,18 @@ def test_client_counts_every_attempt_including_retries(tenants) -> None:
     assert batch.trusted is True
     with SessionLocal() as db:
         assert db.execute(select(PlatformUsageDaily)).scalar_one().transactions == 3
+
+
+def test_dashboard_reports_total_transactions(client) -> None:
+    """The overview shows availability + price consumption from one bucket."""
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        make_user(db, tenant, email="dash@example.com")
+        day = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        db.add(UsageDaily(tenant_id=tenant.id, day=day, review_requests=3, price_requests=17))
+        db.commit()
+
+    login(client, "dash@example.com")
+    body = client.get("/api/v1/dashboard").json()
+    assert body["review_requests_today"] == 20
+    assert body["daily_review_budget"] == 5000

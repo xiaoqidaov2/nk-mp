@@ -117,6 +117,8 @@ def get_dashboard(
             str(credential["status"]) if credential else CredentialStatus.NEEDS_AUTHORIZATION.value
         ),
         credential_expires_at=credential.get("access_expires_at") if credential else None,
-        review_requests_today=int(usage_row.review_requests) if usage_row else 0,
+        review_requests_today=(
+            int(usage_row.review_requests) + int(usage_row.price_requests) if usage_row else 0
+        ),
         daily_review_budget=tenant.daily_review_budget,
     )

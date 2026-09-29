@@ -55,7 +55,7 @@ export function DashboardPage() {
             {credentialTag(data.credential_status)}
             <FreshnessBadge checkedAt={data.last_checked_at} />
             <span style={{ color: "#4b5563" }}>
-              今日审核请求 {data.review_requests_today} / {data.daily_review_budget}
+              今日上游请求 {data.review_requests_today} / {data.daily_review_budget}
             </span>
           </Space>
           {(data.failed_jobs > 0 || data.credential_status === "NEEDS_AUTHORIZATION") && (
