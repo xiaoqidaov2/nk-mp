@@ -32,6 +32,11 @@ docker compose exec api python -m app.cli bootstrap \
 docker compose exec api python -m app.cli import-credential \
   --access-token-file /srv/../jwt_latest.txt
 
+# 只拿到 refresh token（如 mp_refresh.txt）时也可导入：
+# 首次使用时自动换取 access token，并在轮换后继续保存新 refresh token
+docker compose exec api python -m app.cli import-credential \
+  --refresh-token-file /srv/../mp_refresh.txt
+
 # 同步全国门店清单
 docker compose exec api python -m app.cli sync-stores
 docker compose exec api python -m app.cli add-style DN3707-202

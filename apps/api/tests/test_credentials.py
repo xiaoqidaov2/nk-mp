@@ -18,7 +18,7 @@ from app.nike.client import NikeClient
 from app.nike.errors import ErrorCode, ScanError
 from app.security import encrypt_secret
 from app.services import credentials as credentials_module
-from app.services.credentials import CredentialService
+from app.services.credentials import CredentialNotConfigured, CredentialService
 
 from .conftest import make_jwt
 
@@ -234,3 +234,36 @@ def test_refresh_without_new_token_bounds_retries(settings, monkeypatch) -> None
         client.review(["g0"], region_id="NIKE0S001")
     assert excinfo.value.code == ErrorCode.AUTH_REQUIRED
     assert len(requests) == 1
+
+
+def _refresh_only_record() -> Credential:
+    return Credential(
+        account_key="default",
+        client_id="client",
+        access_token_enc="",
+        refresh_token_enc=encrypt_secret("refresh-token"),
+        status=CredentialStatus.ACTIVE.value,
+        access_expires_at=None,
+        last_error="",
+    )
+
+
+def test_refresh_only_import_bootstraps_access_token(settings, monkeypatch) -> None:
+    """Only mp_refresh.txt is needed: the first access token comes from refresh."""
+    new_token = make_jwt(3600)
+    calls = _post_ok(monkeypatch, access=new_token, refresh="rt-2")
+    session = _FakeSession(_refresh_only_record())
+    service = CredentialService(settings, session)
+    assert service.access_token() == new_token
+    assert len(calls) == 1
+    assert session.commits >= 1
+
+
+def test_refresh_only_import_fails_clearly_when_refresh_fails(settings, monkeypatch) -> None:
+    def failing_post(*_args, **_kwargs):  # noqa: ANN001
+        raise httpx.ConnectError("oauth unreachable")
+
+    monkeypatch.setattr(credentials_module.httpx, "post", failing_post)
+    service = CredentialService(settings, _FakeSession(_refresh_only_record()))
+    with pytest.raises(CredentialNotConfigured):
+        service.access_token()

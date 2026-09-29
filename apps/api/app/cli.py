@@ -56,11 +56,15 @@ def cmd_init_tenant(args: argparse.Namespace) -> int:
 
 def cmd_import_credential(args: argparse.Namespace) -> int:
     settings = get_settings()
-    access_token = _read(args.access_token_file)
-    if not access_token:
-        print(f"no access token found in {args.access_token_file}", file=sys.stderr)
-        return 1
+    access_token = _read(args.access_token_file, required=False)
     refresh_token = _read(args.refresh_token_file, required=False)
+    if not access_token and not refresh_token:
+        print(
+            "no access or refresh token found "
+            f"({args.access_token_file}, {args.refresh_token_file})",
+            file=sys.stderr,
+        )
+        return 1
     with _session() as db:
         CredentialService(settings, db).store_tokens(
             access_token, refresh_token, client_id=settings.oauth_client_id

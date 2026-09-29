@@ -86,8 +86,19 @@ class CredentialService:
         returned without another refresh.
         """
         record = self.get_record(account_key)
-        if record is None or not record.access_token_enc:
+        if record is None:
             raise CredentialNotConfigured("no credential stored; run the import command")
+        if not record.access_token_enc:
+            # Refresh-only import (common when only mp_refresh.txt is at
+            # hand): bootstrap the first access token from the stored refresh
+            # token instead of refusing to start.
+            if self.try_refresh(account_key):
+                bootstrapped = self._stored_token(account_key, fallback="")
+                if bootstrapped:
+                    return bootstrapped
+            raise CredentialNotConfigured(
+                "no access token stored and refresh did not succeed; re-import the credential"
+            )
         token = decrypt_secret(record.access_token_enc)
 
         if rejected_token is not None:
