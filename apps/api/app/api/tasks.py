@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, require_write
-from app.models import MonitorTask, User
+from app.models import MonitorTask, Store, Style, User
 from app.schemas import TaskIn, TaskOut, TaskUpdate
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -20,6 +20,7 @@ def _to_out(task: MonitorTask) -> TaskOut:
         name=task.name,
         store_codes=list(task.store_codes or []),
         style_codes=list(task.style_codes or []),
+        all_stores=bool(task.all_stores) or not (task.store_codes or []),
         cadence_seconds=task.cadence_seconds,
         is_active=task.is_active,
         notify_on_restock=task.notify_on_restock,
@@ -63,13 +64,31 @@ def create_task(
     db: Session = Depends(get_db),
     user: User = Depends(require_write),
 ) -> TaskOut:
-    if not payload.store_codes or not payload.style_codes:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "请至少选择一家门店和一个货号")
+    if not payload.style_codes:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "请至少提供一个货号")
+    store_codes = list(payload.store_codes)
+    if store_codes:
+        known = set(
+            db.execute(select(Store.store_code).where(Store.store_code.in_(store_codes))).scalars()
+        )
+        unknown = [code for code in store_codes if code not in known]
+        if unknown:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"以下门店不存在：{'、'.join(unknown[:5])}",
+            )
+    for code in payload.style_codes:
+        existing = db.execute(
+            select(Style).where(Style.style_code == code)
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(Style(style_code=code, title=code))
     task = MonitorTask(
         tenant_id=user.tenant_id,
         name=payload.name.strip(),
-        store_codes=payload.store_codes,
+        store_codes=store_codes,
         style_codes=payload.style_codes,
+        all_stores=not store_codes,
         cadence_seconds=payload.cadence_seconds,
         is_active=payload.is_active,
         notify_on_restock=payload.notify_on_restock,

@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     scheduler_interval_seconds: int = 30
     default_cadence_seconds: int = 1800
     daily_review_budget: int = 60000
+    quota_hourly_cap: int = 900
+    quota_hourly_slow_line: int = 600
+    baseline_max_gap_seconds: int = 7 * 24 * 3600
+    credential_refresh_cooldown_seconds: int = 60
 
 
 @lru_cache

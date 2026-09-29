@@ -1,10 +1,19 @@
-"""Access-token lifecycle with a single-flight refresh guard."""
+"""Access-token lifecycle with single-flight refresh and independent persistence.
+
+A refresh is serialised per account: an in-process lock avoids duplicate
+refreshes inside one worker and a ``SELECT ... FOR UPDATE`` row lock
+serialises across worker processes. Rotated credentials are committed
+immediately, independently of the surrounding job transaction, so a crash
+after a successful upstream rotation can never roll back the stored token.
+"""
 
 from __future__ import annotations
 
 import base64
 import json
-import time
+import logging
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -16,6 +25,20 @@ from app.models import Credential, CredentialStatus
 from app.security import decrypt_secret, encrypt_secret
 
 REFRESH_MARGIN_SECONDS = 300
+
+logger = logging.getLogger("nike_mp.credentials")
+
+_locks_guard = threading.Lock()
+_locks: dict[str, threading.Lock] = {}
+
+
+def _lock_for(account_key: str) -> threading.Lock:
+    with _locks_guard:
+        lock = _locks.get(account_key)
+        if lock is None:
+            lock = threading.Lock()
+            _locks[account_key] = lock
+        return lock
 
 
 class CredentialNotConfigured(RuntimeError):
@@ -49,35 +72,93 @@ class CredentialService:
             stmt = stmt.with_for_update()
         return self.session.execute(stmt).scalar_one_or_none()
 
-    def access_token(self, account_key: str = "default") -> str:
+    def token_provider(self, account_key: str = "default") -> Callable[[str | None], str]:
+        """Return a callback suitable for ``NikeClient.token_provider``."""
+        return lambda rejected: self.access_token(account_key, rejected_token=rejected)
+
+    def access_token(self, account_key: str = "default", rejected_token: str | None = None) -> str:
+        """Return a usable access token.
+
+        ``rejected_token`` is the credential the upstream just rejected with a
+        401. When it still matches the stored token the refresh is forced: a
+        rejected credential must be rotated even if its local expiry has not
+        been reached. If another worker already rotated it, the fresh token is
+        returned without another refresh.
+        """
         record = self.get_record(account_key)
         if record is None or not record.access_token_enc:
             raise CredentialNotConfigured("no credential stored; run the import command")
         token = decrypt_secret(record.access_token_enc)
+
+        if rejected_token is not None:
+            if token != rejected_token:
+                return token
+            if self.try_refresh(account_key, force=True, expected_token=token):
+                return self._stored_token(account_key, fallback=token)
+            return token
+
         expires_at = record.access_expires_at
         margin = timedelta(seconds=REFRESH_MARGIN_SECONDS)
         if (
             expires_at is not None
             and expires_at - margin < datetime.now(UTC)
-            and self.try_refresh(account_key)
+            and self.try_refresh(account_key, expected_token=token)
         ):
-            refreshed = self.get_record(account_key)
-            if refreshed is not None:
-                token = decrypt_secret(refreshed.access_token_enc)
+            return self._stored_token(account_key, fallback=token)
         return token
 
-    def try_refresh(self, account_key: str = "default") -> bool:
-        """Refresh the access token once, serialised across workers."""
+    def _stored_token(self, account_key: str, fallback: str) -> str:
+        record = self.get_record(account_key)
+        if record is None or not record.access_token_enc:
+            return fallback
+        return decrypt_secret(record.access_token_enc)
+
+    def try_refresh(
+        self,
+        account_key: str = "default",
+        *,
+        force: bool = False,
+        expected_token: str | None = None,
+    ) -> bool:
+        """Refresh the access token once, serialised across workers.
+
+        Returns True when the stored credential is rotated (or was rotated by
+        another worker); False when the refresh could not be performed. The
+        outcome is committed immediately so credential state survives a job
+        rollback.
+        """
+        with _lock_for(account_key):
+            return self._refresh_locked(account_key, force=force, expected_token=expected_token)
+
+    def _refresh_locked(self, account_key: str, *, force: bool, expected_token: str | None) -> bool:
         record = self.get_record(account_key, for_update=True)
         if record is None or not record.refresh_token_enc:
             self._mark_needs_authorization(record, "refresh token missing")
+            self.session.commit()
             return False
+
         now = datetime.now(UTC)
-        if record.access_expires_at and record.access_expires_at - timedelta(
-            seconds=REFRESH_MARGIN_SECONDS
-        ) > now:
-            # Another worker refreshed while this one waited for the lock.
+        if force:
+            current = decrypt_secret(record.access_token_enc) if record.access_token_enc else ""
+            if expected_token is not None and current != expected_token:
+                # Another worker refreshed while this one waited for the lock.
+                return True
+        elif (
+            record.access_expires_at
+            and record.access_expires_at - timedelta(seconds=REFRESH_MARGIN_SECONDS) > now
+        ):
             return True
+
+        cooldown = self.settings.credential_refresh_cooldown_seconds
+        if (
+            cooldown > 0
+            and record.last_attempt_at is not None
+            and record.status == CredentialStatus.NEEDS_AUTHORIZATION.value
+            and (now - record.last_attempt_at).total_seconds() < cooldown
+        ):
+            return False
+
+        record.last_attempt_at = now
         refresh_token = decrypt_secret(record.refresh_token_enc)
         try:
             response = httpx.post(
@@ -98,11 +179,13 @@ class CredentialService:
             payload = response.json()
         except Exception as exc:  # noqa: BLE001 - any failure means "needs authorization"
             self._mark_needs_authorization(record, str(exc)[:280])
+            self.session.commit()
             return False
 
         access_token = payload.get("access_token")
         if not access_token:
             self._mark_needs_authorization(record, "token endpoint returned no access_token")
+            self.session.commit()
             return False
         record.access_token_enc = encrypt_secret(access_token)
         rotated = payload.get("refresh_token")
@@ -112,7 +195,10 @@ class CredentialService:
         record.last_refreshed_at = datetime.now(UTC)
         record.status = CredentialStatus.ACTIVE.value
         record.last_error = ""
-        self.session.flush()
+        # Commit independently of the surrounding job: once the upstream has
+        # rotated the refresh token, the new pair must not be lost to a job
+        # rollback.
+        self.session.commit()
         return True
 
     def store_tokens(
@@ -172,7 +258,3 @@ class CredentialService:
         record.last_error = message
         record.updated_at = datetime.now(UTC)
         self.session.flush()
-
-
-def monotonic() -> float:
-    return time.monotonic()

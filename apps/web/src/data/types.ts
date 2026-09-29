@@ -38,6 +38,7 @@ export interface MonitorTask {
   name: string;
   store_codes: string[];
   style_codes: string[];
+  all_stores: boolean;
   cadence_seconds: number;
   is_active: boolean;
   notify_on_restock: boolean;
@@ -52,6 +53,7 @@ export interface MonitorTask {
 
 export interface ScanJob {
   id: string;
+  task_id: string | null;
   kind: string;
   status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "PARTIAL" | "FAILED" | "CANCELLED";
   store_codes: string[];
@@ -108,7 +110,13 @@ export interface Matrix {
 
 export interface ChangeEvent {
   id: number;
-  event_type: "RESTOCK" | "SOLD_OUT" | "PRICE_CHANGE" | "NEW_ARRIVAL_AT_STORE" | "SCAN_FAILED";
+  event_type:
+    | "RESTOCK"
+    | "SOLD_OUT"
+    | "PRICE_CHANGE"
+    | "NEW_ARRIVAL_AT_STORE"
+    | "SCAN_FAILED"
+    | "STRUCTURE_CHANGED";
   store_code: string;
   store_name: string;
   style_code: string;

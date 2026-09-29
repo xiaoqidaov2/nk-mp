@@ -1,10 +1,27 @@
 const CSRF_HEADER = "X-CSRF-Token";
-const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const CSRF_COOKIE = "nike_mp_csrf";
+const MUTATING: Record<string, true> = {
+  POST: true,
+  PUT: true,
+  PATCH: true,
+  DELETE: true,
+};
 
 let csrfToken = "";
 
 export function setCsrfToken(token: string): void {
   csrfToken = token;
+}
+
+function readCsrfCookie(): string {
+  const prefix = `${CSRF_COOKIE}=`;
+  for (const part of document.cookie.split(";")) {
+    const item = part.trim();
+    if (item.startsWith(prefix)) {
+      return decodeURIComponent(item.slice(prefix.length));
+    }
+  }
+  return "";
 }
 
 export class ApiError extends Error {
@@ -42,8 +59,13 @@ export async function apiRequest<T>(
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  if (MUTATING.has(method) && csrfToken) {
-    headers.set(CSRF_HEADER, csrfToken);
+  if (MUTATING[method]) {
+    // The login response carries the CSRF token, but a page refresh loses
+    // module state; the readable cookie set at login is the durable fallback.
+    const token = csrfToken || readCsrfCookie();
+    if (token) {
+      headers.set(CSRF_HEADER, token);
+    }
   }
 
   const response = await fetch(`/api/v1${path}`, {

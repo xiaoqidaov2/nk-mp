@@ -30,14 +30,19 @@ class NikeClient:
         self,
         settings: Settings,
         access_token: str,
-        token_provider: Callable[[], str] | None = None,
+        token_provider: Callable[[str | None], str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        transport: httpx.BaseTransport | None = None,
+        transaction_listener: Callable[[str], bool] | None = None,
     ) -> None:
         self.settings = settings
         self._access_token = access_token
         self._token_provider = token_provider
         self._sleep = sleep
-        self._client = httpx.Client(http2=True, timeout=30.0, follow_redirects=False)
+        self._client = httpx.Client(
+            http2=True, timeout=30.0, follow_redirects=False, transport=transport
+        )
+        self.transaction_listener = transaction_listener
 
     def close(self) -> None:
         self._client.close()
@@ -73,11 +78,13 @@ class NikeClient:
         region_id: str = "",
         body: Any | None = None,
         authorized: bool = True,
+        quota_kind: str = "",
     ) -> httpx.Response:
         attempts = 0
         auth_retries = 0
         response: httpx.Response | None = None
         while attempts < self.settings.request_retry_limit:
+            self._consume_transaction(quota_kind)
             try:
                 response = self._client.request(
                     method,
@@ -91,11 +98,17 @@ class NikeClient:
                     raise NikeTransportError(str(exc)) from exc
                 self._sleep(1.5 + attempts)
                 continue
-            if response.status_code == 401 and authorized and auth_retries < 2:
-                if self._token_provider is None:
+            if response.status_code == 401 and authorized:
+                if auth_retries >= 2 or self._token_provider is None:
                     raise ScanError(ErrorCode.AUTH_REQUIRED, "access token rejected")
                 auth_retries += 1
-                self._access_token = self._token_provider()
+                rejected = self._access_token
+                refreshed = self._token_provider(rejected)
+                if not refreshed or refreshed == rejected:
+                    # The credential could not be rotated; retrying with the
+                    # same token would only burn the remaining budget.
+                    raise ScanError(ErrorCode.AUTH_REQUIRED, "token refresh did not rotate the credential")
+                self._access_token = refreshed
                 continue
             if response.status_code == 405 and b"data-spm" in response.content:
                 attempts += 1
@@ -113,6 +126,15 @@ class NikeClient:
                 continue
             return response
         raise NikeTransportError("request retries exhausted")
+
+    def _consume_transaction(self, quota_kind: str) -> None:
+        if not quota_kind or self.transaction_listener is None:
+            return
+        if not self.transaction_listener(quota_kind):
+            raise ScanError(
+                ErrorCode.BUDGET_EXHAUSTED,
+                "upstream transaction budget exhausted",
+            )
 
     # --------------------------------------------------------------- catalog
 
@@ -244,17 +266,20 @@ class NikeClient:
                 "promotionCodes": [],
             }
         }
-        response = self._request("PUT", base, region_id=region_id, body=body)
+        quota_kind = "price" if with_price else "availability"
+        response = self._request("PUT", base, region_id=region_id, body=body, quota_kind=quota_kind)
         if response.status_code not in (200, 201, 202):
             raise ScanError(ErrorCode.UNEXPECTED_STATUS, f"review PUT {response.status_code}")
 
         saw_empty = False
         for _ in range(self.settings.review_poll_tries):
             self._sleep(self.settings.review_poll_interval_seconds)
-            polled = self._request("GET", base, region_id=region_id)
+            polled = self._request("GET", base, region_id=region_id, quota_kind=quota_kind)
             try:
                 payload = polled.json()
             except ValueError:
+                continue
+            if not isinstance(payload, dict):
                 continue
             if "response" not in payload and "error" not in payload:
                 continue
@@ -273,17 +298,32 @@ class NikeClient:
             message="review did not reach a trustworthy terminal state",
         )
 
-    def _parse_review(self, payload: dict[str, Any], gtins: list[str]) -> ReviewBatch:
+    def _parse_review(self, payload: Any, gtins: list[str]) -> ReviewBatch:
+        """Interpret one polled review payload.
+
+        The exclusion rule (unlisted items are in stock) is only applied when
+        the payload has a shape every requested SKU can be accounted for.
+        Anything else returns UNKNOWN instead of a stock conclusion.
+        """
+        if not isinstance(payload, dict):
+            return self._untrusted(
+                gtins, ErrorCode.BATCH_SUSPECT, "review payload is not an object"
+            )
         error = payload.get("error")
         response = payload.get("response") or {}
+        if not isinstance(response, dict):
+            return self._untrusted(
+                gtins, ErrorCode.BATCH_SUSPECT, "review response is not an object"
+            )
         groups = response.get("fulfillmentGroups") or []
+        if not isinstance(groups, list):
+            return self._untrusted(
+                gtins, ErrorCode.BATCH_SUSPECT, "fulfillmentGroups is not a list"
+            )
 
         if not error and not groups:
-            return ReviewBatch(
-                items={gtin: ReviewItem(gtin=gtin, availability="UNKNOWN") for gtin in gtins},
-                trusted=False,
-                error_code=ErrorCode.EMPTY_COMPLETED.value,
-                message="empty completed review response",
+            return self._untrusted(
+                gtins, ErrorCode.EMPTY_COMPLETED, "empty completed review response"
             )
 
         if error:
@@ -291,9 +331,13 @@ class NikeClient:
 
         items: dict[str, ReviewItem] = {}
         for group in groups:
+            if not isinstance(group, dict):
+                continue
             for entry in group.get("items") or []:
+                if not isinstance(entry, dict):
+                    continue
                 gtin = str(entry.get("skuId") or "")
-                if gtin not in gtins:
+                if gtin not in gtins or gtin in items:
                     continue
                 items[gtin] = ReviewItem(
                     gtin=gtin,
@@ -314,46 +358,72 @@ class NikeClient:
             )
         return ReviewBatch(items=items, trusted=True)
 
-    def _parse_error_review(self, error: dict[str, Any], gtins: list[str]) -> ReviewBatch:
+    def _parse_error_review(self, error: Any, gtins: list[str]) -> ReviewBatch:
         """Map per-item errors to statuses; anything else invalidates the batch.
 
-        The upstream field path looks like ``/request/items/0/skuId``, so the
-        index is parsed first and the error ``code`` decides whether the report
-        is about one item or the whole request.
+        The exclusion rule is only valid for a well-formed, non-empty
+        ``error.errors`` list whose entries all carry a known per-item code.
+        A missing or empty list, an unknown error code, an entry that is not an
+        object, or a reference outside the requested items means the response
+        cannot be accounted for, so every row stays UNKNOWN.
         """
+        if not isinstance(error, dict):
+            return self._untrusted(
+                gtins, ErrorCode.BATCH_SUSPECT, "error payload is not an object"
+            )
+        entries = error.get("errors")
+        if not isinstance(entries, list) or not entries:
+            return self._untrusted(
+                gtins, ErrorCode.BATCH_SUSPECT, "error object without a usable error list"
+            )
+
         statuses: dict[int, str] = {}
-        batch_level: ErrorCode | None = None
-        batch_message = ""
-        for entry in error.get("errors") or []:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return self._untrusted(gtins, ErrorCode.BATCH_SUSPECT, "malformed error entry")
             field = str(entry.get("field") or "")
             code = str(entry.get("code") or "")
             index = self._item_index(field)
-            mapped = ITEM_STATUS_BY_CODE.get(code)
-            if mapped is None or index is None or not 0 <= index < len(gtins):
-                batch_level = (
-                    ErrorCode.ITEM_QUANTITY_LIMIT
-                    if code == "ITEM_QUANTITY_LIMIT"
-                    else ErrorCode.UNKNOWN_ERROR_CODE
-                    if index is not None
-                    else ErrorCode.BATCH_SUSPECT
+            if code == "ITEM_QUANTITY_LIMIT":
+                return self._untrusted(
+                    gtins,
+                    ErrorCode.ITEM_QUANTITY_LIMIT,
+                    f"{code} on {field or 'request'}",
                 )
-                batch_message = f"{code or 'unknown'} on {field or 'request'}"
-                continue
+            if index is None:
+                return self._untrusted(
+                    gtins, ErrorCode.BATCH_SUSPECT, f"error not scoped to an item: {field or 'request'}"
+                )
+            mapped = ITEM_STATUS_BY_CODE.get(code)
+            if mapped is None:
+                return self._untrusted(
+                    gtins, ErrorCode.UNKNOWN_ERROR_CODE, f"unknown error code {code or 'missing'}"
+                )
+            if not 0 <= index < len(gtins):
+                return self._untrusted(
+                    gtins, ErrorCode.BATCH_SUSPECT, f"error references item {index} outside the batch"
+                )
+            existing = statuses.get(index)
+            if existing is not None and existing != mapped:
+                return self._untrusted(
+                    gtins, ErrorCode.BATCH_SUSPECT, f"conflicting errors for item {index}"
+                )
             statuses[index] = mapped
-
-        if batch_level is not None:
-            return ReviewBatch(
-                items={gtin: ReviewItem(gtin=gtin, availability="UNKNOWN") for gtin in gtins},
-                trusted=False,
-                error_code=batch_level.value,
-                message=batch_message,
-            )
 
         items: dict[str, ReviewItem] = {}
         for index, gtin in enumerate(gtins):
             status = statuses.get(index, "IN_STOCK")
             items[gtin] = ReviewItem(gtin=gtin, availability=status)
         return ReviewBatch(items=items, trusted=True)
+
+    @staticmethod
+    def _untrusted(gtins: list[str], code: ErrorCode, message: str) -> ReviewBatch:
+        return ReviewBatch(
+            items={gtin: ReviewItem(gtin=gtin, availability="UNKNOWN") for gtin in gtins},
+            trusted=False,
+            error_code=code.value,
+            message=message,
+        )
 
     @staticmethod
     def _item_index(field: str) -> int | None:

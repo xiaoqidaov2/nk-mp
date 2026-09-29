@@ -33,6 +33,7 @@ const ERROR_LABEL: Record<string, string> = {
   ITEM_QUANTITY_LIMIT: "数量超出单次上限",
   STRUCTURE_MISSING: "缺少尺码结构",
   UNEXPECTED_STATUS: "上游返回异常状态",
+  BUDGET_EXHAUSTED: "配额已用尽",
 };
 
 export function ScanDetailPage() {
@@ -108,7 +109,7 @@ export function ScanDetailPage() {
               {finished ? current.status : "运行中"}
             </Tag>
             <Button
-              disabled={!canWrite || !finished || current.failed_stores === 0}
+              disabled={!canWrite || !finished || current.failed_stores + current.unknown_stores === 0}
               loading={retry.isPending}
               onClick={() => retry.mutate()}
             >

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, settings_dep
@@ -47,7 +47,10 @@ def get_dashboard(
             ChangeEvent.detected_at >= today,
         )
         if not tenant.is_platform:
-            stmt = stmt.where(ChangeEvent.tenant_id == user.tenant_id)
+            # Shared observation events plus this tenant's private events.
+            stmt = stmt.where(
+                or_(ChangeEvent.tenant_id.is_(None), ChangeEvent.tenant_id == user.tenant_id)
+            )
         return int(db.execute(stmt).scalar_one())
 
     task_filter = [] if tenant.is_platform else [MonitorTask.tenant_id == user.tenant_id]

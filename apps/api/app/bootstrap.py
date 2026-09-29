@@ -1,18 +1,35 @@
-"""Create tables and the first platform tenant without running migrations."""
+"""Create tables via Alembic and seed the first platform tenant.
+
+The schema is owned by the migration history: bootstrap and container startup
+both run ``alembic upgrade head`` instead of ``create_all``.
+"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
+from alembic.config import Config
 from sqlalchemy import select
 
-from app.db import Base, SessionLocal, engine
+from alembic import command
+from app.db import SessionLocal
 from app.models import MonitorTask, Role, Store, Style, Tenant, User
 from app.security import hash_password
 
+API_ROOT = Path(__file__).resolve().parents[1]
+ALEMBIC_INI = API_ROOT / "alembic.ini"
+
+
+def alembic_config() -> Config:
+    config = Config(str(ALEMBIC_INI))
+    config.set_main_option("script_location", str(API_ROOT / "alembic"))
+    return config
+
 
 def create_schema() -> None:
-    Base.metadata.create_all(bind=engine)
+    """Upgrade the database to the latest revision."""
+    command.upgrade(alembic_config(), "head")
 
 
 def ensure_platform_tenant(email: str, password: str, name: str = "服务方") -> Tenant:
@@ -78,6 +95,7 @@ def seed_isolated_demo() -> None:
                     name="演示任务",
                     store_codes=["3752", "3875"],
                     style_codes=["DN3707-202", "IO5031-600"],
+                    all_stores=False,
                     cadence_seconds=1800,
                     is_active=False,
                     next_run_at=None,

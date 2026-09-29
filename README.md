@@ -72,5 +72,13 @@ npm test
 
 ## 验证状态
 
-本轮交付了代码、迁移、容器配置与测试用例，但**尚未运行安装、构建与真实接口验证**。
-首次启动前请确认：旧的 Windows 计划任务 `NikeZeroTouchMonitor` 已停止，避免两个系统并发轮换同一个 refresh token。
+本轮完成了代码审阅、P1/P2 修复与三层测试（pytest 单元 + PostgreSQL 集成 + Vitest），并新增隔离的 QA 联调环境（`qa/`，离线上游 stub）。
+
+- 后端：`ruff check app tests` 通过；`pytest`（单元 + PostgreSQL 集成）**91 项通过**；核心判定逻辑覆盖率 71%（配额 99%、观测 91%、凭证 85%）。
+- 前端：`npm run typecheck` 通过；`npm test` 15 项通过。
+- 迁移：空库升级、重复执行、`alembic check` 漂移检查、降级重建全部通过。
+- QA 环境：`docker compose -p nike-mp-qa -f compose.yaml -f qa/compose.qa.yaml up -d --build` 后运行 `qa/smoke.py`（详见 `qa/README.md` 与 `docs/mvp-integration-plan.md`）。
+
+**尚未执行、不得视为通过**：真实 Nike 接口冒烟、真实账号限流承载、24 小时持续观察。首次使用真实凭证前，请确认旧的 Windows 计划任务 `NikeZeroTouchMonitor` 已停止，避免两个系统并发轮换同一个 refresh token。
+
+> 服务器上运行测试前必须显式设置 `NIKE_MP_TEST_DATABASE_URL` 指向一次性测试库；未设置时集成测试会自动跳过，绝不会向运行库写入测试数据。

@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -17,6 +18,7 @@ interface AuthState {
 const AuthContext = createContext<AuthState | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient();
   const [user, setUser] = useState<CurrentUser | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -38,20 +40,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const login = useCallback(async (email: string, password: string) => {
-    const result = await authApi.login(email, password);
-    setCsrfToken(result.csrf_token);
-    setUser(result.user);
-  }, []);
+  const login = useCallback(
+    async (email: string, password: string) => {
+      const result = await authApi.login(email, password);
+      setCsrfToken(result.csrf_token);
+      // Never show another account's cached responses after a switch.
+      queryClient.clear();
+      setUser(result.user);
+    },
+    [queryClient],
+  );
 
   const logout = useCallback(async () => {
     try {
       await authApi.logout();
     } finally {
       setCsrfToken("");
+      queryClient.clear();
       setUser(null);
     }
-  }, []);
+  }, [queryClient]);
 
   const value = useMemo<AuthState>(
     () => ({

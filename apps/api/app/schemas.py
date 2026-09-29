@@ -48,6 +48,12 @@ class StyleOut(BaseModel):
 
 
 class TaskIn(BaseModel):
+    """Create a monitor task.
+
+    An empty ``store_codes`` means "every active store" (全国扫描), matching the
+    scan API semantics; it is stored as ``all_stores`` on the task.
+    """
+
     name: str = Field(min_length=1, max_length=120)
     store_codes: list[str] = Field(default_factory=list)
     style_codes: list[str] = Field(default_factory=list)
@@ -82,6 +88,7 @@ class TaskOut(BaseModel):
     name: str
     store_codes: list[str]
     style_codes: list[str]
+    all_stores: bool
     cadence_seconds: int
     is_active: bool
     notify_on_restock: bool
@@ -116,6 +123,7 @@ class ScanStoreOut(BaseModel):
 
 class ScanJobOut(BaseModel):
     id: uuid.UUID
+    task_id: uuid.UUID | None
     kind: str
     status: str
     store_codes: list[str]

@@ -1,7 +1,13 @@
-"""Job leasing, execution and checkpoints."""
+"""Job leasing, execution and checkpoints.
+
+Each store unit is committed independently as soon as it finishes, so a crash
+or a stolen lease never rolls back work that already succeeded. A worker may
+only keep working (and finalising) while it still owns the job lease.
+"""
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
@@ -23,6 +29,12 @@ from app.services.credentials import CredentialNotConfigured, CredentialService
 from app.services.observations import mark_failed_job_event, persist_observations
 from app.services.probe import probe_store
 from app.services.quota import QuotaGuard
+
+logger = logging.getLogger("nike_mp.jobs")
+
+
+class LeaseLost(RuntimeError):
+    """Raised when another worker has taken over this job's lease."""
 
 
 def enqueue_job(
@@ -62,7 +74,7 @@ def enqueue_job(
     return job
 
 
-def lease_next_job(session: Session, settings: Settings) -> ScanJob | None:
+def lease_next_job(session: Session, settings: Settings, worker_id: str | None = None) -> ScanJob | None:
     now = datetime.now(UTC)
     job = session.execute(
         select(ScanJob)
@@ -81,41 +93,74 @@ def lease_next_job(session: Session, settings: Settings) -> ScanJob | None:
     job.started_at = job.started_at or now
     job.heartbeat_at = now
     job.lease_expires_at = now + timedelta(seconds=settings.worker_lease_seconds)
+    job.leased_by = worker_id
     session.flush()
     return job
 
 
-def heartbeat(session: Session, job: ScanJob, settings: Settings) -> None:
+def heartbeat(session: Session, job: ScanJob, settings: Settings, worker_id: str | None = None) -> None:
     now = datetime.now(UTC)
-    session.execute(
-        update(ScanJob)
-        .where(ScanJob.id == job.id)
-        .values(
+    stmt = update(ScanJob).where(ScanJob.id == job.id)
+    if worker_id is not None:
+        stmt = stmt.where(ScanJob.leased_by == worker_id)
+    result = session.execute(
+        stmt.values(
             heartbeat_at=now,
             lease_expires_at=now + timedelta(seconds=settings.worker_lease_seconds),
         )
     )
+    if worker_id is not None and result.rowcount == 0:
+        raise LeaseLost(f"lease for job {job.id} was taken over by another worker")
     session.flush()
 
 
-def run_job(session: Session, settings: Settings, job: ScanJob) -> None:
+def _lease_held(session: Session, job: ScanJob, worker_id: str | None) -> bool:
+    """Guard result writes: a worker that lost the lease must write nothing."""
+    if worker_id is None:
+        return True
+    current = session.execute(
+        select(ScanJob.leased_by).where(ScanJob.id == job.id)
+    ).scalar_one_or_none()
+    return current == worker_id
+
+
+def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str | None = None) -> None:
     credentials = CredentialService(settings, session)
     try:
         token = credentials.access_token()
     except CredentialNotConfigured as exc:
-        _finalize(session, settings, job, JobStatus.FAILED.value, str(exc))
+        _finalize(session, settings, job, JobStatus.FAILED.value, str(exc), worker_id)
         return
 
-    client = NikeClient(settings, token, token_provider=credentials.access_token)
+    client = NikeClient(settings, token, token_provider=credentials.token_provider())
     try:
         tenant = session.execute(
             select(Tenant).where(Tenant.id == job.tenant_id)
         ).scalar_one_or_none()
         tenant_budget = tenant.daily_review_budget if tenant else 5000
-        quota = QuotaGuard(job.tenant_id, settings.daily_review_budget, tenant_budget)
+        quota = QuotaGuard(
+            job.tenant_id,
+            settings.daily_review_budget,
+            tenant_budget,
+            settings.quota_hourly_cap,
+            settings.quota_hourly_slow_line,
+        )
+
+        max_gap_seconds = settings.baseline_max_gap_seconds
+        if job.task_id:
+            task = session.execute(
+                select(MonitorTask).where(MonitorTask.id == job.task_id)
+            ).scalar_one_or_none()
+            if task is not None:
+                # Invariant: the baseline window must always span at least
+                # three full cadences, otherwise a degraded cadence could
+                # silently suppress every event.
+                max_gap_seconds = max(max_gap_seconds, 3 * task.cadence_seconds)
 
         rows = session.execute(
-            select(ScanJobStore).where(ScanJobStore.job_id == job.id)
+            select(ScanJobStore)
+            .where(ScanJobStore.job_id == job.id)
+            .order_by(ScanJobStore.id)
         ).scalars().all()
         stores = {
             store.id: store
@@ -131,11 +176,21 @@ def run_job(session: Session, settings: Settings, job: ScanJob) -> None:
                 row.error_code = ErrorCode.STRUCTURE_MISSING.value
                 row.message = "store not found"
                 row.finished_at = datetime.now(UTC)
+                session.commit()
                 continue
             if row.status == StoreJobStatus.SUCCEEDED.value:
                 continue
 
-            heartbeat(session, job, settings)
+            try:
+                heartbeat(session, job, settings, worker_id)
+            except LeaseLost:
+                session.rollback()
+                logger.warning("job %s lease lost before store %s", job.id, store.store_code)
+                return
+            # Persist the renewed lease before the (possibly slow) probe so
+            # other workers can see this job is still alive.
+            session.commit()
+
             row.status = StoreJobStatus.RUNNING.value
             row.attempt += 1
             row.started_at = datetime.now(UTC)
@@ -145,20 +200,51 @@ def run_job(session: Session, settings: Settings, job: ScanJob) -> None:
                 result = probe_store(
                     session, client, settings, quota, store, job.style_codes, job.id
                 )
+            except LeaseLost:
+                logger.warning("job %s lease lost while probing %s", job.id, store.store_code)
+                return
             except (ScanError, NikeTransportError) as exc:
                 code = (
                     exc.code.value
                     if isinstance(exc, ScanError)
                     else ErrorCode.TRANSPORT_ERROR.value
                 )
+                if not _lease_held(session, job, worker_id):
+                    session.rollback()
+                    logger.warning(
+                        "job %s lease lost; discarding failure for %s",
+                        job.id,
+                        store.store_code,
+                    )
+                    return
                 _fail_store_row(session, job, row, store, code, str(exc))
+                session.commit()
                 continue
             except Exception as exc:  # noqa: BLE001 - never lose a store silently
+                if not _lease_held(session, job, worker_id):
+                    session.rollback()
+                    logger.warning(
+                        "job %s lease lost; discarding failure for %s",
+                        job.id,
+                        store.store_code,
+                    )
+                    return
                 _fail_store_row(
                     session, job, row, store, ErrorCode.UNEXPECTED_STATUS.value, str(exc)
                 )
+                session.commit()
                 continue
 
+            # The probe may have taken long enough for the lease to be stolen;
+            # results must not be written by a worker that no longer owns it.
+            if not _lease_held(session, job, worker_id):
+                session.rollback()
+                logger.warning(
+                    "job %s lease lost; discarding probe result for %s",
+                    job.id,
+                    store.store_code,
+                )
+                return
             row.finished_at = datetime.now(UTC)
             if not result.trusted:
                 row.status = StoreJobStatus.UNKNOWN.value
@@ -167,10 +253,15 @@ def run_job(session: Session, settings: Settings, job: ScanJob) -> None:
                 mark_failed_job_event(
                     session, job.tenant_id, job, store.id, result.error_code or "UNKNOWN"
                 )
-                session.flush()
+                session.commit()
                 continue
 
-            summary = persist_observations(session, job.tenant_id, result.observations)
+            summary = persist_observations(
+                session,
+                result.observations,
+                max_gap_seconds=max_gap_seconds,
+                suppress_structures=result.structure_changes,
+            )
             row.status = StoreJobStatus.SUCCEEDED.value
             row.error_code = None
             row.message = ""
@@ -178,9 +269,9 @@ def run_job(session: Session, settings: Settings, job: ScanJob) -> None:
             row.events_written = (
                 summary.restock + summary.sold_out + summary.price_change + summary.new_arrival
             )
-            session.flush()
+            session.commit()
 
-        _finalize(session, settings, job, None, "")
+        _finalize(session, settings, job, None, "", worker_id)
     finally:
         client.close()
 
@@ -196,11 +287,19 @@ def _fail_store_row(session, job, row, store, code: str, message: str) -> None:
 
 def _finalize(
     session: Session,
-    settings: Settings,
+    settings: Settings | None,
     job: ScanJob,
     forced_status: str | None,
     error_summary: str,
+    worker_id: str | None = None,
 ) -> None:
+    if worker_id is not None:
+        fresh = session.execute(
+            select(ScanJob).where(ScanJob.id == job.id).with_for_update()
+        ).scalar_one_or_none()
+        if fresh is None or fresh.leased_by != worker_id:
+            raise LeaseLost(f"job {job.id} is no longer owned by this worker")
+
     rows = session.execute(
         select(ScanJobStore).where(ScanJobStore.job_id == job.id)
     ).scalars().all()
@@ -227,6 +326,7 @@ def _finalize(
     job.finished_at = datetime.now(UTC)
     job.lease_expires_at = None
     job.heartbeat_at = datetime.now(UTC)
+    job.leased_by = None
     session.flush()
 
     if job.task_id:
@@ -240,9 +340,13 @@ def _finalize(
 
 
 def requeue_failed_stores(session: Session, job: ScanJob) -> int:
+    """Requeue failed and data-incomplete stores for another attempt."""
     rows = session.execute(
         select(ScanJobStore).where(
-            ScanJobStore.job_id == job.id, ScanJobStore.status == StoreJobStatus.FAILED.value
+            ScanJobStore.job_id == job.id,
+            ScanJobStore.status.in_(
+                [StoreJobStatus.FAILED.value, StoreJobStatus.UNKNOWN.value]
+            ),
         )
     ).scalars().all()
     for row in rows:
@@ -252,6 +356,7 @@ def requeue_failed_stores(session: Session, job: ScanJob) -> int:
     job.status = JobStatus.QUEUED.value
     job.finished_at = None
     job.lease_expires_at = None
+    job.leased_by = None
     job.attempt = 0
     session.flush()
     return len(rows)

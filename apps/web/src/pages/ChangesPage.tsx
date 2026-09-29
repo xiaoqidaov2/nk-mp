@@ -13,6 +13,7 @@ const FILTERS = [
   { label: "变价", value: "PRICE_CHANGE" },
   { label: "到店上新", value: "NEW_ARRIVAL_AT_STORE" },
   { label: "扫描失败", value: "SCAN_FAILED" },
+  { label: "结构变化", value: "STRUCTURE_CHANGED" },
 ];
 
 const TYPE_LABEL: Record<ChangeEvent["event_type"], string> = {
@@ -21,6 +22,7 @@ const TYPE_LABEL: Record<ChangeEvent["event_type"], string> = {
   PRICE_CHANGE: "变价",
   NEW_ARRIVAL_AT_STORE: "到店上新",
   SCAN_FAILED: "扫描失败",
+  STRUCTURE_CHANGED: "结构变化",
 };
 
 function priceText(value: number | null): string {

@@ -75,7 +75,7 @@ def cmd_sync_stores(_args: argparse.Namespace) -> int:
     with _session() as db:
         service = CredentialService(settings, db)
         token = service.access_token()
-        with NikeClient(settings, token, token_provider=service.access_token) as client:
+        with NikeClient(settings, token, token_provider=service.token_provider()) as client:
             records = client.list_stores()
         touched = sync_stores(db, records, "cli")
         db.commit()

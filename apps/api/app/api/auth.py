@@ -6,7 +6,7 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import SESSION_COOKIE, get_current_session, get_db
+from app.api.deps import CSRF_COOKIE, SESSION_COOKIE, get_current_session, get_db
 from app.config import Settings, get_settings
 from app.models import AuthSession, Tenant, User
 from app.schemas import CurrentUser, LoginRequest, LoginResponse
@@ -63,6 +63,7 @@ def login(
     user.last_login_at = datetime.now(UTC)
     db.flush()
 
+    csrf_token = csrf_token_for(token, csrf_secret)
     response.set_cookie(
         SESSION_COOKIE,
         token,
@@ -72,9 +73,20 @@ def login(
         max_age=settings.session_ttl_hours * 3600,
         path="/",
     )
+    response.set_cookie(
+        # Readable by the SPA so a page refresh can restore the CSRF token
+        # without keeping it in a module variable.
+        CSRF_COOKIE,
+        csrf_token,
+        httponly=False,
+        samesite="lax",
+        secure=settings.cookie_secure,
+        max_age=settings.session_ttl_hours * 3600,
+        path="/",
+    )
     return LoginResponse(
         user=_to_current_user(user, tenant),
-        csrf_token=csrf_token_for(token, csrf_secret),
+        csrf_token=csrf_token,
     )
 
 
@@ -88,6 +100,7 @@ def logout(
     _, record = payload
     record.revoked_at = datetime.now(UTC)
     response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(CSRF_COOKIE, path="/")
     db.flush()
     return {"ok": True}
 

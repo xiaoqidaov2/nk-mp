@@ -1,0 +1,50 @@
+# QA overlay: isolated project + offline upstream stub.
+#
+#   docker compose -p nike-mp-qa -f compose.yaml -f qa/compose.qa.yaml up -d --build
+#
+# The stub replaces every Nike endpoint; nothing in this project ever reaches
+# the real service. The volume is project-scoped, so `-p nike-mp-qa` gives an
+# independent database that never mixes with development data.
+
+x-qa-upstream-env: &qa-upstream-env
+  NIKE_MP_NIKE_API_BASE: http://stub:9100
+  NIKE_MP_NIKE_TEST_API_BASE: http://stub:9100
+  NIKE_MP_NIKE_OAUTH_BASE: http://stub:9100
+
+services:
+  stub:
+    build:
+      context: ./qa
+      dockerfile: Dockerfile.stub
+    ports:
+      - "9100:9100"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:9100/healthz')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    environment:
+      <<: *qa-upstream-env
+    depends_on:
+      stub:
+        condition: service_healthy
+
+  worker:
+    environment:
+      <<: *qa-upstream-env
+      NIKE_MP_WORKER_POLL_SECONDS: "1"
+      NIKE_MP_WORKER_LEASE_SECONDS: "60"
+    depends_on:
+      stub:
+        condition: service_healthy
+
+  scheduler:
+    environment:
+      <<: *qa-upstream-env
+      NIKE_MP_SCHEDULER_INTERVAL_SECONDS: "5"
+    depends_on:
+      stub:
+        condition: service_healthy

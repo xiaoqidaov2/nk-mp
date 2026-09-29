@@ -34,5 +34,8 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./src/test/setup.ts"],
     css: false,
+    // antd form/step transitions settle asynchronously in jsdom and each
+    // flushed interaction can take a few seconds; keep a generous ceiling.
+    testTimeout: 60000,
   },
 });

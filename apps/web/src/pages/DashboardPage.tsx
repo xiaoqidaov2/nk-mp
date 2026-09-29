@@ -12,6 +12,7 @@ const EVENT_LABELS: Record<ChangeEvent["event_type"], string> = {
   PRICE_CHANGE: "变价",
   NEW_ARRIVAL_AT_STORE: "到店上新",
   SCAN_FAILED: "扫描失败",
+  STRUCTURE_CHANGED: "结构变化",
 };
 
 function credentialTag(status: string) {

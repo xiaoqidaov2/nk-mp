@@ -1,0 +1,140 @@
+# Self-contained QA stack for environments where Docker bridge networking
+# cannot reach sibling containers (verified in this sandbox: TCP to `db:5432`
+# timed out from another container on the same network).
+#
+# All services share the host network and talk over 127.0.0.1, while still
+# using an isolated compose project and database volume:
+#
+#   docker compose -p nike-mp-qa -f qa/compose.qa.hostnet.yaml up -d --build
+#   docker compose -p nike-mp-qa -f qa/compose.qa.hostnet.yaml \
+#     exec -T api python - < qa/seed_qa.py
+#   apps/api/.venv/bin/python qa/smoke.py
+#
+# On a machine with working container networking, prefer the overlay variant:
+#   docker compose -p nike-mp-qa -f compose.yaml -f qa/compose.qa.yaml up -d --build
+
+name: nike-mp-qa
+
+x-qa-env: &qa-env
+  NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@127.0.0.1:5432/nike_mp
+  NIKE_MP_CREDENTIAL_KEY: qa-credential-key
+  NIKE_MP_NIKE_API_BASE: http://127.0.0.1:9100
+  NIKE_MP_NIKE_TEST_API_BASE: http://127.0.0.1:9100
+  NIKE_MP_NIKE_OAUTH_BASE: http://127.0.0.1:9100
+  NIKE_MP_REVIEW_POLL_TRIES: "2"
+  NIKE_MP_REVIEW_POLL_INTERVAL_SECONDS: "0.2"
+  NIKE_MP_REQUEST_PACE_SECONDS: "0"
+  TZ: Asia/Shanghai
+
+services:
+  db:
+    image: postgres:17-alpine
+    network_mode: host
+    environment:
+      POSTGRES_DB: nike_mp
+      POSTGRES_USER: nike_mp
+      POSTGRES_PASSWORD: nike_mp
+      TZ: Asia/Shanghai
+    volumes:
+      - qa-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U nike_mp -d nike_mp"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  stub:
+    build:
+      context: .
+      dockerfile: Dockerfile.stub
+    network_mode: host
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9100/healthz')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment: *qa-env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+    restart: "no"
+
+  api:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment: *qa-env
+    depends_on:
+      db:
+        condition: service_healthy
+      stub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment:
+      <<: *qa-env
+      NIKE_MP_WORKER_POLL_SECONDS: "1"
+      NIKE_MP_WORKER_LEASE_SECONDS: "60"
+    depends_on:
+      db:
+        condition: service_healthy
+      stub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.worker
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment:
+      <<: *qa-env
+      NIKE_MP_SCHEDULER_INTERVAL_SECONDS: "5"
+    depends_on:
+      db:
+        condition: service_healthy
+      stub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.scheduler_main
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../apps/web
+    network_mode: host
+    environment:
+      VITE_API_TARGET: http://127.0.0.1:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  qa-db-data:

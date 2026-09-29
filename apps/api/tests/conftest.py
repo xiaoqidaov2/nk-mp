@@ -9,6 +9,11 @@ import time
 # any application module is imported.
 os.environ.setdefault("NIKE_MP_CREDENTIAL_KEY", "test-key-for-unit-tests")
 
+# Integration tests only run against an explicitly provided scratch database.
+# The runtime database URL is never silently reused for tests.
+if os.environ.get("NIKE_MP_TEST_DATABASE_URL"):
+    os.environ["NIKE_MP_DATABASE_URL"] = os.environ["NIKE_MP_TEST_DATABASE_URL"]
+
 import pytest  # noqa: E402
 
 from app.config import Settings, get_settings  # noqa: E402

@@ -1,10 +1,16 @@
-"""Observation persistence, monotonic latest-state updates and diffing."""
+"""Observation persistence, monotonic latest-state updates and diffing.
+
+Stock state is a shared platform fact: change events produced from trusted
+observations are stored with ``tenant_id = NULL`` so every subscribed tenant
+sees the same transition. Tenant-private events (for example a scan failure)
+keep a tenant id and are only visible to that tenant.
+"""
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -30,10 +36,21 @@ def _payload_hash(parts: list[str]) -> str:
 
 def persist_observations(
     session: Session,
-    tenant_id,
     observations: list[Observation],
+    *,
+    max_gap_seconds: int = 7 * 24 * 3600,
+    suppress_structures: dict | None = None,
 ) -> DiffSummary:
+    """Persist observations and derive change events.
+
+    ``max_gap_seconds`` protects the baseline: after a longer gap the round
+    only rebuilds the baseline and never reports restock/sold-out.
+    ``suppress_structures`` maps ``style_id -> new structure hash`` for stores
+    whose size structure changed this round; those styles only rebuild their
+    baseline as well and record a single diagnostic STRUCTURE_CHANGED event.
+    """
     summary = DiffSummary()
+    suppressed = suppress_structures or {}
     for observation in observations:
         session.add(observation)
         session.flush()
@@ -68,6 +85,7 @@ def persist_observations(
                     promotions=observation.promotions,
                     error_code=observation.error_code,
                     baseline_ready=True,
+                    last_observation_id=observation.id,
                     checked_at=observation.checked_at,
                 )
             )
@@ -78,9 +96,14 @@ def persist_observations(
             # Older rounds must never clobber newer state.
             continue
 
-        events = _detect_events(latest, observation)
+        events: list[ChangeEvent] = []
+        if observation.style_id not in suppressed:
+            events = _detect_events(latest, observation, max_gap_seconds)
         for event in events:
-            event.tenant_id = tenant_id
+            # Shared observation fact: visible to every tenant.
+            event.tenant_id = None
+            event.before_observation_id = latest.last_observation_id
+            event.after_observation_id = observation.id
             session.add(event)
         if events:
             session.flush()
@@ -104,8 +127,9 @@ def persist_observations(
             latest.discount_amount = observation.discount_amount
             latest.total_price = observation.total_price
             latest.promotions = observation.promotions
-        elif observation.availability == "OUT_OF_STOCK":
-            # Losing stock also invalidates the cached price.
+        else:
+            # Losing stock or losing price visibility invalidates the cached
+            # price; a stale value must never masquerade as the current price.
             latest.price = None
             latest.full_price = None
             latest.discount_amount = None
@@ -114,12 +138,60 @@ def persist_observations(
             latest.price_status = PriceStatus.MISSING.value
         latest.error_code = observation.error_code
         latest.baseline_ready = True
+        latest.last_observation_id = observation.id
         latest.checked_at = observation.checked_at
         session.flush()
+
+    for style_id, structure_hash in suppressed.items():
+        store_ids = {item.store_id for item in observations if item.style_id == style_id}
+        for store_id in store_ids:
+            _record_structure_change(session, store_id, style_id, structure_hash)
     return summary
 
 
-def _detect_events(latest: ObservationLatest, observation: Observation) -> list[ChangeEvent]:
+def _record_structure_change(session: Session, store_id, style_id, structure_hash: str) -> None:
+    key = _payload_hash(["STRUCTURE_CHANGED", str(store_id), str(style_id), structure_hash])
+    dedupe_key = f"STRUCTURE_CHANGED:{key}"
+    existing = session.execute(
+        select(ChangeEvent).where(ChangeEvent.dedupe_key == dedupe_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    session.add(
+        ChangeEvent(
+            tenant_id=None,
+            store_id=store_id,
+            style_id=style_id,
+            size_label="",
+            event_type=EventType.STRUCTURE_CHANGED.value,
+            payload_hash=key,
+            dedupe_key=dedupe_key,
+            checked_at=datetime.now(UTC),
+        )
+    )
+    session.flush()
+
+
+def _detect_events(
+    latest: ObservationLatest,
+    observation: Observation,
+    max_gap_seconds: int = 7 * 24 * 3600,
+) -> list[ChangeEvent]:
+    """Detect transitions between two trusted observations.
+
+    Baseline protection: a gap longer than ``max_gap_seconds`` or a changed
+    GTIN for the same size means the two observations are not comparable, so
+    the round only refreshes the baseline and reports nothing.
+    """
+    if (
+        latest.checked_at is not None
+        and observation.checked_at is not None
+        and observation.checked_at - latest.checked_at > timedelta(seconds=max_gap_seconds)
+    ):
+        return []
+    if latest.gtin and observation.gtin and latest.gtin != observation.gtin:
+        return []
+
     before = latest.availability
     after = observation.availability
     events: list[ChangeEvent] = []
@@ -178,7 +250,11 @@ def _event(
 
 
 def mark_failed_job_event(session: Session, tenant_id, job, store_id, error_code: str) -> None:
-    """Record a store-level failure without pretending it is a stock change."""
+    """Record a store-level failure without pretending it is a stock change.
+
+    Scan failures are tenant-private: they describe this tenant's job, not the
+    shared store state.
+    """
     key = _payload_hash(["SCAN_FAILED", str(job.id), str(store_id), error_code])
     existing = session.execute(
         select(ChangeEvent).where(ChangeEvent.dedupe_key == f"SCAN_FAILED:{key}")
@@ -198,4 +274,3 @@ def mark_failed_job_event(session: Session, tenant_id, job, store_id, error_code
         )
     )
     session.flush()
-

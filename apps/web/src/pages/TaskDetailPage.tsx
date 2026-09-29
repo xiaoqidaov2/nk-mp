@@ -18,10 +18,14 @@ export function TaskDetailPage() {
   const queryClient = useQueryClient();
 
   const tasks = useQuery<MonitorTask[]>({ queryKey: ["tasks"], queryFn: () => taskApi.list() });
-  const scans = useQuery<ScanJob[]>({ queryKey: ["scans"], queryFn: () => scanApi.list() });
+  const scans = useQuery<ScanJob[]>({
+    queryKey: ["scans", taskId],
+    queryFn: () => scanApi.list(taskId),
+    enabled: Boolean(taskId),
+  });
 
   const task = tasks.data?.find((item) => item.id === taskId);
-  const related = (scans.data ?? []).filter((job) => job.kind === "MONITOR");
+  const related = scans.data ?? [];
 
   const toggle = useMutation({
     mutationFn: (isActive: boolean) => taskApi.update(taskId, { is_active: isActive }),
@@ -89,7 +93,12 @@ export function TaskDetailPage() {
             ) : null}
           </div>
           <div>
-            <Typography.Text type="secondary">门店（{task.store_count}）：</Typography.Text>
+            <Typography.Text type="secondary">
+              门店（{task.all_stores ? "全部" : task.store_count}）：
+            </Typography.Text>
+            {task.all_stores ? (
+              <Tag color="blue">全部已同步门店（新门店自动纳入）</Tag>
+            ) : null}
             {(task.store_codes ?? []).slice(0, 20).map((code) => (
               <Link key={code} to={`/stores/${code}`} style={{ marginRight: 8 }}>
                 {code}

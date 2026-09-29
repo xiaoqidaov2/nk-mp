@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
+import socket
 import time
+import uuid
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.services.jobs import lease_next_job, run_job
+from app.services.jobs import LeaseLost, lease_next_job, run_job
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("nike_mp.worker")
@@ -21,22 +24,32 @@ def _stop(*_args: object) -> None:
     _running = False
 
 
+def _worker_id() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
 def main() -> None:
     settings = get_settings()
+    worker_id = _worker_id()
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-    logger.info("worker started")
+    logger.info("worker %s started", worker_id)
     while _running:
         session = SessionLocal()
         try:
-            job = lease_next_job(session, settings)
+            job = lease_next_job(session, settings, worker_id)
             if job is None:
                 session.commit()
                 time.sleep(settings.worker_poll_seconds)
                 continue
             session.commit()
             logger.info("leasing job %s (%s stores)", job.id, job.total_stores)
-            run_job(session, settings, job)
+            try:
+                run_job(session, settings, job, worker_id)
+            except LeaseLost:
+                session.rollback()
+                logger.warning("job %s lease lost; another worker owns it", job.id)
+                continue
             session.commit()
             logger.info("job %s finished with status %s", job.id, job.status)
         except Exception:  # noqa: BLE001 - a worker must survive any single job

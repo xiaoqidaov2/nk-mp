@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, require_ops, settings_dep
+from app.api.deps import get_db, require_ops, require_ops_write, settings_dep
 from app.config import Settings
 from app.models import JobStatus, MonitorTask, ScanJob, Store, Style, Tenant, User
 from app.nike.client import NikeClient
@@ -27,7 +27,7 @@ def credential_status(
 @router.post("/credentials/refresh")
 def refresh_credential(
     db: Session = Depends(get_db),
-    user: User = Depends(require_ops),
+    user: User = Depends(require_ops_write),
     settings: Settings = Depends(settings_dep),
 ) -> dict[str, object]:
     service = CredentialService(settings, db)
@@ -38,7 +38,7 @@ def refresh_credential(
 @router.post("/stores/sync")
 def sync_store_catalog(
     db: Session = Depends(get_db),
-    user: User = Depends(require_ops),
+    user: User = Depends(require_ops_write),
     settings: Settings = Depends(settings_dep),
 ) -> dict[str, object]:
     service = CredentialService(settings, db)
@@ -46,7 +46,7 @@ def sync_store_catalog(
         token = service.access_token()
     except CredentialNotConfigured:
         return {"ok": False, "message": "凭证未导入，无法同步门店"}
-    with NikeClient(settings, token, token_provider=service.access_token) as client:
+    with NikeClient(settings, token, token_provider=service.token_provider()) as client:
         records = client.list_stores()
     touched = sync_stores(db, records, "ops_sync")
     return {"ok": True, "synced": touched, "total": len(records)}

@@ -41,7 +41,8 @@ export const taskApi = {
 };
 
 export const scanApi = {
-  list: () => api.get<ScanJob[]>("/scans"),
+  list: (taskId?: string) =>
+    api.get<ScanJob[]>(`/scans${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
   create: (payload: {
     store_codes?: string[];
     style_codes?: string[];

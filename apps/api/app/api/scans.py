@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from collections.abc import AsyncIterator, Callable
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_user, get_db, require_write
 from app.db import SessionLocal
@@ -16,6 +19,9 @@ from app.schemas import ScanCreateIn, ScanJobOut, ScanStoreOut
 from app.services.jobs import enqueue_job, requeue_failed_stores
 
 router = APIRouter(prefix="/scans", tags=["scans"])
+
+STREAM_POLL_SECONDS = 2.0
+STREAM_MAX_SECONDS = 1800.0
 
 TERMINAL = {
     JobStatus.SUCCEEDED.value,
@@ -31,6 +37,7 @@ def _job_out(db: Session, job: ScanJob) -> ScanJobOut:
         progress = round((job.done_stores + job.failed_stores + job.unknown_stores) / job.total_stores, 3)
     return ScanJobOut(
         id=job.id,
+        task_id=job.task_id,
         kind=job.kind,
         status=job.status,
         store_codes=list(job.store_codes or []),
@@ -111,14 +118,15 @@ def create_scan(
 @router.get("", response_model=list[ScanJobOut])
 def list_scans(
     limit: int = 20,
+    task_id: UUID | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[ScanJobOut]:
+    stmt = select(ScanJob).where(ScanJob.tenant_id == user.tenant_id)
+    if task_id is not None:
+        stmt = stmt.where(ScanJob.task_id == task_id)
     rows = db.execute(
-        select(ScanJob)
-        .where(ScanJob.tenant_id == user.tenant_id)
-        .order_by(ScanJob.created_at.desc())
-        .limit(max(1, min(limit, 200)))
+        stmt.order_by(ScanJob.created_at.desc()).limit(max(1, min(limit, 200)))
     ).scalars().all()
     return [_job_out(db, row) for row in rows]
 
@@ -177,6 +185,45 @@ def retry_failed(
     return _job_out(db, job)
 
 
+def _job_snapshot(job_ref: UUID) -> dict | None:
+    """Read one job snapshot from a dedicated short-lived session."""
+    stream_db = SessionLocal()
+    try:
+        fresh = stream_db.execute(
+            select(ScanJob).where(ScanJob.id == job_ref)
+        ).scalar_one_or_none()
+        if fresh is None:
+            return None
+        return _job_out(stream_db, fresh).model_dump(mode="json")
+    finally:
+        stream_db.close()
+
+
+async def _progress_stream(
+    request: Request,
+    job_ref: UUID,
+    snapshot: Callable[[UUID], dict | None] | None = None,
+) -> AsyncIterator[str]:
+    """Yield SSE progress frames until the job finishes or the client leaves."""
+    fetch = snapshot or _job_snapshot
+    last_payload = ""
+    deadline = time.monotonic() + STREAM_MAX_SECONDS
+    while time.monotonic() < deadline:
+        if await request.is_disconnected():
+            break
+        payload = await run_in_threadpool(fetch, job_ref)
+        if payload is None:
+            break
+        encoded = json.dumps(payload, ensure_ascii=False)
+        if encoded != last_payload:
+            last_payload = encoded
+            yield f"event: progress\ndata: {encoded}\n\n"
+        if payload.get("status") in TERMINAL:
+            yield "event: done\ndata: {}\n\n"
+            break
+        await asyncio.sleep(STREAM_POLL_SECONDS)
+
+
 @router.get("/{job_id}/events")
 def scan_progress(
     job_id: UUID,
@@ -187,36 +234,8 @@ def scan_progress(
     job = _load_job(db, user.tenant_id, job_id)
     job_ref = job.id
 
-    def _stream():
-        # The request-scoped session is torn down with the dependency, so poll
-        # from a dedicated session that lives exactly as long as the stream.
-        stream_db = SessionLocal()
-        try:
-            last_payload = ""
-            deadline = time.monotonic() + 1800
-            while time.monotonic() < deadline:
-                if request.is_disconnected():
-                    break
-                stream_db.expire_all()
-                fresh = stream_db.execute(
-                    select(ScanJob).where(ScanJob.id == job_ref)
-                ).scalar_one_or_none()
-                if fresh is None:
-                    break
-                payload = _job_out(stream_db, fresh).model_dump(mode="json")
-                encoded = json.dumps(payload, ensure_ascii=False)
-                if encoded != last_payload:
-                    last_payload = encoded
-                    yield f"event: progress\ndata: {encoded}\n\n"
-                if fresh.status in TERMINAL:
-                    yield "event: done\ndata: {}\n\n"
-                    break
-                time.sleep(2.0)
-        finally:
-            stream_db.close()
-
     return StreamingResponse(
-        _stream(),
+        _progress_stream(request, job_ref),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

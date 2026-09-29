@@ -4,8 +4,8 @@ WORKDIR /srv
 
 RUN corepack enable
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 

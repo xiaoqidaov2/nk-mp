@@ -1,13 +1,31 @@
-"""Daily review-budget accounting."""
+"""Transaction accounting and hard caps for upstream requests.
+
+Every billable upstream transaction (review PUT, poll GET, retry attempt)
+consumes exactly one unit. The tenant sees a single daily bucket shared by
+availability and price traffic; the platform enforces a global daily cap and
+an hourly steady-state cap. Enforcement is optimistic-locked in PostgreSQL:
+the counters are read ``FOR UPDATE`` so concurrent workers cannot overshoot.
+"""
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TypeVar
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models import Store, Tenant, UsageDaily
+from app.models import PlatformUsageDaily, PlatformUsageHourly, UsageDaily
+
+logger = logging.getLogger("nike_mp.quota")
+
+AVAILABILITY_KIND = "availability"
+PRICE_KIND = "price"
+
+_M = TypeVar("_M")
 
 
 def _today() -> datetime:
@@ -15,43 +33,121 @@ def _today() -> datetime:
     return datetime(now.year, now.month, now.day, tzinfo=UTC)
 
 
+def _hour() -> datetime:
+    now = datetime.now(UTC)
+    return datetime(now.year, now.month, now.day, now.hour, tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """The three independent caps checked before each upstream request."""
+
+    tenant_total: int
+    tenant_budget: int
+    platform_day_total: int
+    platform_day_budget: int
+    platform_hour_total: int
+    platform_hour_budget: int
+
+    def rejection(self) -> str:
+        if self.tenant_total >= self.tenant_budget:
+            return "tenant_budget"
+        if self.platform_day_total >= self.platform_day_budget:
+            return "platform_daily_budget"
+        if self.platform_hour_total >= self.platform_hour_budget:
+            return "platform_hourly_budget"
+        return ""
+
+
 class QuotaGuard:
-    def __init__(self, tenant_id, global_budget: int, tenant_budget: int) -> None:
+    def __init__(
+        self,
+        tenant_id,
+        global_budget: int,
+        tenant_budget: int,
+        hourly_cap: int = 900,
+        hourly_slow_line: int = 600,
+    ) -> None:
         self.tenant_id = tenant_id
         self.global_budget = global_budget
         self.tenant_budget = tenant_budget
+        self.hourly_cap = hourly_cap
+        self.hourly_slow_line = hourly_slow_line
 
-    def _row(self, session: Session) -> UsageDaily:
-        row = session.execute(
-            select(UsageDaily).where(
-                UsageDaily.tenant_id == self.tenant_id, UsageDaily.day == _today()
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            row = UsageDaily(tenant_id=self.tenant_id, day=_today())
-            session.add(row)
-            session.flush()
+    # ------------------------------------------------------------- internals
+
+    @staticmethod
+    def _locked_or_create(session: Session, model: type[_M], index_elements: list[str], **keys) -> _M:
+        """Fetch the counter row with a write lock, creating it if needed.
+
+        Callers must lock in a consistent order (hour -> day -> tenant) so that
+        concurrent workers cannot deadlock against each other.
+        """
+        stmt = select(model).filter_by(**keys).with_for_update()
+        row = session.execute(stmt).scalar_one_or_none()
+        if row is not None:
+            return row
+        session.execute(
+            pg_insert(model).values(**keys).on_conflict_do_nothing(index_elements=index_elements)
+        )
+        row = session.execute(stmt).scalar_one_or_none()
+        if row is None:  # pragma: no cover - only reachable if the row vanished mid-lock
+            raise RuntimeError(f"failed to lock or create {model.__tablename__} row")
         return row
 
-    def try_consume(self, session: Session, store: Store, units: int, kind: str = "availability") -> bool:
-        row = self._row(session)
-        if kind == "availability":
-            if row.review_requests + units > self.tenant_budget:
-                return False
-            row.review_requests += units
+    def _snapshot(
+        self, session: Session
+    ) -> tuple[UsageSnapshot, PlatformUsageHourly, PlatformUsageDaily, UsageDaily]:
+        hour_row = self._locked_or_create(
+            session, PlatformUsageHourly, ["hour"], hour=_hour()
+        )
+        day_row = self._locked_or_create(
+            session, PlatformUsageDaily, ["day"], day=_today()
+        )
+        tenant_row = self._locked_or_create(
+            session,
+            UsageDaily,
+            ["tenant_id", "day"],
+            tenant_id=self.tenant_id,
+            day=_today(),
+        )
+        tenant_total = int(tenant_row.review_requests) + int(tenant_row.price_requests)
+        snapshot = UsageSnapshot(
+            tenant_total=tenant_total,
+            tenant_budget=self.tenant_budget,
+            platform_day_total=int(day_row.transactions),
+            platform_day_budget=self.global_budget,
+            platform_hour_total=int(hour_row.transactions),
+            platform_hour_budget=self.hourly_cap,
+        )
+        return snapshot, hour_row, day_row, tenant_row
+
+    # ---------------------------------------------------------------- public
+
+    def consume_transaction(self, session: Session, kind: str = AVAILABILITY_KIND) -> bool:
+        """Reserve one upstream transaction; returns False when any cap is hit.
+
+        The counters are committed immediately: the row locks are released
+        right away (so concurrent workers are not serialised for the duration
+        of a slow store probe) and the accounting survives a job rollback.
+        """
+        snapshot, hour_row, day_row, tenant_row = self._snapshot(session)
+        rejection = snapshot.rejection()
+        if rejection:
+            # Release the row locks promptly; no accounting change is kept.
+            session.commit()
+            logger.warning("quota rejected upstream request (%s)", rejection)
+            return False
+        if kind == PRICE_KIND:
+            tenant_row.price_requests = int(tenant_row.price_requests) + 1
         else:
-            if row.price_requests + units > self.tenant_budget:
-                return False
-            row.price_requests += units
-        row.updated_at = datetime.now(UTC)
-        session.flush()
+            tenant_row.review_requests = int(tenant_row.review_requests) + 1
+        hour_row.transactions = int(hour_row.transactions) + 1
+        day_row.transactions = int(day_row.transactions) + 1
+        session.commit()
+        if self.hourly_slow_line and hour_row.transactions == self.hourly_slow_line:
+            logger.warning(
+                "hourly transaction volume reached the slow-down observation line (%s)",
+                self.hourly_slow_line,
+            )
         return True
-
-    @staticmethod
-    def global_usage(session: Session) -> int:
-        rows = session.execute(select(UsageDaily).where(UsageDaily.day == _today())).scalars().all()
-        return sum(row.review_requests + row.price_requests for row in rows)
-
-    @staticmethod
-    def tenant_for(session: Session, tenant_id) -> Tenant | None:
-        return session.execute(select(Tenant).where(Tenant.id == tenant_id)).scalar_one_or_none()

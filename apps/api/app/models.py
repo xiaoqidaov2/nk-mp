@@ -72,6 +72,7 @@ class EventType(StrEnum):
     PRICE_CHANGE = "PRICE_CHANGE"
     NEW_ARRIVAL_AT_STORE = "NEW_ARRIVAL_AT_STORE"
     SCAN_FAILED = "SCAN_FAILED"
+    STRUCTURE_CHANGED = "STRUCTURE_CHANGED"
 
 
 class CredentialStatus(StrEnum):
@@ -216,7 +217,9 @@ class Observation(Base):
     total_price: Mapped[float | None] = mapped_column(Numeric(10, 2))
     promotions: Mapped[list] = mapped_column(JSONB, default=list)
     error_code: Mapped[str | None] = mapped_column(String(48))
-    job_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("scan_job.id", ondelete="SET NULL")
+    )
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -241,6 +244,9 @@ class ObservationLatest(Base):
     promotions: Mapped[list] = mapped_column(JSONB, default=list)
     error_code: Mapped[str | None] = mapped_column(String(48))
     baseline_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_observation_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("observation.id", ondelete="SET NULL")
+    )
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -253,6 +259,7 @@ class MonitorTask(Base):
     name: Mapped[str] = mapped_column(String(160))
     store_codes: Mapped[list] = mapped_column(JSONB, default=list)
     style_codes: Mapped[list] = mapped_column(JSONB, default=list)
+    all_stores: Mapped[bool] = mapped_column(Boolean, default=False)
     cadence_seconds: Mapped[int] = mapped_column(Integer, default=1800)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_on_restock: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -260,7 +267,9 @@ class MonitorTask(Base):
     notify_on_price_change: Mapped[bool] = mapped_column(Boolean, default=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_by: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("app_user.id", ondelete="SET NULL")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -285,7 +294,10 @@ class ScanJob(Base):
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    requested_by: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    leased_by: Mapped[str | None] = mapped_column(String(96))
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("app_user.id", ondelete="SET NULL")
+    )
     error_summary: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -314,6 +326,7 @@ class ChangeEvent(Base):
     __table_args__ = (
         UniqueConstraint("dedupe_key", name="uq_change_event_dedupe"),
         Index("ix_change_event_detected", "detected_at"),
+        Index("ix_change_event_tenant_detected", "tenant_id", "detected_at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -331,6 +344,12 @@ class ChangeEvent(Base):
     promotions: Mapped[list] = mapped_column(JSONB, default=list)
     payload_hash: Mapped[str] = mapped_column(String(64), default="")
     dedupe_key: Mapped[str] = mapped_column(String(200))
+    before_observation_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("observation.id", ondelete="SET NULL")
+    )
+    after_observation_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("observation.id", ondelete="SET NULL")
+    )
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -349,6 +368,7 @@ class Credential(Base):
     status: Mapped[str] = mapped_column(String(32), default=CredentialStatus.ACTIVE.value)
     access_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str] = mapped_column(String(300), default="")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -362,8 +382,30 @@ class UsageDaily(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenant.id", ondelete="CASCADE"))
     day: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    review_requests: Mapped[int] = mapped_column(Integer, default=0)
-    price_requests: Mapped[int] = mapped_column(Integer, default=0)
+    review_requests: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    price_requests: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class PlatformUsageDaily(Base):
+    """Platform-wide transaction counter for the daily hard cap."""
+
+    __tablename__ = "platform_usage_daily"
+    __table_args__ = (UniqueConstraint("day", name="uq_platform_usage_daily_day"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    day: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    transactions: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
+class PlatformUsageHourly(Base):
+    """Platform-wide transaction counter for the steady-state rate cap."""
+
+    __tablename__ = "platform_usage_hourly"
+    __table_args__ = (UniqueConstraint("hour", name="uq_platform_usage_hourly_hour"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    hour: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    transactions: Mapped[int] = mapped_column(Integer, default=0, server_default="0")

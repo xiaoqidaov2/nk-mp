@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -26,6 +26,8 @@ class ProbeResult:
     message: str = ""
     trusted: bool = True
     observations_written: int = 0
+    # style_id -> new structure hash for structures that changed this round
+    structure_changes: dict = field(default_factory=dict)
 
 
 def _hash_structure(structure: SizeStructure) -> str:
@@ -100,6 +102,7 @@ def probe_store(
 
     styles: dict[str, Style] = {}
     structures: dict[str, SizeStructure] = {}
+    changed_structures: dict = {}
     for style_code in style_codes:
         style = session.execute(
             select(Style).where(Style.style_code == style_code)
@@ -109,16 +112,19 @@ def probe_store(
             session.add(style)
             session.flush()
         styles[style_code] = style
-        structures[style_code] = get_or_fetch_structure(
-            session, client, settings, store, style
-        )[0]
+        structure, changed = get_or_fetch_structure(session, client, settings, store, style)
+        structures[style_code] = structure
+        if changed and structure.status == "OK":
+            changed_structures[style.id] = _hash_structure(structure)
 
     missing_styles = [code for code in style_codes if not structures[code].sizes]
     for style_code in missing_styles:
-        structure = get_or_fetch_structure(
+        structure, changed = get_or_fetch_structure(
             session, client, settings, store, styles[style_code], force=True
-        )[0]
+        )
         structures[style_code] = structure
+        if changed and structure.status == "OK":
+            changed_structures[styles[style_code].id] = _hash_structure(structure)
 
     plan: list[tuple[str, str, str]] = []
     for style_code in style_codes:
@@ -134,18 +140,13 @@ def probe_store(
             trusted=False,
         )
 
-    if not quota.try_consume(session, store, len(plan), kind="availability"):
-        return ProbeResult(
-            store_code=store.store_code,
-            observations=[],
-            error_code=ErrorCode.BATCH_SUSPECT.value,
-            message="daily review budget exhausted",
-            trusted=False,
-        )
+    # Every real upstream transaction (PUT, poll GET, retry) consumes quota at
+    # the moment the request is issued; exhausting the budget aborts the probe
+    # with an UNKNOWN result instead of a guessed one.
+    client.transaction_listener = lambda kind: quota.consume_transaction(session, kind)
 
     availability: dict[str, str] = {}
     prices: dict[str, PriceInfo] = {}
-    batch = None
     for start in range(0, len(plan), settings.availability_chunk_size):
         chunk = plan[start : start + settings.availability_chunk_size]
         gtins = [item[0] for item in chunk]
@@ -159,6 +160,7 @@ def probe_store(
                 error_code=code,
                 message=str(exc),
                 trusted=False,
+                structure_changes=changed_structures,
             )
         if not batch.trusted:
             return ProbeResult(
@@ -167,6 +169,7 @@ def probe_store(
                 error_code=batch.error_code or ErrorCode.BATCH_SUSPECT.value,
                 message=batch.message,
                 trusted=False,
+                structure_changes=changed_structures,
             )
         for gtin, item in batch.items.items():
             availability[gtin] = item.availability
@@ -174,24 +177,24 @@ def probe_store(
                 prices[gtin] = item.price
 
     in_stock = [gtin for gtin, status in availability.items() if status == "IN_STOCK"]
-    if in_stock and not quota.try_consume(session, store, len(in_stock), kind="price"):
-        # Size-level stock is still trustworthy; prices stay missing.
-        prices = {}
-    else:
-        for start in range(0, len(in_stock), settings.price_chunk_size):
-            group = in_stock[start : start + settings.price_chunk_size]
-            try:
-                price_batch = client.review(group, region_id=store.region_id, with_price=True)
-            except (ScanError, NikeTransportError):
-                continue
-            if not price_batch.trusted:
-                continue
-            for gtin, item in price_batch.items.items():
-                if item.price is not None:
-                    prices[gtin] = item.price
-            for gtin, item in price_batch.items.items():
-                if item.availability != "IN_STOCK":
-                    availability[gtin] = item.availability
+    for start in range(0, len(in_stock), settings.price_chunk_size):
+        group = in_stock[start : start + settings.price_chunk_size]
+        try:
+            price_batch = client.review(group, region_id=store.region_id, with_price=True)
+        except ScanError as exc:
+            if exc.code == ErrorCode.BUDGET_EXHAUSTED:
+                break
+            continue
+        except NikeTransportError:
+            continue
+        if not price_batch.trusted:
+            continue
+        for gtin, item in price_batch.items.items():
+            if item.price is not None:
+                prices[gtin] = item.price
+        for gtin, item in price_batch.items.items():
+            if item.availability != "IN_STOCK":
+                availability[gtin] = item.availability
 
     for gtin, style_code, size_label in plan:
         status = availability.get(gtin, "UNKNOWN")
@@ -219,4 +222,8 @@ def probe_store(
             )
         )
 
-    return ProbeResult(store_code=store.store_code, observations=observations)
+    return ProbeResult(
+        store_code=store.store_code,
+        observations=observations,
+        structure_changes=changed_structures,
+    )

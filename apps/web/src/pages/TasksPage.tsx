@@ -56,7 +56,12 @@ export function TasksPage() {
           pagination={{ pageSize: 10, hideOnSinglePage: true }}
           columns={[
             { title: "任务名称", dataIndex: "name" },
-            { title: "门店数", dataIndex: "store_count", width: 90 },
+            {
+              title: "门店数",
+              dataIndex: "store_count",
+              width: 90,
+              render: (value: number, row: MonitorTask) => (row.all_stores ? "全部" : value),
+            },
             { title: "货号数", dataIndex: "style_count", width: 90 },
             {
               title: "周期",
@@ -94,7 +99,9 @@ export function TasksPage() {
                 <Space size={8}>
                   <Button
                     size="small"
-                    disabled={!canWrite || row.store_count === 0 || row.style_count === 0}
+                    disabled={
+                      !canWrite || (!row.all_stores && row.store_count === 0) || row.style_count === 0
+                    }
                     loading={run.isPending && run.variables === row.id}
                     onClick={() => run.mutate(row.id)}
                   >

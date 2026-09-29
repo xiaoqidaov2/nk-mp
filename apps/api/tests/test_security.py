@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.config import get_settings
 from app.security import (
     csrf_matches,
     csrf_token_for,
@@ -34,3 +35,15 @@ def test_csrf_binding(settings) -> None:
 def test_token_fingerprint_is_stable_and_opaque(settings) -> None:
     assert token_fingerprint("abc") == token_fingerprint("abc")
     assert token_fingerprint("abc") != "abc"
+
+
+def test_credential_encryption_refuses_without_key(monkeypatch) -> None:
+    """Without NIKE_MP_CREDENTIAL_KEY the service must refuse to handle secrets."""
+    import pytest
+
+    monkeypatch.setenv("NIKE_MP_CREDENTIAL_KEY", "")
+    get_settings.cache_clear()
+    with pytest.raises(RuntimeError):
+        encrypt_secret("secret-token-value")
+    with pytest.raises(RuntimeError):
+        decrypt_secret("bm90LWEtY2lwaGVydGV4dA==")

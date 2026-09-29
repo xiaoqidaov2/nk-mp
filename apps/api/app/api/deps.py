@@ -15,6 +15,7 @@ from app.security import csrf_matches, token_fingerprint
 
 SESSION_COOKIE = "nike_mp_session"
 CSRF_HEADER = "X-CSRF-Token"
+CSRF_COOKIE = "nike_mp_csrf"
 
 OPS_ROLES = {Role.OPS_ADMIN.value, Role.OPS_OPERATOR.value}
 WRITE_ROLES = {Role.OPS_ADMIN.value, Role.OPS_OPERATOR.value, Role.TENANT_ADMIN.value}
@@ -79,7 +80,18 @@ def require_write(
     return user
 
 
-def require_ops(user: User = Depends(require_write)) -> User:
+def require_ops(user: User = Depends(get_current_user)) -> User:
+    """Read-only operations access.
+
+    GET handlers must not require a CSRF token; the role check is the whole
+    guard. Mutating operations endpoints use :func:`require_ops_write`.
+    """
+    if user.role not in OPS_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "operations role required")
+    return user
+
+
+def require_ops_write(user: User = Depends(require_write)) -> User:
     if user.role not in OPS_ROLES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "operations role required")
     return user
