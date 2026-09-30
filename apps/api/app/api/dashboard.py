@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, settings_dep
+from app.api.deps import get_current_session, get_db, settings_dep
 from app.config import Settings
 from app.models import (
+    AuthSession,
     ChangeEvent,
     CredentialStatus,
     EventType,
@@ -22,7 +23,7 @@ from app.models import (
     User,
 )
 from app.schemas import DashboardOut
-from app.services.credentials import CredentialService
+from app.services.credentials import CredentialError, CredentialService
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -35,25 +36,38 @@ def _today_window() -> datetime:
 @router.get("", response_model=DashboardOut)
 def get_dashboard(
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
     settings: Settings = Depends(settings_dep),
 ) -> DashboardOut:
+    """Personal dashboard.
+
+    Task, job, event and latest-state counters are scoped to the caller.
+    ``UsageDaily`` stays the tenant-wide upstream budget (labelled as such in
+    the UI); it is not a per-user quota.
+    """
+    user = payload[0]
     today = _today_window()
     tenant = db.execute(select(Tenant).where(Tenant.id == user.tenant_id)).scalar_one()
+
+    binding = None
+    try:
+        binding = CredentialService(settings, user.id).binding()
+    except CredentialError:
+        binding = None
 
     def _count_events(event_type: EventType) -> int:
         stmt = select(func.count()).select_from(ChangeEvent).where(
             ChangeEvent.event_type == event_type.value,
             ChangeEvent.detected_at >= today,
+            ChangeEvent.owner_user_id == user.id,
+            ChangeEvent.tenant_id == user.tenant_id,
         )
-        if not tenant.is_platform:
-            # Shared observation events plus this tenant's private events.
-            stmt = stmt.where(
-                or_(ChangeEvent.tenant_id.is_(None), ChangeEvent.tenant_id == user.tenant_id)
-            )
         return int(db.execute(stmt).scalar_one())
 
-    task_filter = [] if tenant.is_platform else [MonitorTask.tenant_id == user.tenant_id]
+    task_filter = [
+        MonitorTask.tenant_id == user.tenant_id,
+        MonitorTask.created_by == user.id,
+    ]
     active_tasks = int(
         db.execute(
             select(func.count()).select_from(MonitorTask).where(
@@ -68,16 +82,37 @@ def get_dashboard(
         monitored_codes.update(codes or [])
 
     store_count = int(
-        db.execute(select(func.count()).select_from(Store).where(Store.is_active.is_(True))).scalar_one()
-    )
-    monitored_stores = int(
         db.execute(
-            select(func.count(func.distinct(ObservationLatest.store_id)))
+            select(func.count())
+            .select_from(Store)
+            .where(Store.owner_user_id == user.id, Store.is_active.is_(True))
         ).scalar_one()
     )
-    last_checked = db.execute(select(func.max(ObservationLatest.checked_at))).scalar_one()
 
-    job_filter = [] if tenant.is_platform else [ScanJob.tenant_id == user.tenant_id]
+    latest_filter = [ObservationLatest.owner_user_id == user.id]
+    if binding is not None:
+        latest_filter.extend(
+            [
+                ObservationLatest.credential_id == binding.credential_id,
+                ObservationLatest.credential_generation == binding.generation,
+            ]
+        )
+    monitored_stores = 0
+    last_checked = None
+    if binding is not None:
+        monitored_stores = int(
+            db.execute(
+                select(func.count(func.distinct(ObservationLatest.store_id))).where(*latest_filter)
+            ).scalar_one()
+        )
+        last_checked = db.execute(
+            select(func.max(ObservationLatest.checked_at)).where(*latest_filter)
+        ).scalar_one()
+
+    job_filter = [
+        ScanJob.tenant_id == user.tenant_id,
+        ScanJob.owner_user_id == user.id,
+    ]
     running_jobs = int(
         db.execute(
             select(func.count()).select_from(ScanJob).where(
@@ -99,7 +134,7 @@ def get_dashboard(
     usage_row = db.execute(
         select(UsageDaily).where(UsageDaily.tenant_id == user.tenant_id, UsageDaily.day == today)
     ).scalar_one_or_none()
-    credential = CredentialService(settings, db).status()
+    credential = CredentialService(settings, user.id).status()
 
     return DashboardOut(
         active_tasks=active_tasks,
@@ -114,9 +149,9 @@ def get_dashboard(
         running_jobs=running_jobs,
         last_checked_at=last_checked,
         credential_status=(
-            str(credential["status"]) if credential else CredentialStatus.NEEDS_AUTHORIZATION.value
+            credential.status if credential else CredentialStatus.UNASSIGNED.value
         ),
-        credential_expires_at=credential.get("access_expires_at") if credential else None,
+        credential_expires_at=credential.access_expires_at if credential else None,
         review_requests_today=(
             int(usage_row.review_requests) + int(usage_row.price_requests) if usage_row else 0
         ),

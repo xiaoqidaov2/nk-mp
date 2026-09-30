@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Role, Style, Tenant, User
+from app.models import Credential, CredentialStatus, Role, Style, Tenant, User
 from app.nike.client import NikeClient
 from app.security import hash_password
 from app.services.credentials import CredentialService
@@ -66,38 +68,98 @@ def cmd_import_credential(args: argparse.Namespace) -> int:
         )
         return 1
     with _session() as db:
-        CredentialService(settings, db).store_tokens(
+        user = _require_user(db, args.user_id)
+        binding = CredentialService(settings, user.id).store_tokens(
             access_token, refresh_token, client_id=settings.oauth_client_id
         )
         db.commit()
-    print("credential stored (encrypted)")
+    print(f"credential stored for user {user.email} (generation {binding.generation})")
     return 0
 
 
-def cmd_sync_stores(_args: argparse.Namespace) -> int:
+def cmd_assign_credential(args: argparse.Namespace) -> int:
+    """Attribute one legacy owner-less credential to an unbound user.
+
+    One-shot operator tool for migration: no copy, no refresh, no secret is
+    printed. Conflicts are refused instead of overwritten.
+    """
+    with _session() as db:
+        user = _require_user(db, args.user_id)
+        record = db.execute(
+            select(Credential).where(Credential.id == args.credential_id)
+        ).scalar_one_or_none()
+        if record is None:
+            print("credential not found", file=sys.stderr)
+            return 1
+        if record.owner_user_id is not None:
+            print("credential already has an owner; refusing", file=sys.stderr)
+            return 1
+        existing = db.execute(
+            select(Credential).where(Credential.owner_user_id == user.id)
+        ).scalar_one_or_none()
+        if existing is not None:
+            print("user already has a credential binding; refusing", file=sys.stderr)
+            return 1
+        if record.phone_hash is not None:
+            conflict = db.execute(
+                select(Credential).where(
+                    Credential.phone_hash == record.phone_hash,
+                    Credential.id != record.id,
+                    Credential.status != CredentialStatus.REVOKED.value,
+                )
+            ).scalar_one_or_none()
+            if conflict is not None:
+                print("phone number already bound to another credential; refusing", file=sys.stderr)
+                return 1
+        record.owner_user_id = user.id
+        record.status = CredentialStatus.ACTIVE.value
+        record.last_error_code = None
+        record.updated_at = datetime.now(UTC)
+        db.commit()
+    print(f"credential assigned to user {user.email}")
+    return 0
+
+
+def cmd_sync_stores(args: argparse.Namespace) -> int:
     settings = get_settings()
     with _session() as db:
-        service = CredentialService(settings, db)
-        token = service.access_token()
-        with NikeClient(settings, token, token_provider=service.token_provider()) as client:
+        user = _require_user(db, args.user_id)
+        service = CredentialService(settings, user.id)
+        binding = service.binding()
+        token = service.access_token(binding=binding)
+        with NikeClient(settings, token, token_provider=service.token_provider(binding)) as client:
             records = client.list_stores()
-        touched = sync_stores(db, records, "cli")
+        touched = sync_stores(db, records, "cli", user.id)
         db.commit()
     print(f"synced {touched} stores")
     return 0
 
 
+def _require_user(db, raw_user_id: str) -> User:
+    try:
+        user_id = uuid.UUID(str(raw_user_id))
+    except (TypeError, ValueError):
+        raise SystemExit(f"invalid user id: {raw_user_id}") from None
+    user = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    if user is None or not user.is_active:
+        raise SystemExit(f"active user not found: {raw_user_id}")
+    return user
+
+
 def cmd_add_style(args: argparse.Namespace) -> int:
     with _session() as db:
+        user = _require_user(db, args.user_id)
         for code in args.codes:
             normalized = code.strip().upper()
             if not normalized:
                 continue
             existing = db.execute(
-                select(Style).where(Style.style_code == normalized)
+                select(Style).where(
+                    Style.owner_user_id == user.id, Style.style_code == normalized
+                )
             ).scalar_one_or_none()
             if existing is None:
-                db.add(Style(style_code=normalized, title=normalized))
+                db.add(Style(style_code=normalized, title=normalized, owner_user_id=user.id))
         db.commit()
     print(f"registered {len(args.codes)} style code(s)")
     return 0
@@ -167,14 +229,22 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.set_defaults(func=cmd_bootstrap)
 
     credential = sub.add_parser("import-credential", help="导入并加密存储访问凭证")
+    credential.add_argument("--user-id", required=True, help="凭证归属的平台用户 UUID")
     credential.add_argument("--access-token-file", default="jwt_latest.txt")
     credential.add_argument("--refresh-token-file", default="mp_refresh.txt")
     credential.set_defaults(func=cmd_import_credential)
 
+    assign = sub.add_parser("assign-credential", help="把无归属的历史凭证一次性指派给某用户")
+    assign.add_argument("--credential-id", required=True, help="credential 行 UUID")
+    assign.add_argument("--user-id", required=True, help="目标平台用户 UUID")
+    assign.set_defaults(func=cmd_assign_credential)
+
     stores = sub.add_parser("sync-stores", help="从 Nike 接口同步门店清单")
+    stores.add_argument("--user-id", required=True, help="使用该用户的绑定凭证")
     stores.set_defaults(func=cmd_sync_stores)
 
-    styles = sub.add_parser("add-style", help="登记待监控货号")
+    styles = sub.add_parser("add-style", help="为某个用户登记待监控货号")
+    styles.add_argument("--user-id", required=True, help="归属用户 id（目录按连接归属）")
     styles.add_argument("codes", nargs="+")
     styles.set_defaults(func=cmd_add_style)
 

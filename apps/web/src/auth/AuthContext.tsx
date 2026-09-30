@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 
 import { authApi } from "@/data/api";
 import { setCsrfToken } from "@/data/client";
+import { clearAllNikeAttemptIds } from "@/data/nikeAttempt";
 import type { CurrentUser } from "@/data/types";
 
 interface AuthState {
@@ -56,6 +57,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await authApi.logout();
     } finally {
       setCsrfToken("");
+      // Drop the in-flight SMS attempt ids and cached results; the bound
+      // credential itself lives server-side and is not destroyed here.
+      clearAllNikeAttemptIds();
       queryClient.clear();
       setUser(null);
     }

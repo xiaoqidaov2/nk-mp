@@ -15,9 +15,14 @@ router = APIRouter(tags=["catalog"])
 def list_stores(
     search: str = Query(default="", max_length=80),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[StoreOut]:
-    stmt = select(Store).where(Store.is_active.is_(True)).order_by(Store.store_code)
+    # 目录是连接缓存：只返回本用户自己拉取到的门店。
+    stmt = (
+        select(Store)
+        .where(Store.owner_user_id == user.id, Store.is_active.is_(True))
+        .order_by(Store.store_code)
+    )
     rows = db.execute(stmt).scalars().all()
     if search:
         needle = search.strip().lower()
@@ -36,10 +41,13 @@ def list_styles(
     search: str = Query(default="", max_length=80),
     limit: int = Query(default=100, ge=1, le=1000),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[StyleOut]:
     rows = db.execute(
-        select(Style).order_by(Style.style_code).limit(limit)
+        select(Style)
+        .where(Style.owner_user_id == user.id)
+        .order_by(Style.style_code)
+        .limit(limit)
     ).scalars().all()
     if search:
         needle = search.strip().upper()
@@ -53,17 +61,20 @@ def list_styles(
 def style_structure(
     style_code: str,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> dict[str, object]:
     style = db.execute(
-        select(Style).where(Style.style_code == style_code.upper())
+        select(Style).where(Style.owner_user_id == user.id, Style.style_code == style_code.upper())
     ).scalar_one_or_none()
     if style is None:
         return {"style_code": style_code.upper(), "status": "MISSING", "stores": []}
     rows = db.execute(
         select(GtinStructure, Store)
         .join(Store, Store.id == GtinStructure.store_id)
-        .where(GtinStructure.style_id == style.id)
+        .where(
+            GtinStructure.owner_user_id == user.id,
+            GtinStructure.style_id == style.id,
+        )
         .order_by(Store.store_code)
     ).all()
     return {

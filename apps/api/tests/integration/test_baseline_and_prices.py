@@ -1,29 +1,45 @@
-"""T06: baseline protection and price honesty."""
+"""T06: baseline protection and price honesty.
+
+Every observation and latest-state row is personal: it carries the owner user
+and the exact credential generation that produced it. Baselines are therefore
+per-owner; a re-bound account only rebuilds its own baseline.
+"""
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.db import SessionLocal
 from app.models import ChangeEvent, Observation, ObservationLatest, Trust
 from app.services.observations import persist_observations
 
-from .helpers import make_store, make_style, make_tenant
+from .helpers import make_store, make_style, make_tenant, make_user, store_credential
 
 SEVEN_DAYS = 7 * 24 * 3600
 
 
 @pytest.fixture
 def world():
+    settings = get_settings()
     with SessionLocal() as db:
         tenant = make_tenant(db)
-        store = make_store(db, code="S001")
-        style = make_style(db, code="DN3707-202")
+        user = make_user(db, tenant, email=f"base-{uuid.uuid4().hex[:8]}@example.com")
+        store = make_store(db, owner=user, code="S001")
+        style = make_style(db, owner=user, code="DN3707-202")
         db.commit()
-        return {"tenant_id": tenant.id, "store_id": store.id, "style_id": style.id}
+        world = {
+            "tenant_id": tenant.id,
+            "store_id": store.id,
+            "style_id": style.id,
+            "user_id": user.id,
+        }
+    world["binding"] = store_credential(settings, world["user_id"])
+    return world
 
 
 def _observation(world, *, availability, checked_at, gtin="G1", price=None):
@@ -44,7 +60,12 @@ def _observation(world, *, availability, checked_at, gtin="G1", price=None):
 
 def _persist(world, **kwargs):
     with SessionLocal() as db:
-        summary = persist_observations(db, [_observation(world, **kwargs)], max_gap_seconds=SEVEN_DAYS)
+        summary = persist_observations(
+            db,
+            [_observation(world, **kwargs)],
+            binding=world["binding"],
+            max_gap_seconds=SEVEN_DAYS,
+        )
         db.commit()
         return summary
 
@@ -62,6 +83,11 @@ def test_first_collection_only_builds_baseline(world) -> None:
         latest = db.execute(select(ObservationLatest)).scalar_one()
         assert latest.availability == "OUT_OF_STOCK"
         assert latest.baseline_ready is True
+        assert latest.owner_user_id == world["user_id"]
+        assert latest.credential_generation == world["binding"].generation
+        observation = db.execute(select(Observation)).scalar_one()
+        assert observation.owner_user_id == world["user_id"]
+        assert observation.credential_id == world["binding"].credential_id
 
 
 def test_gap_longer_than_max_rebuilds_baseline_without_events(world) -> None:
@@ -90,6 +116,7 @@ def test_structure_change_round_records_diagnostics_but_no_restock(world) -> Non
         summary = persist_observations(
             db,
             [_observation(world, availability="IN_STOCK", checked_at=datetime.now(UTC), gtin="new")],
+            binding=world["binding"],
             max_gap_seconds=SEVEN_DAYS,
             suppress_structures={world["style_id"]: "new-hash"},
         )
@@ -97,6 +124,8 @@ def test_structure_change_round_records_diagnostics_but_no_restock(world) -> Non
     assert summary.restock == 0
     events = _events()
     assert [event.event_type for event in events] == ["STRUCTURE_CHANGED"]
+    assert events[0].owner_user_id == world["user_id"]
+    assert events[0].tenant_id == world["tenant_id"]
 
 
 def test_failed_round_keeps_the_last_trusted_inventory(world) -> None:

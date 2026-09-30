@@ -10,6 +10,11 @@ x-qa-upstream-env: &qa-upstream-env
   NIKE_MP_NIKE_API_BASE: http://stub:9100
   NIKE_MP_NIKE_TEST_API_BASE: http://stub:9100
   NIKE_MP_NIKE_OAUTH_BASE: http://stub:9100
+  # Self-service phone binding, pointed at the same stub. The contract version
+  # must equal SUPPORTED_CONTRACT_VERSION in app/nike/phone_auth.py.
+  NIKE_MP_CREDENTIAL_KEY: ${NIKE_MP_CREDENTIAL_KEY:-qa-credential-key}
+  NIKE_MP_NIKE_PHONE_AUTH_ENABLED: "true"
+  NIKE_MP_NIKE_PHONE_AUTH_CONTRACT_VERSION: "2026-09-29/mp-phone-otc-pkce"
 
 services:
   stub:

@@ -34,10 +34,13 @@ class NikeClient:
         sleep: Callable[[float], None] = time.sleep,
         transport: httpx.BaseTransport | None = None,
         transaction_listener: Callable[[str], bool] | None = None,
+        *,
+        credential_guard: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
         self._access_token = access_token
         self._token_provider = token_provider
+        self._credential_guard = credential_guard
         self._sleep = sleep
         self._client = httpx.Client(
             http2=True, timeout=30.0, follow_redirects=False, transport=transport
@@ -84,6 +87,11 @@ class NikeClient:
         auth_retries = 0
         response: httpx.Response | None = None
         while attempts < self.settings.request_retry_limit:
+            if authorized and self._credential_guard is not None:
+                # The binding must still be current and the owner enabled
+                # before any authoritative request consumes quota. Requests
+                # already sent cannot be recalled; only future ones stop.
+                self._run_credential_guard()
             self._consume_transaction(quota_kind)
             try:
                 response = self._client.request(
@@ -103,7 +111,7 @@ class NikeClient:
                     raise ScanError(ErrorCode.AUTH_REQUIRED, "access token rejected")
                 auth_retries += 1
                 rejected = self._access_token
-                refreshed = self._token_provider(rejected)
+                refreshed = self._run_token_provider(rejected)
                 if not refreshed or refreshed == rejected:
                     # The credential could not be rotated; retrying with the
                     # same token would only burn the remaining budget.
@@ -135,6 +143,30 @@ class NikeClient:
                 ErrorCode.BUDGET_EXHAUSTED,
                 "upstream transaction budget exhausted",
             )
+
+    def _run_credential_guard(self) -> None:
+        assert self._credential_guard is not None
+        try:
+            self._credential_guard()
+        except ScanError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - credential errors carry stable codes
+            code = getattr(exc, "code", None)
+            if isinstance(code, str) and code.startswith("NIKE_"):
+                raise ScanError(ErrorCode.AUTH_REQUIRED, code) from exc
+            raise
+
+    def _run_token_provider(self, rejected: str | None) -> str:
+        assert self._token_provider is not None
+        try:
+            return self._token_provider(rejected)
+        except ScanError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - credential errors carry stable codes
+            code = getattr(exc, "code", None)
+            if isinstance(code, str) and code.startswith("NIKE_"):
+                raise ScanError(ErrorCode.AUTH_REQUIRED, code) from exc
+            raise
 
     # --------------------------------------------------------------- catalog
 

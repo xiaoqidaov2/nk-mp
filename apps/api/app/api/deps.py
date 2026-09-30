@@ -80,6 +80,27 @@ def require_write(
     return user
 
 
+def require_self_write(
+    session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+    csrf: str | None = Header(default=None, alias=CSRF_HEADER),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> tuple[User, AuthSession]:
+    """CSRF-checked write dependency for per-user self-service endpoints.
+
+    Every logged-in role (including ``tenant_viewer``) may manage its own
+    Nike connection; scanning stays behind :func:`require_write`.
+    """
+    user, record = payload
+    _assert_csrf(session_token, record, csrf)
+    if not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user disabled")
+    tenant = db.execute(select(Tenant).where(Tenant.id == user.tenant_id)).scalar_one_or_none()
+    if tenant is None or not tenant.is_active:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant disabled")
+    return user, record
+
+
 def require_ops(user: User = Depends(get_current_user)) -> User:
     """Read-only operations access.
 

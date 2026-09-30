@@ -103,3 +103,21 @@ def decrypt_secret(ciphertext: str) -> str:
     blob = base64.b64decode(ciphertext)
     nonce, sealed = blob[:12], blob[12:]
     return AESGCM(_credential_key()).decrypt(nonce, sealed, None).decode("utf-8")
+
+
+def secret_fingerprint(value: str, *, purpose: str) -> str:
+    """Purpose-scoped HMAC-SHA256 for low-entropy identifiers (phone, IP).
+
+    A bare hash of a phone number is trivially reversible; the server key and
+    the purpose label keep fingerprints isolated and non-guessable.
+    """
+    key = _credential_key()
+    return hmac.new(key, f"{purpose}\x00{value}".encode(), hashlib.sha256).hexdigest()
+
+
+def credential_key_available() -> bool:
+    try:
+        _credential_key()
+    except RuntimeError:
+        return False
+    return True

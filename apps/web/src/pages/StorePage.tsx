@@ -1,12 +1,30 @@
-import { Alert, Card, Descriptions, Empty, Input, Space, Table, Tag, Typography } from "antd";
+import { Alert, Descriptions, Input, Space, Table, Typography } from "antd";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
+import { EmptyState } from "@/components/EmptyState";
 import { FreshnessBadge } from "@/components/FreshnessBadge";
-import { availabilityLabel } from "@/components/StatusTag";
+import { CardRow, ResponsiveList } from "@/components/MobileCardList";
+import { NikeConnectionNotice } from "@/components/NikeCredentialCard";
+import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
+import { StatusPill } from "@/components/StatusPill";
+import { TimeText } from "@/components/TimeText";
+import {
+  BTN,
+  EMPTY,
+  ERR,
+  STORE_PAGE,
+  formatPrice,
+  formatPriceChange,
+  formatPromotions,
+  formatSizeLabel,
+  formatStoreLabel,
+  latestCheckedAt,
+} from "@/copy";
 import { catalogApi, changeApi, matrixApi } from "@/data/api";
-import type { ChangeEvent, Matrix, StoreOut } from "@/data/types";
+import type { ChangeEvent, Matrix, MatrixCell, StoreOut } from "@/data/types";
 
 export function StorePage() {
   const { storeCode = "" } = useParams();
@@ -41,33 +59,162 @@ export function StorePage() {
     enabled: styleCodes.length > 0,
   });
 
+  const storeChanges = (changes.data ?? []).filter((item) => item.store_code === storeCode);
+  const cells = matrix.data?.cells ?? [];
+
+  const resultCards = (
+    <ResponsiveList
+      items={cells}
+      rowKey={(row) => `${row.store_code}-${row.size_label}`}
+      loading={matrix.isLoading}
+      empty={
+        <EmptyState
+          variant="no-data"
+          description={EMPTY.storeResults}
+          action={<Link to="/tasks/new">{BTN.newTask}</Link>}
+          compact
+        />
+      }
+      renderCard={(row) => (
+        <>
+          <div className="mobile-card-list__row">
+            <span>{formatSizeLabel(row.size_label)}</span>
+            <StatusPill domain="availability" value={row.availability} size="sm" />
+          </div>
+          <CardRow label="实付价">{formatPrice(row.total_price, row.availability)}</CardRow>
+        </>
+      )}
+      table={
+        <Table<MatrixCell>
+          size="small"
+          rowKey={(row) => `${row.store_code}-${row.size_label}`}
+          loading={matrix.isLoading}
+          dataSource={cells}
+          locale={{ emptyText: EMPTY.storeResults }}
+          pagination={{ pageSize: 20, hideOnSinglePage: true }}
+          columns={[
+            { title: "尺码", dataIndex: "size_label", width: 90, render: (value: string) => formatSizeLabel(value) },
+            {
+              title: "有货状态",
+              dataIndex: "availability",
+              width: 120,
+              render: (value: MatrixCell["availability"]) => (
+                <StatusPill domain="availability" value={value} size="sm" />
+              ),
+            },
+            {
+              title: "实付价",
+              dataIndex: "total_price",
+              width: 120,
+              render: (value: number | null, row: MatrixCell) => formatPrice(value, row.availability),
+            },
+            {
+              title: "标价",
+              dataIndex: "price",
+              width: 110,
+              render: (value: number | null) => formatPrice(value),
+            },
+            {
+              title: "促销",
+              dataIndex: "promotions",
+              render: (value: string[]) => formatPromotions(value),
+            },
+            {
+              title: "探测时间",
+              dataIndex: "checked_at",
+              width: 130,
+              render: (value: string | null) => <TimeText value={value} />,
+            },
+          ]}
+        />
+      }
+    />
+  );
+
+  const changeCards = (
+    <ResponsiveList
+      items={storeChanges}
+      rowKey={(row) => row.id}
+      loading={changes.isLoading}
+      empty={<EmptyState variant="no-data" description={EMPTY.storeChanges} compact />}
+      renderCard={(row) => (
+        <>
+          <div className="mobile-card-list__row">
+            <StatusPill domain="change" value={row.event_type} size="sm" />
+            <Link to={`/styles/${row.style_code}?store=${storeCode}`}>{row.style_code}</Link>
+          </div>
+          <CardRow label="实付价">
+            {formatPriceChange(row.before_total_price, row.after_total_price)}
+          </CardRow>
+        </>
+      )}
+      table={
+        <Table<ChangeEvent>
+          size="small"
+          rowKey="id"
+          loading={changes.isLoading}
+          dataSource={storeChanges}
+          locale={{ emptyText: EMPTY.storeChanges }}
+          pagination={{ pageSize: 10, hideOnSinglePage: true }}
+          columns={[
+            {
+              title: "类型",
+              dataIndex: "event_type",
+              width: 100,
+              render: (value: ChangeEvent["event_type"]) => (
+                <StatusPill domain="change" value={value} size="sm" />
+              ),
+            },
+            {
+              title: "货号",
+              dataIndex: "style_code",
+              render: (value: string) =>
+                value ? <Link to={`/styles/${value}?store=${storeCode}`}>{value}</Link> : "—",
+            },
+            { title: "尺码", dataIndex: "size_label", width: 90, render: (value: string) => formatSizeLabel(value) },
+            {
+              title: "实付价",
+              width: 150,
+              render: (_: unknown, row: ChangeEvent) =>
+                formatPriceChange(row.before_total_price, row.after_total_price),
+            },
+            {
+              title: "探测时间",
+              dataIndex: "checked_at",
+              width: 150,
+              render: (value: string) => <TimeText value={value} />,
+            },
+          ]}
+        />
+      }
+    />
+  );
+
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <Card size="small">
+      <PageHeader title={formatStoreLabel(storeCode, store?.display_name)} />
+      <NikeConnectionNotice action="读取本店数据" />
+
+      {stores.isSuccess && !store ? (
+        <Alert type="warning" showIcon message={ERR.storeNotFound} />
+      ) : null}
+
+      <SectionCard>
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
-          <Typography.Title level={5} style={{ margin: 0 }}>
-            {storeCode} · {store?.display_name || "未命名门店"}
-          </Typography.Title>
           <Descriptions size="small" column={{ xs: 1, md: 2 }}>
             <Descriptions.Item label="地址">{store?.address || "—"}</Descriptions.Item>
-            <Descriptions.Item label="概念店类型">{store?.concept || "—"}</Descriptions.Item>
+            <Descriptions.Item label="概念店">{store?.concept || "—"}</Descriptions.Item>
           </Descriptions>
-          <Alert
-            type="info"
-            showIcon
-            message="单店全量商品清单无法通过接口获得"
-            description="本页仅展示已监控货号和满减专区预览池的结果，不代表门店全部在售商品。"
-          />
+          <Alert type="info" showIcon message={STORE_PAGE.capability} />
         </Space>
-      </Card>
+      </SectionCard>
 
-      <Card
-        size="small"
-        title="本店已监控结果"
+      <SectionCard
+        title={STORE_PAGE.resultsTitle}
         extra={
           <Input
             size="small"
-            placeholder="按货号筛选"
+            placeholder={STORE_PAGE.filterPlaceholder}
             style={{ width: 200 }}
             value={styleFilter}
             onChange={(event) => setStyleFilter(event.target.value)}
@@ -76,75 +223,24 @@ export function StorePage() {
         }
       >
         {styleCodes.length === 0 ? (
-          <Empty description="本店暂无已监控结果" />
+          <EmptyState
+            variant="no-data"
+            description={EMPTY.storeResults}
+            action={<Link to="/tasks/new">{BTN.newTask}</Link>}
+            compact
+          />
         ) : (
           <Space direction="vertical" size={12} style={{ width: "100%" }}>
-            <FreshnessBadge checkedAt={matrix.data?.last_checked_at} />
+            <FreshnessBadge checkedAt={latestCheckedAt(matrix.data?.last_checked_at, cells)} />
             <Typography.Text type="secondary">
-              当前展示货号：{styleCodes[0]}（切换货号请使用下方变化记录或货号页）
+              {STORE_PAGE.currentStyle(styleCodes[0])}
             </Typography.Text>
-            <Table
-              size="small"
-              rowKey={(row) => `${row.store_code}-${row.size_label}`}
-              loading={matrix.isLoading}
-              dataSource={matrix.data?.cells ?? []}
-              pagination={{ pageSize: 20, hideOnSinglePage: true }}
-              columns={[
-                { title: "尺码", dataIndex: "size_label", width: 90 },
-                {
-                  title: "状态",
-                  dataIndex: "availability",
-                  width: 120,
-                  render: (value: Matrix["cells"][number]["availability"]) => availabilityLabel(value),
-                },
-                {
-                  title: "实付价",
-                  dataIndex: "total_price",
-                  width: 120,
-                  render: (value: number | null) => (value != null ? `¥${value.toFixed(2)}` : "待补价"),
-                },
-                {
-                  title: "促销",
-                  dataIndex: "promotions",
-                  render: (value: string[]) => (value.length ? value.join("；") : "—"),
-                },
-              ]}
-            />
+            {resultCards}
           </Space>
         )}
-      </Card>
+      </SectionCard>
 
-      <Card size="small" title={`本店近 14 天变化（${changes.data?.filter((item) => item.store_code === storeCode).length ?? 0} 条）`}>
-        <Table<ChangeEvent>
-          size="small"
-          rowKey="id"
-          loading={changes.isLoading}
-          dataSource={(changes.data ?? []).filter((item) => item.store_code === storeCode)}
-          locale={{ emptyText: <Empty description="本店暂无变化记录" /> }}
-          pagination={{ pageSize: 10, hideOnSinglePage: true }}
-          columns={[
-            {
-              title: "类型",
-              dataIndex: "event_type",
-              width: 100,
-              render: (value: string) => <Tag>{value}</Tag>,
-            },
-            {
-              title: "货号",
-              dataIndex: "style_code",
-              render: (value: string) =>
-                value ? <Link to={`/styles/${value}?store=${storeCode}`}>{value}</Link> : "—",
-            },
-            { title: "尺码", dataIndex: "size_label", width: 90, render: (v: string) => v || "—" },
-            {
-              title: "探测时间",
-              dataIndex: "checked_at",
-              width: 170,
-              render: (value: string) => new Date(value).toLocaleString("zh-CN"),
-            },
-          ]}
-        />
-      </Card>
+      <SectionCard title={STORE_PAGE.changesTitle(storeChanges.length)}>{changeCards}</SectionCard>
     </Space>
   );
 }

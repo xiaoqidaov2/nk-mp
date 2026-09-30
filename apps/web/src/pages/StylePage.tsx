@@ -1,16 +1,39 @@
-import { Alert, Card, Empty, Input, Space, Table, Tag, Typography, Button } from "antd";
-import { useQuery } from "@tanstack/react-query";
+import { Alert, App as AntdApp, Button, Input, Space, Table, Tag, Typography } from "antd";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
+import { useAuth } from "@/auth/AuthContext";
+import { EmptyState } from "@/components/EmptyState";
 import { FreshnessBadge } from "@/components/FreshnessBadge";
-import { MatrixCellBadge, StatusLegend, availabilityLabel } from "@/components/StatusTag";
-import { matrixApi } from "@/data/api";
-import type { Matrix, MatrixCell } from "@/data/types";
+import { CardRow, ResponsiveList } from "@/components/MobileCardList";
+import { NikeConnectionNotice } from "@/components/NikeCredentialCard";
+import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
+import { StatusLegend, MatrixCellBadge } from "@/components/StatusTag";
+import { StatusPill } from "@/components/StatusPill";
+import { TimeText } from "@/components/TimeText";
+import {
+  BTN,
+  EMPTY,
+  ERR,
+  MSG,
+  STYLE_PAGE,
+  formatCount,
+  formatPrice,
+  formatPromotions,
+  formatSizeLabel,
+  latestCheckedAt,
+} from "@/copy";
+import { matrixApi, scanApi, taskApi } from "@/data/api";
+import type { Matrix, MatrixCell, MonitorTask } from "@/data/types";
 
 export function StylePage() {
   const { styleCode = "" } = useParams();
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const { message } = AntdApp.useApp();
+  const { canWrite } = useAuth();
   const [sizeFilter, setSizeFilter] = useState("");
   const [inStockOnly, setInStockOnly] = useState(true);
 
@@ -18,6 +41,22 @@ export function StylePage() {
     queryKey: ["matrix", styleCode],
     queryFn: () => matrixApi.get(styleCode.toUpperCase()),
     enabled: Boolean(styleCode),
+  });
+
+  const emptyResults = matrix.isSuccess && (matrix.data?.cells.length ?? 0) === 0;
+  const tasks = useQuery<MonitorTask[]>({
+    queryKey: ["tasks"],
+    queryFn: () => taskApi.list(),
+    enabled: emptyResults && canWrite,
+  });
+
+  const runNow = useMutation({
+    mutationFn: (taskId: string) => scanApi.create({ task_id: taskId }),
+    onSuccess: (job) => {
+      message.success(MSG.checkStarted());
+      navigate(`/scans/${job.id}`);
+    },
+    onError: () => message.error(ERR.checkStartFailed),
   });
 
   const highlightSize = searchParams.get("size") ?? "";
@@ -38,18 +77,18 @@ export function StylePage() {
     return map;
   }, [matrix.data]);
 
-  if (matrix.isLoading) return <Card loading />;
-  if (matrix.isError) {
+  if (matrix.isLoading) return <SectionCard loading>{null}</SectionCard>;
+  if (matrix.isError || !matrix.data) {
     return (
       <Alert
         type="error"
         showIcon
-        message="无法加载货号矩阵"
-        description={(matrix.error as Error).message}
+        message={ERR.matrixFailed}
+        description={ERR.matrixFailedHint}
       />
     );
   }
-  const data = matrix.data as Matrix;
+  const data = matrix.data;
 
   const rows = data.stores
     .map((store) => {
@@ -61,44 +100,161 @@ export function StylePage() {
     })
     .filter((row) => (inStockOnly ? row.inStockCount > 0 : true));
 
+  const taskWithStyle = (tasks.data ?? []).find((task) => task.style_codes.includes(data.style_code));
+  const matrixEmpty = data.cells.length === 0;
+  const sizeFilterEmpty = !matrixEmpty && filteredSizes.length === 0;
+  const storeFilterEmpty = !matrixEmpty && !sizeFilterEmpty && rows.length === 0;
+
+  const emptyState = matrixEmpty ? (
+    <EmptyState
+      variant="not-probed"
+      description={EMPTY.matrixNoResults}
+      action={
+        taskWithStyle && canWrite ? (
+          <Button
+            type="primary"
+            loading={runNow.isPending}
+            onClick={() => runNow.mutate(taskWithStyle.id)}
+          >
+            {BTN.checkNow}
+          </Button>
+        ) : (
+          <Link to="/tasks/new">{BTN.newTask}</Link>
+        )
+      }
+      compact
+    />
+  ) : sizeFilterEmpty ? (
+    <EmptyState
+      variant="no-result"
+      description={EMPTY.matrixFiltered(sizeFilter.trim())}
+      action={<Button onClick={() => setSizeFilter("")}>{BTN.clearFilter}</Button>}
+      compact
+    />
+  ) : storeFilterEmpty ? (
+    <EmptyState
+      variant="no-result"
+      action={<Button onClick={() => setInStockOnly(false)}>{BTN.clearFilter}</Button>}
+      compact
+    />
+  ) : null;
+
+  const detailCards = (
+    <ResponsiveList
+      items={data.cells}
+      rowKey={(row) => `${row.store_code}|${row.size_label}`}
+      empty={<EmptyState variant="not-probed" description={EMPTY.matrixNoResults} compact />}
+      renderCard={(row) => (
+        <>
+          <div className="mobile-card-list__row">
+            <Link to={`/stores/${row.store_code}`}>{row.store_name || row.store_code}</Link>
+            <StatusPill domain="availability" value={row.availability} size="sm" />
+          </div>
+          <CardRow label="尺码">{formatSizeLabel(row.size_label)}</CardRow>
+          <CardRow label="实付价">{formatPrice(row.total_price, row.availability)}</CardRow>
+        </>
+      )}
+      table={
+        <Table<MatrixCell>
+          size="small"
+          rowKey={(row) => `${row.store_code}|${row.size_label}`}
+          dataSource={data.cells}
+          pagination={{ pageSize: 20, hideOnSinglePage: true }}
+          scroll={{ x: 720 }}
+          columns={[
+            {
+              title: "门店",
+              dataIndex: "store_name",
+              width: 180,
+              render: (value: string, row: MatrixCell) => (
+                <Link to={`/stores/${row.store_code}`}>
+                  {row.store_code}
+                  {value ? ` · ${value}` : ""}
+                </Link>
+              ),
+            },
+            {
+              title: "尺码",
+              dataIndex: "size_label",
+              width: 80,
+              render: (value: string) => formatSizeLabel(value),
+            },
+            {
+              title: "有货状态",
+              dataIndex: "availability",
+              width: 110,
+              render: (value: MatrixCell["availability"]) => (
+                <StatusPill domain="availability" value={value} size="sm" />
+              ),
+            },
+            {
+              title: "实付价",
+              dataIndex: "total_price",
+              width: 110,
+              render: (value: number | null, row: MatrixCell) => formatPrice(value, row.availability),
+            },
+            {
+              title: "标价",
+              dataIndex: "price",
+              width: 110,
+              render: (value: number | null) => formatPrice(value),
+            },
+            {
+              title: "促销",
+              dataIndex: "promotions",
+              render: (value: string[]) => formatPromotions(value),
+            },
+            {
+              title: "最近探测",
+              dataIndex: "checked_at",
+              width: 150,
+              render: (value: string | null) => <TimeText value={value} />,
+            },
+          ]}
+        />
+      }
+    />
+  );
+
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <Card size="small">
-        <Space direction="vertical" size={8} style={{ width: "100%" }}>
-          <Space size={12} wrap>
-            <Typography.Title level={5} style={{ margin: 0 }}>
-              {data.style_code}
-              {data.title && data.title !== data.style_code ? ` · ${data.title}` : ""}
-            </Typography.Title>
-            <FreshnessBadge checkedAt={data.last_checked_at} />
+      <PageHeader
+        title={`${data.style_code}${data.title && data.title !== data.style_code ? ` · ${data.title}` : ""}`}
+        meta={
+          <>
+            <FreshnessBadge checkedAt={latestCheckedAt(data.last_checked_at, data.cells)} />
             {data.structure_status !== "OK" ? (
-              <Tag color="orange">部分门店缺少尺码结构</Tag>
+              <Tag color="gold">{STYLE_PAGE.structureWarning}</Tag>
             ) : null}
-          </Space>
+          </>
+        }
+      />
+      <NikeConnectionNotice action="读取该货号数据" />
+
+      <SectionCard>
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
           <Space wrap>
             <Input
-              placeholder="筛选尺码，例如 42"
+              placeholder={STYLE_PAGE.filterPlaceholder}
               value={sizeFilter}
               onChange={(event) => setSizeFilter(event.target.value)}
               style={{ width: 200 }}
               allowClear
             />
             <Button onClick={() => setInStockOnly((prev) => !prev)}>
-              {inStockOnly ? "显示全部门店" : "仅有货门店"}
+              {inStockOnly ? STYLE_PAGE.showAllStores : STYLE_PAGE.inStockOnly}
             </Button>
             <Typography.Text type="secondary">
-              共 {rows.length} 家门店、{filteredSizes.length} 个尺码
+              {STYLE_PAGE.countSummary(rows.length, filteredSizes.length)}
             </Typography.Text>
           </Space>
           <StatusLegend />
         </Space>
-      </Card>
+      </SectionCard>
 
-      <Card size="small" title="货号 × 门店 × 尺码">
-        {rows.length === 0 ? (
-          <Empty description="暂无探测结果，请先运行一次扫描" />
-        ) : (
-          <div style={{ overflowX: "auto" }}>
+      <SectionCard title={STYLE_PAGE.matrixTitle}>
+        {emptyState ?? (
+          <div className="table-scroll-x">
             <table className="matrix-table" style={{ borderCollapse: "collapse", width: "100%" }}>
               <thead>
                 <tr>
@@ -108,10 +264,8 @@ export function StylePage() {
                   {filteredSizes.map((size) => (
                     <th
                       key={size}
-                      style={{
-                        padding: "6px 4px",
-                        background: size === highlightSize ? "#eaf1ff" : undefined,
-                      }}
+                      className={size === highlightSize ? "matrix-highlight-col" : undefined}
+                      style={{ padding: "6px 4px" }}
                     >
                       {size}
                     </th>
@@ -122,26 +276,26 @@ export function StylePage() {
                 {rows.map((row) => (
                   <tr
                     key={row.store.store_code}
-                    style={{
-                      background:
-                        row.store.store_code === highlightStore ? "#f2f8ff" : undefined,
-                    }}
+                    className={
+                      row.store.store_code === highlightStore ? "matrix-highlight-row" : undefined
+                    }
                   >
                     <td className="matrix-store-col" style={{ padding: 8 }}>
-                      {row.store.store_code} · {row.store.store_name || "未命名门店"}
-                      <div style={{ color: "#6b7280", fontSize: 11 }}>
-                        有货 {row.inStockCount} 码
-                      </div>
+                      <Link to={`/stores/${row.store.store_code}`}>
+                        {row.store.store_code}
+                        {row.store.store_name ? ` · ${row.store.store_name}` : ""}
+                      </Link>
+                      <div className="matrix-store-count">有货 {row.inStockCount} 码</div>
                     </td>
                     {row.cells.map((cell, index) => (
                       <td
                         key={`${row.store.store_code}-${filteredSizes[index]}`}
-                        style={{
-                          textAlign: "center",
-                          padding: 3,
-                          background:
-                            filteredSizes[index] === highlightSize ? "#f7fbff" : undefined,
-                        }}
+                        className={
+                          filteredSizes[index] === highlightSize
+                            ? "matrix-highlight-cell"
+                            : undefined
+                        }
+                        style={{ textAlign: "center", padding: 3 }}
                       >
                         {cell ? (
                           <MatrixCellBadge
@@ -149,11 +303,12 @@ export function StylePage() {
                             priceStatus={cell.price_status}
                             totalPrice={cell.total_price}
                             checkedAt={cell.checked_at}
+                            trust={cell.trust}
                           />
                         ) : (
                           <span
                             className="matrix-cell matrix-cell--unknown"
-                            title="该门店没有这个尺码的结构或尚未探测"
+                            title={STYLE_PAGE.matrixEmptyCell}
                           >
                             ?
                           </span>
@@ -166,50 +321,18 @@ export function StylePage() {
             </table>
           </div>
         )}
-      </Card>
+      </SectionCard>
 
-      <Card size="small" title="明细（含价格与促销）">
-        <Table<MatrixCell>
-          size="small"
-          rowKey={(row) => `${row.store_code}|${row.size_label}`}
-          dataSource={data.cells}
-          pagination={{ pageSize: 20, hideOnSinglePage: true }}
-          columns={[
-            { title: "门店", dataIndex: "store_name", width: 180 },
-            { title: "尺码", dataIndex: "size_label", width: 90 },
-            {
-              title: "状态",
-              dataIndex: "availability",
-              width: 110,
-              render: (value: MatrixCell["availability"]) => availabilityLabel(value),
-            },
-            {
-              title: "实付价",
-              dataIndex: "total_price",
-              width: 110,
-              render: (value: number | null) => (value != null ? `¥${value.toFixed(2)}` : "待补价"),
-            },
-            {
-              title: "标价",
-              dataIndex: "price",
-              width: 110,
-              render: (value: number | null) => (value != null ? `¥${value.toFixed(2)}` : "—"),
-            },
-            {
-              title: "促销",
-              dataIndex: "promotions",
-              render: (value: string[]) => (value.length ? value.join("；") : "—"),
-            },
-            {
-              title: "最近探测",
-              dataIndex: "checked_at",
-              width: 170,
-              render: (value: string | null) =>
-                value ? new Date(value).toLocaleString("zh-CN") : "—",
-            },
-          ]}
-        />
-      </Card>
+      <SectionCard
+        title={STYLE_PAGE.detailTitle}
+        extra={
+          <Typography.Text type="secondary">
+            共 {formatCount(data.cells.length)} 条
+          </Typography.Text>
+        }
+      >
+        {detailCards}
+      </SectionCard>
     </Space>
   );
 }

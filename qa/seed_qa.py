@@ -2,24 +2,31 @@
 
 Run inside the api container after the migrate gate:
 
-    docker compose -p nike-mp-qa -f compose.yaml -f qa/compose.qa.yaml \
+    docker compose -p nike-mp-auth-qa -f qa/compose.auth.yaml \
       exec -T api python - < qa/seed_qa.py
 
-Creates the platform operator, one customer tenant, a crypto placeholder
-credential (fake tokens only) and one registered style.
+Creates three platform users - the operator and the two customer accounts A/B -
+plus one registered style. No credential is installed: the smoke test binds
+every account itself through the self-service phone flow, so nothing here fakes
+a Nike token.
 """
 
 from __future__ import annotations
 
 from sqlalchemy import select
 
-from app.config import get_settings
 from app.db import SessionLocal
 from app.models import Role, Style, Tenant, User
 from app.security import hash_password
-from app.services.credentials import CredentialService
 
 PASSWORD = "qa-password"
+
+USERS = (
+    # email, tenant slug, role
+    ("ops@qa.local", "platform", Role.OPS_ADMIN.value),
+    ("qa-a@qa.local", "qa-customer", Role.TENANT_ADMIN.value),
+    ("qa-b@qa.local", "qa-customer", Role.TENANT_ADMIN.value),
+)
 
 
 def _tenant(db, slug: str, name: str, is_platform: bool) -> Tenant:
@@ -46,23 +53,29 @@ def _user(db, tenant: Tenant, email: str, role: str) -> None:
 
 
 def main() -> None:
-    settings = get_settings()
     with SessionLocal() as db:
-        platform = _tenant(db, "platform", "服务方", is_platform=True)
-        _user(db, platform, "ops@qa.local", Role.OPS_ADMIN.value)
+        tenant_by_slug = {
+            "platform": _tenant(db, "platform", "服务方", is_platform=True),
+            "qa-customer": _tenant(db, "qa-customer", "QA 客户", is_platform=False),
+        }
+        for email, slug, role in USERS:
+            _user(db, tenant_by_slug[slug], email, role)
+        db.flush()
 
-        customer = _tenant(db, "qa-customer", "QA 客户", is_platform=False)
-        _user(db, customer, "qa@qa.local", Role.TENANT_ADMIN.value)
+        # 货号自 0003 起按用户归属：给操作员登记一条，其余用户按需自建。
+        ops = db.execute(select(User).where(User.email == "ops@qa.local")).scalar_one_or_none()
+        if ops is not None and (
+            db.execute(
+                select(Style).where(
+                    Style.owner_user_id == ops.id, Style.style_code == "DN3707-202"
+                )
+            ).scalar_one_or_none()
+            is None
+        ):
+            db.add(Style(style_code="DN3707-202", title="离线测试货号", owner_user_id=ops.id))
 
-        if db.execute(select(Style).where(Style.style_code == "DN3707-202")).scalar_one_or_none() is None:
-            db.add(Style(style_code="DN3707-202", title="离线测试货号"))
-
-        # Distinct fake tokens; the stub accepts any of them.
-        CredentialService(settings, db).store_tokens(
-            access_token="qa-access-token", refresh_token="qa-refresh-token", client_id="qa"
-        )
         db.commit()
-    print("qa seed ready: ops@qa.local / qa@qa.local, password qa-password")
+    print("qa seed ready: ops@qa.local / qa-a@qa.local / qa-b@qa.local, password qa-password")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,13 @@
-"""Store catalogue sync with regionId de-duplication."""
+"""Store catalogue sync with regionId de-duplication.
+
+Every row is owned by the Nike binding that fetched it: the catalogue is a
+per-user cache, never a shared pool. All reads and writes therefore carry the
+owner's user id.
+"""
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -11,8 +17,13 @@ from app.models import Store, StoreRegionAlias
 from app.nike.types import StoreRecord
 
 
-def sync_stores(session: Session, records: list[StoreRecord], region_id: str) -> int:
-    """Upsert stores, merging duplicate regionIds into one storeCode."""
+def sync_stores(
+    session: Session,
+    records: list[StoreRecord],
+    region_id: str,
+    owner_user_id: uuid.UUID,
+) -> int:
+    """Upsert the owner's stores, merging duplicate regionIds into one storeCode."""
     now = datetime.now(UTC)
     touched = 0
     by_code: dict[str, StoreRecord] = {}
@@ -23,10 +34,12 @@ def sync_stores(session: Session, records: list[StoreRecord], region_id: str) ->
 
     for store_code, record in by_code.items():
         store = session.execute(
-            select(Store).where(Store.store_code == store_code)
+            select(Store).where(
+                Store.owner_user_id == owner_user_id, Store.store_code == store_code
+            )
         ).scalar_one_or_none()
         if store is None:
-            store = Store(store_code=store_code)
+            store = Store(store_code=store_code, owner_user_id=owner_user_id)
             session.add(store)
         store.display_name = record.display_name or store.display_name
         store.address = record.address or store.address
@@ -39,11 +52,15 @@ def sync_stores(session: Session, records: list[StoreRecord], region_id: str) ->
         session.flush()
 
         alias = session.execute(
-            select(StoreRegionAlias).where(StoreRegionAlias.region_id == record.region_id)
+            select(StoreRegionAlias).where(
+                StoreRegionAlias.owner_user_id == owner_user_id,
+                StoreRegionAlias.region_id == record.region_id,
+            )
         ).scalar_one_or_none()
         if alias is None:
             session.add(
                 StoreRegionAlias(
+                    owner_user_id=owner_user_id,
                     store_id=store.id,
                     region_id=record.region_id,
                     source=region_id,
@@ -59,9 +76,9 @@ def sync_stores(session: Session, records: list[StoreRecord], region_id: str) ->
     return touched
 
 
-def resolve_region(session: Session, store_code: str) -> str | None:
+def resolve_region(session: Session, store_code: str, owner_user_id: uuid.UUID) -> str | None:
     store = session.execute(
-        select(Store).where(Store.store_code == store_code)
+        select(Store).where(Store.owner_user_id == owner_user_id, Store.store_code == store_code)
     ).scalar_one_or_none()
     if store is None:
         return None

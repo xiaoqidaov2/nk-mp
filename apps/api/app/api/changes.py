@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, tenant_scope
-from app.models import ChangeEvent, Store, Style, User
+from app.api.deps import get_current_session, get_db
+from app.models import AuthSession, ChangeEvent, Store, Style, User
 from app.schemas import ChangeEventOut
 
 router = APIRouter(prefix="/changes", tags=["changes"])
@@ -19,25 +19,28 @@ def list_changes(
     days: int = Query(default=7, ge=1, le=90),
     limit: int = Query(default=200, ge=1, le=1000),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> list[ChangeEventOut]:
-    tenant, sees_all = tenant_scope(user, db)
+    """Change events of the caller only.
+
+    There is no shared broadcast and no platform-wide exception: a user sees
+    exactly the events produced by their own account (historical rows keep
+    their original owner; a re-bound account simply starts a new baseline).
+    """
+    user = payload[0]
     since = datetime.now(UTC) - timedelta(days=days)
     stmt = (
         select(ChangeEvent, Store, Style)
         .join(Store, Store.id == ChangeEvent.store_id)
         .outerjoin(Style, Style.id == ChangeEvent.style_id)
-        .where(ChangeEvent.detected_at >= since)
+        .where(
+            ChangeEvent.detected_at >= since,
+            ChangeEvent.owner_user_id == user.id,
+            ChangeEvent.tenant_id == user.tenant_id,
+        )
         .order_by(ChangeEvent.detected_at.desc())
         .limit(limit)
     )
-    if not sees_all:
-        # Shared observation events (tenant_id is NULL) plus this tenant's
-        # private events (for example scan failures). Another tenant's private
-        # events are never returned.
-        stmt = stmt.where(
-            or_(ChangeEvent.tenant_id.is_(None), ChangeEvent.tenant_id == tenant.id)
-        )
     if event_type:
         stmt = stmt.where(ChangeEvent.event_type == event_type.upper())
     rows = db.execute(stmt).all()

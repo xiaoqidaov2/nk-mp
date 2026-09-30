@@ -8,6 +8,8 @@ import time
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.services import nike_auth
+from app.services.bootstrap import enqueue_due
 from app.services.scheduler import dispatch_due_tasks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -29,10 +31,16 @@ def main() -> None:
     while _running:
         session = SessionLocal()
         try:
-            dispatched = dispatch_due_tasks(session)
+            dispatched = dispatch_due_tasks(session, settings)
             session.commit()
             if dispatched:
                 logger.info("dispatched %s scan job(s)", dispatched)
+            nike_auth.expire_attempts()
+            nike_auth.cleanup_old_attempts()
+            refreshed = enqueue_due(session, settings)
+            if refreshed:
+                session.commit()
+                logger.info("enqueued %s catalogue refresh plan(s)", refreshed)
         except Exception:  # noqa: BLE001 - keep the scheduler alive
             session.rollback()
             logger.exception("scheduler tick failed")

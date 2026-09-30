@@ -1,11 +1,10 @@
 import {
   Alert,
+  App as AntdApp,
   Button,
-  Card,
+  Descriptions,
   Form,
   Input,
-  InputNumber,
-  Result,
   Select,
   Space,
   Steps,
@@ -13,19 +12,20 @@ import {
   Tag,
   Typography,
 } from "antd";
+import { BellOutlined, TagsOutlined } from "@ant-design/icons";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
+import { NikeConnectionNotice, isCredentialActive, useNikeCredentialQuery } from "@/components/NikeCredentialCard";
+import { PageHeader } from "@/components/PageHeader";
+import { useHasEnabledChannel } from "@/components/PushChannelsCard";
+import { SectionCard } from "@/components/SectionCard";
+import { useAuth } from "@/auth/AuthContext";
+import { BTN, CADENCE_OPTIONS, CATALOG, EMPTY, ERR, MSG, PUSH, WIZARD, formatCadence } from "@/copy";
 import { catalogApi, scanApi, taskApi } from "@/data/api";
 import type { StoreOut, StyleOut } from "@/data/types";
-
-const STEP_ITEMS = [
-  { title: "选择货号" },
-  { title: "选择门店" },
-  { title: "设置周期" },
-  { title: "确认并创建" },
-];
+import { useIsMobile } from "@/hooks/useIsMobile";
 
 interface TaskDraft {
   name: string;
@@ -45,6 +45,12 @@ function parseCodes(input: string): string[] {
 
 export function TaskCreatePage() {
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
+  const { message } = AntdApp.useApp();
+  const { canWrite } = useAuth();
+  const credential = useNikeCredentialQuery();
+  const bound = isCredentialActive(credential.data?.status);
+  const canCreate = canWrite && bound;
   const [step, setStep] = useState(0);
   const [form] = Form.useForm<TaskDraft>();
   const [codes, setCodes] = useState<string[]>([]);
@@ -54,6 +60,7 @@ export function TaskCreatePage() {
 
   const stores = useQuery<StoreOut[]>({ queryKey: ["stores"], queryFn: () => catalogApi.stores() });
   const styles = useQuery<StyleOut[]>({ queryKey: ["styles"], queryFn: () => catalogApi.styles() });
+  const hasEnabledChannel = useHasEnabledChannel();
 
   const create = useMutation({
     mutationFn: async (payload: TaskDraft) => {
@@ -64,13 +71,18 @@ export function TaskCreatePage() {
       });
       if (runImmediately) {
         const job = await scanApi.create({ task_id: task.id });
-        return { task, jobId: job.id };
+        return { task, jobId: job.id as string | null, cadence: payload.cadence_seconds };
       }
-      return { task, jobId: null as string | null };
+      return { task, jobId: null as string | null, cadence: payload.cadence_seconds };
     },
     onSuccess: (result) => {
-      if (result.jobId) navigate(`/scans/${result.jobId}`);
-      else navigate("/tasks");
+      if (result.jobId) {
+        message.success(MSG.taskCreatedChecking());
+        navigate(`/scans/${result.jobId}`);
+      } else {
+        message.success(MSG.taskCreated(formatCadence(result.cadence)));
+        navigate("/tasks");
+      }
     },
   });
 
@@ -78,7 +90,7 @@ export function TaskCreatePage() {
     () =>
       (stores.data ?? []).map((store) => ({
         value: store.store_code,
-        label: `${store.store_code} · ${store.display_name || "未命名门店"}`,
+        label: `${store.store_code} · ${store.display_name || store.store_code}`,
       })),
     [stores.data],
   );
@@ -91,23 +103,45 @@ export function TaskCreatePage() {
   };
 
   const submit = async () => {
-    // The form stays mounted across every step, so the values survive the
-    // round trip to the confirm page.
+    // 表单常驻挂载：切步不丢值（hidden 切换保留现实现）。
     const values = await form.validateFields();
     create.mutate(values);
   };
 
+  const stepItems = [
+    { title: "选择货号和门店", icon: <TagsOutlined /> },
+    { title: "设置频率并确认", icon: <BellOutlined /> },
+  ];
+
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <Card size="small">
-        <Steps current={step} items={STEP_ITEMS} size="small" />
-      </Card>
+      <PageHeader title="新建监控任务" />
+      {isMobile ? (
+        <Typography.Text type="secondary">
+          步骤 {step + 1}/2 · {WIZARD.steps[step]}
+        </Typography.Text>
+      ) : (
+        <Steps current={step} size="small" items={stepItems} />
+      )}
+
+      {!canWrite ? <Alert type="info" showIcon message={ERR.forbidden} /> : null}
+      <NikeConnectionNotice action="创建监控任务或启动检查" />
 
       {create.isError ? (
-        <Alert type="error" showIcon message="创建失败" description={(create.error as Error).message} />
+        <Alert
+          type="error"
+          showIcon
+          message={ERR.taskCreateFailed}
+          description={ERR.commonFailure}
+          action={
+            <Button size="small" loading={create.isPending} onClick={() => void submit()}>
+              重试
+            </Button>
+          }
+        />
       ) : null}
 
-      <Form
+      <Form<TaskDraft>
         form={form}
         layout="vertical"
         initialValues={{
@@ -119,22 +153,22 @@ export function TaskCreatePage() {
         }}
       >
         <div hidden={step !== 0}>
-          <Card size="small" title="第一步：选择要监控的货号">
+          <SectionCard title={WIZARD.steps[0]}>
             <Space direction="vertical" size={12} style={{ width: "100%" }}>
               <Space.Compact style={{ width: "100%" }}>
                 <Input
                   value={codeDraft}
                   onChange={(event) => setCodeDraft(event.target.value)}
                   onPressEnter={addCodes}
-                  placeholder="粘贴货号，支持空格、逗号、换行分隔，例如 DN3707-202 IO5031-600"
+                  placeholder={WIZARD.stylePlaceholder}
                 />
-                <Button onClick={addCodes}>添加</Button>
+                <Button onClick={addCodes}>{BTN.add}</Button>
               </Space.Compact>
               <Select
                 mode="multiple"
                 allowClear
                 style={{ width: "100%" }}
-                placeholder="或从已登记货号中选择"
+                placeholder={WIZARD.styleSelectPlaceholder}
                 value={codes}
                 onChange={(value: string[]) => setCodes(value)}
                 options={(styles.data ?? []).map((style) => ({
@@ -144,132 +178,176 @@ export function TaskCreatePage() {
               />
               <Space wrap>
                 {codes.map((code) => (
-                  <Tag key={code} closable onClose={() => setCodes(codes.filter((item) => item !== code))}>
+                  <Tag
+                    key={code}
+                    closable
+                    onClose={() => setCodes(codes.filter((item) => item !== code))}
+                  >
                     {code}
                   </Tag>
                 ))}
               </Space>
-              <Typography.Text type="secondary">
-                共 {codes.length} 个货号。全国扫描会对每个货号 × 每家门店发起尺码级审核请求，请留意配额。
-              </Typography.Text>
-              <Button type="primary" disabled={codes.length === 0} onClick={() => setStep(1)}>
-                下一步
-              </Button>
-            </Space>
-          </Card>
-        </div>
 
-        <div hidden={step !== 1}>
-          <Card size="small" title="第二步：选择门店">
-            <Space direction="vertical" size={12} style={{ width: "100%" }}>
               <Select
                 mode="multiple"
                 allowClear
                 showSearch
                 optionFilterProp="label"
                 style={{ width: "100%" }}
-                placeholder="选择门店（可多选）"
+                placeholder={WIZARD.storePlaceholder}
                 value={storeCodes}
                 onChange={(value: string[]) => setStoreCodes(value)}
                 options={storeOptions}
                 loading={stores.isLoading}
               />
               <Space>
-                <Button
-                  size="small"
-                  onClick={() => setStoreCodes((stores.data ?? []).map((store) => store.store_code))}
-                >
-                  全选（全国扫描）
-                </Button>
+                <span className="desktop-only">
+                  <Button
+                    size="small"
+                    onClick={() => setStoreCodes((stores.data ?? []).map((store) => store.store_code))}
+                  >
+                    {BTN.selectAll}
+                  </Button>
+                </span>
                 <Button size="small" onClick={() => setStoreCodes([])}>
-                  清空
+                  {BTN.clear}
                 </Button>
               </Space>
-              <Typography.Text type="secondary">
-                已选 {storeCodes.length} 家门店。不选择门店代表监控全部已同步门店，之后新同步的门店会自动纳入；
-                扫描时以任务保存的门店范围为准。
-              </Typography.Text>
-              <Space>
-                <Button onClick={() => setStep(0)}>上一步</Button>
-                <Button type="primary" onClick={() => setStep(2)}>
-                  下一步
+              <Typography.Text type="secondary">{EMPTY.wizardStoreHint}</Typography.Text>
+
+              {stores.isSuccess && (stores.data ?? []).length === 0 ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  message={CATALOG.emptyHint}
+                  action={<Link to="/account">去连接</Link>}
+                />
+              ) : null}
+
+              <Form.Item
+                label={WIZARD.taskNameLabel}
+                name="name"
+                rules={[{ required: true, message: "请输入任务名称" }]}
+              >
+                <Input maxLength={120} />
+              </Form.Item>
+
+              <Space direction="vertical" size={4}>
+                <Typography.Text type="secondary">{WIZARD.styleCount(codes.length)}</Typography.Text>
+                {codes.length === 0 ? (
+                  <Typography.Text type="secondary">{EMPTY.wizardNoStyles}</Typography.Text>
+                ) : null}
+                <Button type="primary" disabled={codes.length === 0} onClick={() => setStep(1)}>
+                  {BTN.nextStep}
                 </Button>
               </Space>
             </Space>
-          </Card>
+          </SectionCard>
         </div>
 
-        <div hidden={step !== 2}>
-          <Card size="small" title="第三步：设置周期与提醒">
-            <Form.Item label="任务名称" name="name" rules={[{ required: true, message: "请输入任务名称" }]}>
-              <Input maxLength={120} />
-            </Form.Item>
-            <Form.Item
-              label="监控周期"
-              name="cadence_seconds"
-              rules={[{ required: true }]}
-              extra="周期越短消耗越多配额；默认 30 分钟。"
-            >
-              <InputNumber
-                min={300}
-                max={86400}
-                step={300}
-                style={{ width: 200 }}
-                addonAfter="秒"
-              />
-            </Form.Item>
-            <Form.Item label="提醒类型">
-              <Space direction="vertical">
+        <div hidden={step !== 1}>
+          <SectionCard title={WIZARD.steps[1]}>
+            <Space direction="vertical" size={12} style={{ width: "100%" }}>
+              <Form.Item
+                label={WIZARD.frequencyLabel}
+                name="cadence_seconds"
+                rules={[{ required: true }]}
+              >
+                <Select
+                  style={{ maxWidth: 320 }}
+                  options={CADENCE_OPTIONS.map((option) => ({
+                    value: option.value,
+                    label: option.label,
+                  }))}
+                />
+              </Form.Item>
+              <Space direction="vertical" size={8}>
                 <Form.Item name="notify_on_restock" valuePropName="checked" noStyle>
-                  <Switch /> <span>补货提醒</span>
+                  <Switch /> <span>{WIZARD.notifyRestock}</span>
                 </Form.Item>
                 <Form.Item name="notify_on_sold_out" valuePropName="checked" noStyle>
-                  <Switch /> <span>售罄提醒</span>
+                  <Switch /> <span>{WIZARD.notifySoldOut}</span>
                 </Form.Item>
                 <Form.Item name="notify_on_price_change" valuePropName="checked" noStyle>
-                  <Switch /> <span>变价提醒</span>
+                  <Switch /> <span>{WIZARD.notifyPriceChange}</span>
                 </Form.Item>
               </Space>
-            </Form.Item>
-            <Space>
-              <Button onClick={() => setStep(1)}>上一步</Button>
-              <Button
-                type="primary"
-                onClick={async () => {
-                  await form.validateFields();
-                  setStep(3);
+              <Form.Item noStyle shouldUpdate>
+                {() => {
+                  const values = form.getFieldsValue();
+                  const notifyOn = Boolean(
+                    values.notify_on_restock ||
+                      values.notify_on_sold_out ||
+                      values.notify_on_price_change,
+                  );
+                  if (!notifyOn || hasEnabledChannel !== false) return null;
+                  return (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message={PUSH.noChannelHint}
+                      action={<Link to="/account">{PUSH.noChannelLink}</Link>}
+                    />
+                  );
                 }}
-              >
-                下一步
-              </Button>
-            </Space>
-          </Card>
-        </div>
+              </Form.Item>
+              <Space>
+                <Switch checked={runImmediately} onChange={setRunImmediately} />
+                <span>{WIZARD.runImmediately}</span>
+              </Space>
 
-        <div hidden={step !== 3}>
-          <Card size="small" title="第四步：确认并创建">
-            <Space direction="vertical" size={12} style={{ width: "100%" }}>
-              <Result
-                status="info"
-                title={`将监控 ${codes.length} 个货号 × ${storeCodes.length || "全部"} 家门店`}
-                subTitle="每次运行的实际请求量取决于各门店尺码结构与价格可得性，暂无法可靠预估；配额以实际请求计量。"
-                extra={
-                  <Space direction="vertical">
-                    <Space>
-                      <Switch checked={runImmediately} onChange={setRunImmediately} />
-                      <span>创建后立即扫描一次</span>
-                    </Space>
-                    <Space>
-                      <Button onClick={() => setStep(2)}>上一步</Button>
-                      <Button type="primary" loading={create.isPending} onClick={submit}>
-                        创建任务
-                      </Button>
-                    </Space>
-                  </Space>
-                }
-              />
+              <Form.Item noStyle shouldUpdate>
+                {() => {
+                  const values = form.getFieldsValue();
+                  const cadence = values.cadence_seconds ?? 1800;
+                  const notify: string[] = [];
+                  if (values.notify_on_restock) notify.push(WIZARD.notifyRestock);
+                  if (values.notify_on_sold_out) notify.push(WIZARD.notifySoldOut);
+                  if (values.notify_on_price_change) notify.push(WIZARD.notifyPriceChange);
+                  return (
+                    <Descriptions size="small" column={1} title={WIZARD.summaryLabel}>
+                      <Descriptions.Item label="货号">
+                        {WIZARD.summaryStyles(codes.length)}
+                      </Descriptions.Item>
+                      <Descriptions.Item label="门店">
+                        {storeCodes.length === 0
+                          ? WIZARD.summaryStoresAll
+                          : WIZARD.summaryStores(storeCodes.length)}
+                      </Descriptions.Item>
+                      <Descriptions.Item label={WIZARD.frequencyLabel}>
+                        {formatCadence(cadence)}
+                      </Descriptions.Item>
+                      <Descriptions.Item label="提醒">
+                        {notify.length === 0 ? (
+                          <Tag>已关闭全部提醒</Tag>
+                        ) : (
+                          <Space size={4} wrap>
+                            {notify.map((label) => (
+                              <Tag key={label}>{label}</Tag>
+                            ))}
+                          </Space>
+                        )}
+                      </Descriptions.Item>
+                    </Descriptions>
+                  );
+                }}
+              </Form.Item>
+
+              <Typography.Text type="secondary">{WIZARD.quotaNote}</Typography.Text>
+
+              <Space>
+                <Button onClick={() => setStep(0)}>{BTN.prevStep}</Button>
+                <Button
+                  type="primary"
+                  disabled={!canCreate}
+                  loading={create.isPending}
+                  onClick={() => void submit()}
+                >
+                  {BTN.createTask}
+                </Button>
+              </Space>
             </Space>
-          </Card>
+          </SectionCard>
         </div>
       </Form>
     </Space>

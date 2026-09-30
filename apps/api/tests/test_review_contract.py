@@ -250,3 +250,53 @@ def test_unknown_gtins_are_never_invented(settings) -> None:
     batch = client.review(["g0"], region_id="NIKE0S001")
     assert batch.trusted is True
     assert set(batch.items) == {"g0"}
+
+
+class _StaleCredential(RuntimeError):
+    """Mirrors the stable ``NIKE_*`` code carried by credential errors."""
+
+    code = "NIKE_CREDENTIAL_CHANGED"
+
+
+def test_credential_guard_blocks_a_request_before_it_is_sent(settings) -> None:
+    calls: list[int] = []
+
+    def guard() -> None:
+        calls.append(1)
+        raise _StaleCredential("binding changed")
+
+    replay = _Replay([_json(_ok_group(["g0"]))])
+    client = replay.client(settings, credential_guard=guard)
+    with pytest.raises(ScanError) as excinfo:
+        client.review(["g0"], region_id="NIKE0S001")
+    assert excinfo.value.code == ErrorCode.AUTH_REQUIRED
+    assert calls == [1]
+    assert replay.requests == []
+
+
+def test_credential_guard_runs_before_every_authorized_request(settings) -> None:
+    checks: list[str] = []
+
+    def guard() -> None:
+        checks.append("checked")
+
+    replay = _Replay([_json({}, status=202), _json(_ok_group(["g0"]))])
+    client = replay.client(settings, credential_guard=guard)
+    batch = client.review(["g0"], region_id="NIKE0S001")
+    assert batch.trusted is True
+    # One guard per authorized request: the PUT and the poll GET.
+    assert len(checks) == 2
+    assert len(replay.requests) == 2
+
+
+def test_credential_guard_scan_error_passes_through(settings) -> None:
+    def guard() -> None:
+        raise ScanError(ErrorCode.AUTH_REQUIRED, "guard stopped the scan")
+
+    replay = _Replay([])
+    client = replay.client(settings, credential_guard=guard)
+    with pytest.raises(ScanError) as excinfo:
+        client.review(["g0"], region_id="NIKE0S001")
+    assert excinfo.value.code == ErrorCode.AUTH_REQUIRED
+    assert excinfo.value.message == "guard stopped the scan"
+    assert replay.requests == []

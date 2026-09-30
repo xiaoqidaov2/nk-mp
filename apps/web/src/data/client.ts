@@ -24,15 +24,44 @@ function readCsrfCookie(): string {
   return "";
 }
 
+/** Pulls the stable error contract out of an untrusted response body. */
+function parseApiErrorFields(payload: unknown): {
+  errorCode: string | null;
+  retryAfterSeconds: number | null;
+} {
+  let errorCode: string | null = null;
+  let retryAfterSeconds: number | null = null;
+  if (payload !== null && typeof payload === "object") {
+    if ("error_code" in payload) {
+      const raw = payload.error_code;
+      if (typeof raw === "string" && raw.trim()) errorCode = raw;
+    }
+    if ("retry_after_seconds" in payload) {
+      const raw = payload.retry_after_seconds;
+      if (typeof raw === "number" && Number.isFinite(raw)) retryAfterSeconds = raw;
+      else if (typeof raw === "string" && raw.trim() && !Number.isNaN(Number(raw))) {
+        retryAfterSeconds = Number(raw);
+      }
+    }
+  }
+  return { errorCode, retryAfterSeconds };
+}
+
 export class ApiError extends Error {
   status: number;
   payload: unknown;
+  /** Stable server `error_code`; the raw `detail` stays on `message`. */
+  errorCode: string | null;
+  retryAfterSeconds: number | null;
 
   constructor(status: number, message: string, payload: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.payload = payload;
+    const fields = parseApiErrorFields(payload);
+    this.errorCode = fields.errorCode;
+    this.retryAfterSeconds = fields.retryAfterSeconds;
   }
 }
 

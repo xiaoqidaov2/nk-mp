@@ -18,6 +18,8 @@ name: nike-mp-qa
 x-qa-env: &qa-env
   NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@127.0.0.1:5432/nike_mp
   NIKE_MP_CREDENTIAL_KEY: qa-credential-key
+  NIKE_MP_NIKE_PHONE_AUTH_ENABLED: "true"
+  NIKE_MP_NIKE_PHONE_AUTH_CONTRACT_VERSION: "2026-09-29/mp-phone-otc-pkce"
   NIKE_MP_NIKE_API_BASE: http://127.0.0.1:9100
   NIKE_MP_NIKE_TEST_API_BASE: http://127.0.0.1:9100
   NIKE_MP_NIKE_OAUTH_BASE: http://127.0.0.1:9100

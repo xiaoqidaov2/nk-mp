@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
@@ -17,6 +18,7 @@ from app.security import (
     token_fingerprint,
     verify_password,
 )
+from app.services import nike_auth
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -62,6 +64,9 @@ def login(
     db.add(record)
     user.last_login_at = datetime.now(UTC)
     db.flush()
+    # Commit before returning: the session row must be visible to the very
+    # next request; teardown-time commits can land after the response.
+    db.commit()
 
     csrf_token = csrf_token_for(token, csrf_secret)
     response.set_cookie(
@@ -97,11 +102,16 @@ def logout(
     payload: tuple[User, AuthSession] = Depends(get_current_session),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
-    _, record = payload
+    user, record = payload
     record.revoked_at = datetime.now(UTC)
     response.delete_cookie(SESSION_COOKIE, path="/")
     response.delete_cookie(CSRF_COOKIE, path="/")
     db.flush()
+    db.commit()
+    # Unfinished phone-binding attempts belong to this platform session;
+    # an already bound Nike credential stays connected.
+    with contextlib.suppress(nike_auth.NikeAuthError):
+        nike_auth.cancel_for_auth_session(user_id=user.id, auth_session_id=record.id)
     return {"ok": True}
 
 

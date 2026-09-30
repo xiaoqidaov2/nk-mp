@@ -1,157 +1,427 @@
-import { Alert, Button, Card, Empty, Space, Switch, Table, Tag, Typography } from "antd";
+import { Alert, App as AntdApp, Button, Space, Switch, Table, Tooltip, Typography } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 
+import { EmptyState } from "@/components/EmptyState";
+import { CardRow, ResponsiveList } from "@/components/MobileCardList";
+import { NikeConnectionNotice, isCredentialActive, useNikeCredentialQuery } from "@/components/NikeCredentialCard";
+import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
+import { StatusPill } from "@/components/StatusPill";
+import { TimeText } from "@/components/TimeText";
+import { useAuth } from "@/auth/AuthContext";
+import {
+  BTN,
+  EMPTY,
+  ERR,
+  MODALS,
+  MSG,
+  TASK_LIST,
+  formatCadence,
+  formatDate,
+  formatCount,
+  formatScanId,
+  formatStoreScope,
+} from "@/copy";
 import { scanApi, taskApi } from "@/data/api";
 import type { MonitorTask, ScanJob } from "@/data/types";
-import { useAuth } from "@/auth/AuthContext";
-
-function formatCadence(seconds: number): string {
-  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
-  return `${Math.round(seconds / 60)} 分钟`;
-}
 
 export function TasksPage() {
   const { canWrite } = useAuth();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { message, modal } = AntdApp.useApp();
+  const credential = useNikeCredentialQuery();
+  const bound = isCredentialActive(credential.data?.status);
 
   const tasks = useQuery<MonitorTask[]>({ queryKey: ["tasks"], queryFn: () => taskApi.list() });
   const scans = useQuery<ScanJob[]>({ queryKey: ["scans"], queryFn: () => scanApi.list() });
 
+  const taskName = (taskId: string | null) =>
+    tasks.data?.find((item) => item.id === taskId)?.name ?? TASK_LIST.manualCheck;
+
   const toggle = useMutation({
     mutationFn: ({ id, is_active }: { id: string; is_active: boolean }) =>
       taskApi.update(id, { is_active }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+    onSuccess: (updated, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      if (variables.is_active) {
+        message.success(
+          updated.next_run_at
+            ? MSG.taskEnabled(updated.name, formatDate(updated.next_run_at))
+            : MSG.taskEnabled(updated.name, "待定"),
+        );
+      } else {
+        message.success(MSG.taskPaused(updated.name));
+      }
+    },
+    onError: () => message.error(ERR.commonFailure),
   });
 
   const run = useMutation({
     mutationFn: (taskId: string) => scanApi.create({ task_id: taskId }),
-    onSuccess: (job) => navigate(`/scans/${job.id}`),
+    onSuccess: (job) => {
+      message.success(MSG.checkStarted());
+      navigate(`/scans/${job.id}`);
+    },
+    onError: () => message.error(ERR.checkStartFailed),
   });
 
-  return (
-    <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      {run.isError ? <Alert type="error" showIcon message={(run.error as Error).message} /> : null}
+  const remove = useMutation({
+    mutationFn: (taskId: string) => taskApi.remove(taskId),
+    onSuccess: (_result, taskId) => {
+      const name = tasks.data?.find((item) => item.id === taskId)?.name ?? "";
+      message.success(MSG.taskDeleted(name));
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+    onError: () => message.error(ERR.commonFailure),
+  });
 
-      <Card
+  const confirmDelete = (task: MonitorTask) => {
+    const tpl = MODALS.deleteTask(task.name);
+    modal.confirm({
+      title: tpl.title,
+      content: tpl.content,
+      okText: tpl.okText,
+      cancelText: tpl.cancelText,
+      okButtonProps: { danger: true },
+      onOk: () => remove.mutate(task.id),
+    });
+  };
+
+  const confirmPause = (onOk: () => void) => {
+    const tpl = MODALS.pauseTask();
+    modal.confirm({
+      title: tpl.title,
+      content: tpl.content,
+      okText: tpl.okText,
+      cancelText: tpl.cancelText,
+      onOk,
+    });
+  };
+
+  const checkDisabledReason = (task: MonitorTask): string | null => {
+    if (!canWrite) return TASK_LIST.disabledReadonly;
+    if (!bound) return TASK_LIST.disabledNotConnected;
+    if (task.style_count === 0) return TASK_LIST.disabledNoStyles;
+    if (!task.all_stores && task.store_count === 0) return TASK_LIST.disabledNoStores;
+    return null;
+  };
+
+  const checkButton = (task: MonitorTask, block = false) => {
+    const reason = checkDisabledReason(task);
+    const button = (
+      <Button
+        block={block}
         size="small"
-        title="监控任务"
-        extra={
-          canWrite ? (
-            <Button type="primary" onClick={() => navigate("/tasks/new")}>
-              新建监控任务
-            </Button>
-          ) : (
-            <Typography.Text type="secondary">只读角色不能修改任务</Typography.Text>
-          )
-        }
+        disabled={reason !== null}
+        loading={run.isPending && run.variables === task.id}
+        onClick={() => run.mutate(task.id)}
       >
+        {BTN.checkNow}
+      </Button>
+    );
+    if (!reason) return button;
+    // 禁用按钮在浏览器中不派发鼠标事件，包一层 span 让 Tooltip 能出现。
+    return (
+      <Tooltip title={reason}>
+        <span style={{ display: "inline-block", width: block ? "100%" : undefined }}>{button}</span>
+      </Tooltip>
+    );
+  };
+
+  const newTaskButton = (
+    <Tooltip title={!bound ? TASK_LIST.connectFirstTooltip : undefined}>
+      <span
+        style={{ display: "inline-block", cursor: !bound ? "pointer" : undefined }}
+        onClick={() => {
+          if (!bound) navigate("/account");
+        }}
+      >
+        <Button
+          type="primary"
+          disabled={!bound}
+          style={!bound ? { pointerEvents: "none" } : undefined}
+          onClick={() => navigate("/tasks/new")}
+        >
+          {BTN.newTask}
+        </Button>
+      </span>
+    </Tooltip>
+  );
+
+  const taskCards = (
+    <ResponsiveList
+      items={tasks.data ?? []}
+      rowKey={(task) => task.id}
+      loading={tasks.isLoading}
+      empty={
+        <EmptyState
+          variant="no-data"
+          description={canWrite ? EMPTY.taskList : EMPTY.readonlyTasks}
+          compact
+        />
+      }
+      renderCard={(task) => (
+        <>
+          <div className="mobile-card-list__row">
+            <Link to={`/tasks/${task.id}`}>{task.name}</Link>
+            <Switch
+              checked={task.is_active}
+              disabled={!canWrite || !bound}
+              loading={toggle.isPending && toggle.variables?.id === task.id}
+              onChange={(checked) => {
+                if (!checked) {
+                  confirmPause(() => toggle.mutate({ id: task.id, is_active: false }));
+                } else {
+                  toggle.mutate({ id: task.id, is_active: true });
+                }
+              }}
+              checkedChildren={BTN.enable}
+              unCheckedChildren={BTN.pause}
+            />
+          </div>
+          <CardRow label="检查范围">
+            {formatStoreScope(task.all_stores, task.store_count)}
+          </CardRow>
+          <CardRow label="货号数">{`${formatCount(task.style_count)} 个`}</CardRow>
+          <CardRow label="检查频率">{formatCadence(task.cadence_seconds)}</CardRow>
+          <div className="mobile-card-list__actions">
+            {checkButton(task, true)}
+            <Link to={`/tasks/${task.id}`}>{BTN.view}</Link>
+            {canWrite ? (
+              <Button danger size="small" onClick={() => confirmDelete(task)}>
+                {BTN.deleteTask}
+              </Button>
+            ) : null}
+          </div>
+        </>
+      )}
+      table={
         <Table<MonitorTask>
           size="small"
           rowKey="id"
           loading={tasks.isLoading}
           dataSource={tasks.data ?? []}
-          locale={{ emptyText: <Empty description="还没有监控任务" /> }}
+          locale={{
+            emptyText: canWrite ? EMPTY.taskList : EMPTY.readonlyTasks,
+          }}
           pagination={{ pageSize: 10, hideOnSinglePage: true }}
           columns={[
-            { title: "任务名称", dataIndex: "name" },
             {
-              title: "门店数",
-              dataIndex: "store_count",
-              width: 90,
-              render: (value: number, row: MonitorTask) => (row.all_stores ? "全部" : value),
+              title: "任务名称",
+              dataIndex: "name",
+              sorter: (a: MonitorTask, b: MonitorTask) => a.name.localeCompare(b.name),
+              defaultSortOrder: "ascend",
+              render: (value: string, row: MonitorTask) => <Link to={`/tasks/${row.id}`}>{value}</Link>,
             },
-            { title: "货号数", dataIndex: "style_count", width: 90 },
             {
-              title: "周期",
+              title: "检查范围",
+              dataIndex: "store_count",
+              width: 110,
+              render: (_: unknown, row: MonitorTask) => formatStoreScope(row.all_stores, row.store_count),
+            },
+            {
+              title: "货号数",
+              dataIndex: "style_count",
+              width: 90,
+              sorter: (a: MonitorTask, b: MonitorTask) => a.style_count - b.style_count,
+              render: (value: number) => `${formatCount(value)} 个`,
+            },
+            {
+              title: "检查频率",
               dataIndex: "cadence_seconds",
               width: 100,
+              sorter: (a: MonitorTask, b: MonitorTask) => a.cadence_seconds - b.cadence_seconds,
               render: (value: number) => formatCadence(value),
             },
             {
-              title: "下次运行",
+              title: "下次检查",
               dataIndex: "next_run_at",
-              width: 170,
-              render: (value: string | null) =>
-                value ? new Date(value).toLocaleString("zh-CN") : "已暂停",
+              width: 150,
+              sorter: (a: MonitorTask, b: MonitorTask) =>
+                (a.next_run_at ?? "").localeCompare(b.next_run_at ?? ""),
+              defaultSortOrder: "ascend",
+              render: (value: string | null) => (value ? formatDate(value) : BTN.pause),
             },
             {
               title: "状态",
               dataIndex: "is_active",
-              width: 110,
+              width: 100,
+              sorter: (a: MonitorTask, b: MonitorTask) => Number(a.is_active) - Number(b.is_active),
               render: (value: boolean, row: MonitorTask) => (
                 <Switch
-                  size="small"
                   checked={value}
-                  disabled={!canWrite}
+                  disabled={!canWrite || !bound}
                   loading={toggle.isPending && toggle.variables?.id === row.id}
-                  onChange={(checked) => toggle.mutate({ id: row.id, is_active: checked })}
-                  checkedChildren="启用"
-                  unCheckedChildren="暂停"
+                  onChange={(checked) => {
+                    if (!checked) {
+                      confirmPause(() => toggle.mutate({ id: row.id, is_active: false }));
+                    } else {
+                      toggle.mutate({ id: row.id, is_active: true });
+                    }
+                  }}
+                  checkedChildren={BTN.enable}
+                  unCheckedChildren={BTN.pause}
                 />
               ),
             },
             {
               title: "操作",
-              width: 170,
+              width: 200,
               render: (_: unknown, row: MonitorTask) => (
                 <Space size={8}>
-                  <Button
-                    size="small"
-                    disabled={
-                      !canWrite || (!row.all_stores && row.store_count === 0) || row.style_count === 0
-                    }
-                    loading={run.isPending && run.variables === row.id}
-                    onClick={() => run.mutate(row.id)}
-                  >
-                    立即扫描
-                  </Button>
-                  <Link to={`/tasks/${row.id}`}>详情</Link>
+                  {checkButton(row)}
+                  <Link to={`/tasks/${row.id}`}>{BTN.view}</Link>
+                  {canWrite ? (
+                    <Button type="link" size="small" danger onClick={() => confirmDelete(row)}>
+                      {BTN.deleteTask}
+                    </Button>
+                  ) : null}
                 </Space>
               ),
             },
           ]}
         />
-      </Card>
+      }
+    />
+  );
 
-      <Card size="small" title="最近扫描">
+  const scanCards = (
+    <ResponsiveList
+      items={scans.data ?? []}
+      rowKey={(job) => job.id}
+      loading={scans.isLoading}
+      empty={<EmptyState variant="no-data" description={EMPTY.scanList} compact />}
+      renderCard={(job) => (
+        <>
+          <div className="mobile-card-list__row">
+            <Link to={`/scans/${job.id}`}>{formatScanId(job.id)}</Link>
+            <StatusPill domain="job" value={job.status} size="sm" />
+          </div>
+          <CardRow label="已完成">{TASK_LIST.scanCountLabel(job.done_stores, job.total_stores)}</CardRow>
+          <CardRow label="失败">
+            <span style={job.failed_stores > 0 ? { color: "var(--color-danger)" } : undefined}>
+              {formatCount(job.failed_stores)}
+            </span>
+          </CardRow>
+          <CardRow label="结果不完整">
+            <span style={job.unknown_stores > 0 ? { color: "var(--color-warning)" } : undefined}>
+              {formatCount(job.unknown_stores)}
+            </span>
+          </CardRow>
+        </>
+      )}
+      table={
         <Table<ScanJob>
           size="small"
           rowKey="id"
           loading={scans.isLoading}
           dataSource={scans.data ?? []}
-          locale={{ emptyText: <Empty description="还没有扫描记录" /> }}
+          locale={{ emptyText: EMPTY.scanList }}
           pagination={{ pageSize: 8, hideOnSinglePage: true }}
           columns={[
             {
-              title: "任务",
+              title: "检查",
               dataIndex: "id",
-              render: (value: string) => <Link to={`/scans/${value}`}>{value.slice(0, 8)}</Link>,
+              width: 110,
+              defaultSortOrder: "descend",
+              sorter: (a: ScanJob, b: ScanJob) => a.created_at.localeCompare(b.created_at),
+              render: (value: string) => <Link to={`/scans/${value}`}>{formatScanId(value)}</Link>,
             },
-            { title: "类型", dataIndex: "kind", width: 90 },
+            {
+              title: "关联任务",
+              dataIndex: "task_id",
+              width: 150,
+              render: (value: string | null) => taskName(value),
+            },
             {
               title: "状态",
               dataIndex: "status",
               width: 110,
-              render: (value: string) => (
-                <Tag color={value === "SUCCEEDED" ? "green" : value === "RUNNING" ? "blue" : "orange"}>
-                  {value}
-                </Tag>
+              sorter: (a: ScanJob, b: ScanJob) => a.status.localeCompare(b.status),
+              render: (value: ScanJob["status"]) => <StatusPill domain="job" value={value} size="sm" />,
+            },
+            {
+              title: "已完成",
+              width: 100,
+              render: (_: unknown, row: ScanJob) =>
+                TASK_LIST.scanCountLabel(row.done_stores, row.total_stores),
+            },
+            {
+              title: "失败",
+              dataIndex: "failed_stores",
+              width: 80,
+              sorter: (a: ScanJob, b: ScanJob) => a.failed_stores - b.failed_stores,
+              render: (value: number) => (
+                <span style={value > 0 ? { color: "var(--color-danger)" } : undefined}>
+                  {formatCount(value)}
+                </span>
               ),
             },
-            { title: "成功门店", dataIndex: "done_stores", width: 100 },
-            { title: "失败门店", dataIndex: "failed_stores", width: 100 },
-            { title: "未探测门店", dataIndex: "unknown_stores", width: 110 },
             {
-              title: "创建时间",
+              title: "结果不完整",
+              dataIndex: "unknown_stores",
+              width: 110,
+              sorter: (a: ScanJob, b: ScanJob) => a.unknown_stores - b.unknown_stores,
+              render: (value: number) => (
+                <span style={value > 0 ? { color: "var(--color-warning)" } : undefined}>
+                  {formatCount(value)}
+                </span>
+              ),
+            },
+            {
+              title: "开始时间",
               dataIndex: "created_at",
-              width: 170,
-              render: (value: string) => new Date(value).toLocaleString("zh-CN"),
+              width: 150,
+              defaultSortOrder: "descend",
+              sorter: (a: ScanJob, b: ScanJob) => a.created_at.localeCompare(b.created_at),
+              render: (value: string) => <TimeText value={value} absolute={false} />,
             },
           ]}
         />
-      </Card>
+      }
+    />
+  );
+
+  return (
+    <Space direction="vertical" size={16} style={{ width: "100%" }}>
+      <PageHeader title="监控任务" />
+      <NikeConnectionNotice action="启动检查或启用任务" />
+
+      {tasks.isError || scans.isError ? (
+        <Alert
+          type="error"
+          showIcon
+          message={ERR.taskListFailed}
+          action={
+            <Button
+              size="small"
+              onClick={() => {
+                void tasks.refetch();
+                void scans.refetch();
+              }}
+            >
+              {BTN.refresh}
+            </Button>
+          }
+        />
+      ) : null}
+
+      <SectionCard
+        title="监控任务"
+        extra={
+          canWrite ? (
+            newTaskButton
+          ) : (
+            <Typography.Text type="secondary">{EMPTY.readonlyTasks}</Typography.Text>
+          )
+        }
+      >
+        {taskCards}
+      </SectionCard>
+
+      <SectionCard title="最近检查">{scanCards}</SectionCard>
     </Space>
   );
 }

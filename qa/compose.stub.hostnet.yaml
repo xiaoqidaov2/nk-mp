@@ -1,0 +1,25 @@
+# 离线 stub 叠加：把 QA 栈的 Nike 上游切回本地假服务（smoke / 离线开发用）。
+#
+#   docker compose -p nike-mp-auth-qa -f qa/compose.auth.hostnet.yaml \
+#     -f qa/compose.stub.hostnet.yaml up -d
+#
+# ⚠️ 只有叠加了本文件时才可以运行 qa/smoke.py。
+name: nike-mp-auth-qa
+
+x-stub-env: &stub-env
+  NIKE_MP_NIKE_API_BASE: ${QA_STUB_BASE:-http://127.0.0.1:19100}
+  NIKE_MP_NIKE_TEST_API_BASE: ${QA_STUB_BASE:-http://127.0.0.1:19100}
+  NIKE_MP_NIKE_OAUTH_BASE: ${QA_STUB_BASE:-http://127.0.0.1:19100}
+  # 离线冒烟追求速度，不按真实上游的节奏。
+  NIKE_MP_REVIEW_POLL_TRIES: "2"
+  NIKE_MP_REVIEW_POLL_INTERVAL_SECONDS: "0.2"
+  NIKE_MP_REQUEST_PACE_SECONDS: "0"
+  NIKE_MP_PUSH_ALLOW_PRIVATE_TARGETS: "true"
+
+services:
+  api:
+    environment: *stub-env
+  worker:
+    environment: *stub-env
+  scheduler:
+    environment: *stub-env

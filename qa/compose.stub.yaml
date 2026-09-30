@@ -1,0 +1,22 @@
+# 离线 stub 叠加（bridge 网络变体）：Nike 上游切回本地假服务。
+#
+#   docker compose -p nike-mp-auth-qa -f qa/compose.auth.yaml \
+#     -f qa/compose.stub.yaml up -d
+name: nike-mp-auth-qa
+
+x-stub-env: &stub-env
+  NIKE_MP_NIKE_API_BASE: ${QA_STUB_BASE:-http://stub:9100}
+  NIKE_MP_NIKE_TEST_API_BASE: ${QA_STUB_BASE:-http://stub:9100}
+  NIKE_MP_NIKE_OAUTH_BASE: ${QA_STUB_BASE:-http://stub:9100}
+  NIKE_MP_REVIEW_POLL_TRIES: "2"
+  NIKE_MP_REVIEW_POLL_INTERVAL_SECONDS: "0.2"
+  NIKE_MP_REQUEST_PACE_SECONDS: "0"
+  NIKE_MP_PUSH_ALLOW_PRIVATE_TARGETS: "true"
+
+services:
+  api:
+    environment: *stub-env
+  worker:
+    environment: *stub-env
+  scheduler:
+    environment: *stub-env

@@ -202,17 +202,110 @@ class DashboardOut(BaseModel):
     daily_review_budget: int
 
 
-class CredentialOut(BaseModel):
-    account_key: str
-    status: str
-    access_expires_at: datetime | None
-    last_refreshed_at: datetime | None
-    last_error: str
-    has_refresh_token: bool
-
-
 class HealthOut(BaseModel):
     status: str
     database: str
-    credential: str
     queue_depth: int
+
+
+class NikeCredentialOut(BaseModel):
+    status: str
+    phone_masked: str | None
+    access_expires_at: datetime | None
+    last_refreshed_at: datetime | None
+    last_error_code: str | None
+    binding_generation: int | None
+    login_available: bool
+
+
+class NikeBootstrapOut(BaseModel):
+    """绑定后的预加载进度（门店目录只属于该用户）。"""
+
+    state: str
+    progress: float
+    stage: str
+    store_count: int
+    error_code: str | None
+    updated_at: datetime | None
+
+
+class NikeAuthSessionIn(BaseModel):
+    phone: str = Field(min_length=5, max_length=32)
+    consent: bool
+    request_id: uuid.UUID
+
+    @field_validator("phone")
+    @classmethod
+    def _strip_phone(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("consent")
+    @classmethod
+    def _require_consent(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("需要同意使用条款")
+        return value
+
+
+class NikeAuthVerifyIn(BaseModel):
+    code: str = Field(min_length=1, max_length=32)
+
+    @field_validator("code")
+    @classmethod
+    def _strip_code(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("验证码不能为空")
+        return cleaned
+
+
+class NikeAuthAttemptOut(BaseModel):
+    id: uuid.UUID
+    state: str
+    phone_masked: str
+    expires_at: datetime | None
+    resend_after: datetime | None
+    attempts_remaining: int
+    error_code: str | None
+
+
+class NotificationChannelIn(BaseModel):
+    """渠道表单：平台 + 该平台的字段，Apprise URL 由服务端拼装。"""
+
+    platform: str = Field(min_length=1, max_length=32)
+    name: str = Field(default="", max_length=64)
+    fields: dict[str, str] = Field(default_factory=dict)
+
+
+class NotificationChannelPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=64)
+    enabled: bool | None = None
+
+
+class NotificationChannelOut(BaseModel):
+    id: uuid.UUID
+    platform: str
+    name: str
+    target_hint: str
+    enabled: bool
+    last_ok_at: datetime | None
+    last_error_code: str | None
+    last_error: str | None
+    last_error_at: datetime | None
+    created_at: datetime
+
+
+class NotificationDeliveryOut(BaseModel):
+    id: int
+    job_id: uuid.UUID
+    task_name: str | None
+    channel_id: uuid.UUID
+    channel_name: str
+    platform: str
+    state: str
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    sent_at: datetime | None
+    title: str
+    summary: str

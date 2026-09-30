@@ -1,10 +1,17 @@
-"""Access-token lifecycle with single-flight refresh and independent persistence.
+"""Per-user access-token lifecycle with single-flight refresh.
 
-A refresh is serialised per account: an in-process lock avoids duplicate
-refreshes inside one worker and a ``SELECT ... FOR UPDATE`` row lock
-serialises across worker processes. Rotated credentials are committed
-immediately, independently of the surrounding job transaction, so a crash
-after a successful upstream rotation can never roll back the stored token.
+Every read and write opens its own short session: callers never hand in a job
+or request session, so a credential rotation can never be rolled back with an
+unrelated transaction, and a job transaction can never leak credential state.
+The row-lock order is fixed everywhere in the platform:
+
+    owner user row -> credential row -> auth attempt / auth limit rows
+
+Bindings are immutable value objects. Long-running work (a scan job) captures
+one binding up front and re-validates it with :meth:`CredentialService.assert_binding`
+around every authoritative action; when the user re-binds or disconnects, the
+old generation becomes invalid and ongoing work must stop instead of silently
+using the new account.
 """
 
 from __future__ import annotations
@@ -14,14 +21,17 @@ import json
 import logging
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Credential, CredentialStatus
+from app.db import SessionLocal
+from app.models import Credential, CredentialStatus, Tenant, User
 from app.security import decrypt_secret, encrypt_secret
 
 REFRESH_MARGIN_SECONDS = 300
@@ -32,17 +42,53 @@ _locks_guard = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
 
 
-def _lock_for(account_key: str) -> threading.Lock:
+def _lock_for(owner_user_id: UUID) -> threading.Lock:
+    key = str(owner_user_id)
     with _locks_guard:
-        lock = _locks.get(account_key)
+        lock = _locks.get(key)
         if lock is None:
             lock = threading.Lock()
-            _locks[account_key] = lock
+            _locks[key] = lock
         return lock
 
 
-class CredentialNotConfigured(RuntimeError):
-    pass
+class CredentialError(RuntimeError):
+    """Base class for stable credential errors mapped to NIKE_* codes."""
+
+    code = "NIKE_UPSTREAM_UNAVAILABLE"
+
+
+class CredentialRequired(CredentialError):
+    code = "NIKE_CREDENTIAL_REQUIRED"
+
+
+class CredentialChanged(CredentialError):
+    code = "NIKE_CREDENTIAL_CHANGED"
+
+
+class CredentialReauthRequired(CredentialError):
+    code = "NIKE_REAUTH_REQUIRED"
+
+
+class CredentialUnavailable(CredentialError):
+    code = "NIKE_UPSTREAM_UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class CredentialBinding:
+    owner_user_id: UUID
+    credential_id: UUID
+    generation: int
+
+
+@dataclass(frozen=True)
+class CredentialStatusInfo:
+    status: str
+    phone_masked: str | None
+    access_expires_at: datetime | None
+    last_refreshed_at: datetime | None
+    last_error_code: str | None
+    binding_generation: int
 
 
 def _decode_expiry(access_token: str) -> datetime | None:
@@ -61,101 +107,324 @@ def _decode_expiry(access_token: str) -> datetime | None:
     return datetime.fromtimestamp(exp, tz=UTC)
 
 
+def apply_tokens_locked(
+    record: Credential,
+    *,
+    access_token: str,
+    refresh_token: str | None,
+    client_id: str = "",
+) -> None:
+    """Write a token pair onto an already-locked row. Never commits."""
+    record.access_token_enc = encrypt_secret(access_token)
+    if refresh_token:
+        record.refresh_token_enc = encrypt_secret(refresh_token)
+    if client_id:
+        record.client_id = client_id
+    record.access_expires_at = _decode_expiry(access_token)
+    record.last_refreshed_at = datetime.now(UTC)
+    record.status = CredentialStatus.ACTIVE.value
+    record.last_error = ""
+    record.last_error_code = None
+    record.updated_at = datetime.now(UTC)
+
+
 class CredentialService:
-    def __init__(self, settings: Settings, session: Session) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        owner_user_id: UUID,
+        *,
+        session_factory: Callable[[], Session] = SessionLocal,
+    ) -> None:
         self.settings = settings
-        self.session = session
+        self.owner_user_id = owner_user_id
+        self._session_factory = session_factory
 
-    def get_record(self, account_key: str = "default", for_update: bool = False) -> Credential | None:
-        stmt = select(Credential).where(Credential.account_key == account_key)
-        if for_update:
-            stmt = stmt.with_for_update()
-        return self.session.execute(stmt).scalar_one_or_none()
+    # ------------------------------------------------------------------ reads
 
-    def token_provider(self, account_key: str = "default") -> Callable[[str | None], str]:
+    def binding(self) -> CredentialBinding:
+        """Return the owner's current binding, or raise a stable error.
+
+        Confirms local ownership and status only; it never talks to Nike.
+        """
+        with self._session_factory() as session:
+            self._require_active_scope(session)
+            record = self._load(session)
+            if record is None or record.status == CredentialStatus.REVOKED.value:
+                raise CredentialRequired("Nike 账号尚未连接")
+            if record.status == CredentialStatus.NEEDS_AUTHORIZATION.value:
+                raise CredentialReauthRequired("Nike 账号需要重新验证")
+            if (
+                record.status == CredentialStatus.UNASSIGNED.value
+                or (not record.access_token_enc and not record.refresh_token_enc)
+            ):
+                raise CredentialRequired("Nike 账号尚未连接")
+            return CredentialBinding(
+                owner_user_id=record.owner_user_id,
+                credential_id=record.id,
+                generation=record.binding_generation,
+            )
+
+    def assert_binding(self, binding: CredentialBinding) -> None:
+        """Cheap guard executed before every authoritative upstream action."""
+        with self._session_factory() as session:
+            self._require_active_scope(session)
+            record = self._load(session)
+            if record is None:
+                raise CredentialRequired("Nike 账号尚未连接")
+            if record.status == CredentialStatus.REVOKED.value:
+                raise CredentialChanged("绑定已断开，请重新发起扫描")
+            if (
+                record.owner_user_id != binding.owner_user_id
+                or record.id != binding.credential_id
+                or record.binding_generation != binding.generation
+            ):
+                raise CredentialChanged("绑定已变更，请重新发起扫描")
+            if record.status == CredentialStatus.NEEDS_AUTHORIZATION.value:
+                raise CredentialReauthRequired("Nike 账号需要重新验证")
+            if (
+                record.status == CredentialStatus.UNASSIGNED.value
+                or (not record.access_token_enc and not record.refresh_token_enc)
+            ):
+                raise CredentialRequired("Nike 账号尚未连接")
+
+    def status(self) -> CredentialStatusInfo | None:
+        with self._session_factory() as session:
+            record = self._load(session)
+            if record is None:
+                return None
+            status = record.status
+            expires_at = record.access_expires_at
+            if status == CredentialStatus.ACTIVE.value and expires_at is not None:
+                remaining = (expires_at - datetime.now(UTC)).total_seconds()
+                if remaining < 0:
+                    status = CredentialStatus.NEEDS_AUTHORIZATION.value
+                elif remaining < 3600:
+                    status = CredentialStatus.EXPIRING.value
+            return CredentialStatusInfo(
+                status=status,
+                phone_masked=record.phone_masked,
+                access_expires_at=expires_at,
+                last_refreshed_at=record.last_refreshed_at,
+                last_error_code=record.last_error_code,
+                binding_generation=record.binding_generation,
+            )
+
+    # ----------------------------------------------------------------- tokens
+
+    def token_provider(self, binding: CredentialBinding) -> Callable[[str | None], str]:
         """Return a callback suitable for ``NikeClient.token_provider``."""
-        return lambda rejected: self.access_token(account_key, rejected_token=rejected)
 
-    def access_token(self, account_key: str = "default", rejected_token: str | None = None) -> str:
-        """Return a usable access token.
+        def provider(rejected: str | None) -> str:
+            return self.access_token(binding=binding, rejected_token=rejected)
+
+        return provider
+
+    def access_token(
+        self,
+        *,
+        binding: CredentialBinding | None = None,
+        rejected_token: str | None = None,
+    ) -> str:
+        """Return a usable access token for this owner.
 
         ``rejected_token`` is the credential the upstream just rejected with a
-        401. When it still matches the stored token the refresh is forced: a
-        rejected credential must be rotated even if its local expiry has not
-        been reached. If another worker already rotated it, the fresh token is
-        returned without another refresh.
+        401; when the stored token still matches, a forced rotation is
+        attempted. A token that is already expired is never returned.
         """
-        record = self.get_record(account_key)
-        if record is None:
-            raise CredentialNotConfigured("no credential stored; run the import command")
-        if not record.access_token_enc:
-            # Refresh-only import (common when only mp_refresh.txt is at
-            # hand): bootstrap the first access token from the stored refresh
-            # token instead of refusing to start.
-            if self.try_refresh(account_key):
-                bootstrapped = self._stored_token(account_key, fallback="")
-                if bootstrapped:
-                    return bootstrapped
-            raise CredentialNotConfigured(
-                "no access token stored and refresh did not succeed; re-import the credential"
-            )
-        token = decrypt_secret(record.access_token_enc)
+        with _lock_for(self.owner_user_id), self._session_factory() as session:
+            self._lock_owner(session)
+            record = self._load(session, for_update=True)
+            if record is None:
+                raise CredentialRequired("Nike 账号尚未连接")
+            self._match_binding(record, binding)
 
-        if rejected_token is not None:
-            if token != rejected_token:
-                return token
-            if self.try_refresh(account_key, force=True, expected_token=token):
-                return self._stored_token(account_key, fallback=token)
+            now = datetime.now(UTC)
+            token = decrypt_secret(record.access_token_enc) if record.access_token_enc else ""
+
+            if rejected_token is not None and (token == rejected_token or not token):
+                self._refresh_locked(
+                    session, record, force=True, expected_token=token or None
+                )
+                token = decrypt_secret(record.access_token_enc) if record.access_token_enc else ""
+                if not token or token == rejected_token:
+                    raise self._auth_failure(record, "令牌刷新失败，请稍后重试")
+            elif not token:
+                if self._refresh_locked(session, record, force=True, expected_token=None):
+                    token = decrypt_secret(record.access_token_enc)
+                else:
+                    raise self._auth_failure(record, "凭证暂不可用，请稍后重试")
+            elif (
+                record.access_expires_at is not None
+                and record.access_expires_at - timedelta(seconds=REFRESH_MARGIN_SECONDS) < now
+            ):
+                if self._refresh_locked(session, record, force=False, expected_token=token):
+                    token = decrypt_secret(record.access_token_enc)
+
+            if not token:
+                raise CredentialRequired("Nike 账号尚未连接")
+            expires_at = record.access_expires_at
+            if expires_at is not None and expires_at <= now:
+                # Never hand out an expired token: a failed refresh must
+                # surface as a stable error instead.
+                raise self._auth_failure(record, "访问令牌已过期且刷新失败，请稍后重试")
             return token
-
-        expires_at = record.access_expires_at
-        margin = timedelta(seconds=REFRESH_MARGIN_SECONDS)
-        if (
-            expires_at is not None
-            and expires_at - margin < datetime.now(UTC)
-            and self.try_refresh(account_key, expected_token=token)
-        ):
-            return self._stored_token(account_key, fallback=token)
-        return token
-
-    def _stored_token(self, account_key: str, fallback: str) -> str:
-        record = self.get_record(account_key)
-        if record is None or not record.access_token_enc:
-            return fallback
-        return decrypt_secret(record.access_token_enc)
 
     def try_refresh(
         self,
-        account_key: str = "default",
         *,
+        binding: CredentialBinding | None = None,
         force: bool = False,
         expected_token: str | None = None,
     ) -> bool:
-        """Refresh the access token once, serialised across workers.
+        """Refresh once, serialised in-process and across workers."""
+        with _lock_for(self.owner_user_id), self._session_factory() as session:
+            self._lock_owner(session)
+            record = self._load(session, for_update=True)
+            if record is None:
+                raise CredentialRequired("Nike 账号尚未连接")
+            self._match_binding(record, binding)
+            return self._refresh_locked(
+                session, record, force=force, expected_token=expected_token
+            )
 
-        Returns True when the stored credential is rotated (or was rotated by
-        another worker); False when the refresh could not be performed. The
-        outcome is committed immediately so credential state survives a job
-        rollback.
+    # ---------------------------------------------------------------- install
+
+    def store_tokens(
+        self,
+        access_token: str,
+        refresh_token: str | None,
+        client_id: str = "",
+    ) -> CredentialBinding:
+        """Install a token pair for this owner (CLI / internal use).
+
+        First binding installs generation 1; replacing an existing credential
+        bumps the generation so old jobs can never use the new account.
         """
-        with _lock_for(account_key):
-            return self._refresh_locked(account_key, force=force, expected_token=expected_token)
+        with _lock_for(self.owner_user_id), self._session_factory() as session:
+            self._lock_owner(session)
+            record = self._load(session, for_update=True)
+            if record is None:
+                record = Credential(
+                    owner_user_id=self.owner_user_id,
+                    binding_generation=1,
+                    status=CredentialStatus.ACTIVE.value,
+                )
+                session.add(record)
+                session.flush()
+            else:
+                record.binding_generation = record.binding_generation + 1
+            apply_tokens_locked(
+                record,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                client_id=client_id or self.settings.oauth_client_id,
+            )
+            session.commit()
+            return CredentialBinding(
+                owner_user_id=self.owner_user_id,
+                credential_id=record.id,
+                generation=record.binding_generation,
+            )
 
-    def _refresh_locked(self, account_key: str, *, force: bool, expected_token: str | None) -> bool:
-        record = self.get_record(account_key, for_update=True)
-        if record is None or not record.refresh_token_enc:
-            self._mark_needs_authorization(record, "refresh token missing")
-            self.session.commit()
+    def revoke_local(self, session: Session, *, only_if_active: bool = True) -> bool:
+        """Mark this owner's credential as locally disconnected.
+
+        Must be called inside an existing transaction that already locked the
+        owner row and the credential row via :meth:`lock_for_update`. Clears
+        stored token ciphertext and bumps the generation so in-flight work
+        stops; returns False when the credential was already revoked.
+        """
+        record = self._load(session, for_update=True)
+        if record is None:
+            return False
+        if only_if_active and record.status == CredentialStatus.REVOKED.value:
+            return False
+        record.binding_generation = record.binding_generation + 1
+        record.status = CredentialStatus.REVOKED.value
+        record.access_token_enc = ""
+        record.refresh_token_enc = ""
+        record.access_expires_at = None
+        record.last_error = ""
+        record.last_error_code = None
+        record.updated_at = datetime.now(UTC)
+        session.flush()
+        return True
+
+    # --------------------------------------------------------------- internals
+
+    def lock_for_update(self, session: Session) -> None:
+        """Lock the owner row then the credential row (fixed platform order)."""
+        self._lock_owner(session)
+        self._load(session, for_update=True)
+
+    def _load(self, session: Session, *, for_update: bool = False) -> Credential | None:
+        stmt = select(Credential).where(Credential.owner_user_id == self.owner_user_id)
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        return session.execute(stmt).scalar_one_or_none()
+
+    def _lock_owner(self, session: Session) -> User:
+        user = session.execute(
+            select(User).where(User.id == self.owner_user_id).with_for_update()
+        ).scalar_one_or_none()
+        if user is None or not user.is_active:
+            raise CredentialUnavailable("账号不可用")
+        return user
+
+    def _require_active_scope(self, session: Session) -> None:
+        user = session.execute(
+            select(User).where(User.id == self.owner_user_id)
+        ).scalar_one_or_none()
+        if user is None or not user.is_active:
+            raise CredentialUnavailable("账号不可用")
+        tenant = session.execute(
+            select(Tenant).where(Tenant.id == user.tenant_id)
+        ).scalar_one_or_none()
+        if tenant is None or not tenant.is_active:
+            raise CredentialUnavailable("租户不可用")
+
+    def _match_binding(self, record: Credential, binding: CredentialBinding | None) -> None:
+        if binding is None:
+            if record.status == CredentialStatus.REVOKED.value:
+                raise CredentialChanged("绑定已断开，请重新发起扫描")
+            return
+        if (
+            record.owner_user_id != binding.owner_user_id
+            or record.id != binding.credential_id
+            or record.binding_generation != binding.generation
+        ):
+            raise CredentialChanged("绑定已变更，请重新发起扫描")
+        if record.status == CredentialStatus.REVOKED.value:
+            raise CredentialChanged("绑定已断开，请重新发起扫描")
+
+    def _refresh_locked(
+        self,
+        session: Session,
+        record: Credential,
+        *,
+        force: bool,
+        expected_token: str | None,
+    ) -> bool:
+        """Refresh under the credential row lock. Commits its own outcome."""
+        now = datetime.now(UTC)
+        self._match_binding(record, None)
+
+        if record.status == CredentialStatus.NEEDS_AUTHORIZATION.value and not force:
+            # A previously revoked grant stays revoked until the user re-binds.
+            return False
+        if not record.refresh_token_enc:
+            self._mark_error(record, CredentialStatus.NEEDS_AUTHORIZATION.value, "NIKE_REAUTH_REQUIRED")
+            session.commit()
             return False
 
-        now = datetime.now(UTC)
-        if force:
-            current = decrypt_secret(record.access_token_enc) if record.access_token_enc else ""
-            if expected_token is not None and current != expected_token:
-                # Another worker refreshed while this one waited for the lock.
-                return True
-        elif (
-            record.access_expires_at
+        current = decrypt_secret(record.access_token_enc) if record.access_token_enc else ""
+        if expected_token is not None and current != expected_token:
+            # Another worker refreshed while this one waited for the lock.
+            return True
+        if (
+            not force
+            and record.access_expires_at is not None
             and record.access_expires_at - timedelta(seconds=REFRESH_MARGIN_SECONDS) > now
         ):
             return True
@@ -163,10 +432,12 @@ class CredentialService:
         cooldown = self.settings.credential_refresh_cooldown_seconds
         if (
             cooldown > 0
+            and record.last_error_code is not None
             and record.last_attempt_at is not None
-            and record.status == CredentialStatus.NEEDS_AUTHORIZATION.value
             and (now - record.last_attempt_at).total_seconds() < cooldown
         ):
+            # Inside the cooldown no upstream call is made, for both temporary
+            # and permanent failures; the remembered outcome stands.
             return False
 
         record.last_attempt_at = now
@@ -186,86 +457,68 @@ class CredentialService:
                 },
                 timeout=25.0,
             )
-            response.raise_for_status()
-            payload = response.json()
-        except Exception as exc:  # noqa: BLE001 - any failure means "needs authorization"
-            self._mark_needs_authorization(record, str(exc)[:280])
-            self.session.commit()
+        except Exception:  # noqa: BLE001 - network failure is transient, not a revocation
+            self._mark_error(record, record.status, "NIKE_UPSTREAM_UNAVAILABLE")
+            session.commit()
             return False
 
-        access_token = payload.get("access_token")
-        if not access_token:
-            self._mark_needs_authorization(record, "token endpoint returned no access_token")
-            self.session.commit()
+        if response.status_code >= 500:
+            self._mark_error(record, record.status, "NIKE_UPSTREAM_UNAVAILABLE")
+            session.commit()
             return False
-        record.access_token_enc = encrypt_secret(access_token)
-        rotated = payload.get("refresh_token")
-        if rotated:
-            record.refresh_token_enc = encrypt_secret(rotated)
-        record.access_expires_at = _decode_expiry(access_token)
-        record.last_refreshed_at = datetime.now(UTC)
-        record.status = CredentialStatus.ACTIVE.value
-        record.last_error = ""
-        # Commit independently of the surrounding job: once the upstream has
-        # rotated the refresh token, the new pair must not be lost to a job
-        # rollback.
-        self.session.commit()
+
+        if response.status_code != 200:
+            payload: dict = {}
+            try:
+                payload = response.json()
+            except Exception:  # noqa: BLE001 - an unparsable body is still a rejection
+                payload = {}
+            error = str(payload.get("error") or "")
+            if response.status_code in (400, 401) and error in (
+                "invalid_grant",
+                "invalid_request",
+                "unauthorized_client",
+                "invalid_client",
+            ):
+                # Verified permanent rejection: the grant was revoked or the
+                # client registration changed; only the user can re-authorize.
+                self._mark_error(record, CredentialStatus.NEEDS_AUTHORIZATION.value, "NIKE_REAUTH_REQUIRED")
+                session.commit()
+                return False
+            self._mark_error(record, record.status, "NIKE_UPSTREAM_UNAVAILABLE")
+            session.commit()
+            return False
+
+        try:
+            payload = response.json()
+        except Exception:  # noqa: BLE001
+            payload = {}
+        access_token = str(payload.get("access_token") or "")
+        if not access_token:
+            self._mark_error(record, record.status, "NIKE_UPSTREAM_UNAVAILABLE")
+            session.commit()
+            return False
+        apply_tokens_locked(
+            record,
+            access_token=access_token,
+            refresh_token=str(payload.get("refresh_token") or "") or None,
+            client_id=record.client_id,
+        )
+        session.commit()
         return True
 
-    def store_tokens(
-        self,
-        access_token: str,
-        refresh_token: str | None,
-        client_id: str = "",
-        account_key: str = "default",
-    ) -> Credential:
-        record = self.get_record(account_key)
-        if record is None:
-            record = Credential(account_key=account_key)
-            self.session.add(record)
-        record.access_token_enc = encrypt_secret(access_token)
-        if refresh_token:
-            record.refresh_token_enc = encrypt_secret(refresh_token)
-        record.client_id = client_id or self.settings.oauth_client_id
-        record.access_expires_at = _decode_expiry(access_token)
-        record.status = CredentialStatus.ACTIVE.value
-        record.last_error = ""
+    def _mark_error(self, record: Credential, status: str, code: str) -> None:
+        record.status = status
+        record.last_error_code = code
         record.updated_at = datetime.now(UTC)
-        self.session.flush()
-        return record
+        logger.info("credential refresh outcome owner=%s code=%s", self.owner_user_id, code)
 
-    def status(self, account_key: str = "default") -> dict[str, object]:
-        record = self.get_record(account_key)
-        if record is None:
-            return {
-                "account_key": account_key,
-                "status": CredentialStatus.NEEDS_AUTHORIZATION.value,
-                "access_expires_at": None,
-                "last_refreshed_at": None,
-                "last_error": "credential not imported",
-                "has_refresh_token": False,
-            }
-        expires_at = record.access_expires_at
-        status = record.status
-        if status == CredentialStatus.ACTIVE.value and expires_at is not None:
-            remaining = (expires_at - datetime.now(UTC)).total_seconds()
-            if remaining < 0:
-                status = CredentialStatus.NEEDS_AUTHORIZATION.value
-            elif remaining < 3600:
-                status = CredentialStatus.EXPIRING.value
-        return {
-            "account_key": record.account_key,
-            "status": status,
-            "access_expires_at": expires_at,
-            "last_refreshed_at": record.last_refreshed_at,
-            "last_error": record.last_error,
-            "has_refresh_token": bool(record.refresh_token_enc),
-        }
-
-    def _mark_needs_authorization(self, record: Credential | None, message: str) -> None:
-        if record is None:
-            return
-        record.status = CredentialStatus.NEEDS_AUTHORIZATION.value
-        record.last_error = message
-        record.updated_at = datetime.now(UTC)
-        self.session.flush()
+    def _auth_failure(self, record: Credential, message: str) -> CredentialError:
+        """Map the current credential state onto the stable error contract."""
+        if record.status == CredentialStatus.NEEDS_AUTHORIZATION.value:
+            return CredentialReauthRequired(message)
+        if record.status == CredentialStatus.REVOKED.value:
+            return CredentialChanged("绑定已断开，请重新发起扫描")
+        if record.status == CredentialStatus.UNASSIGNED.value:
+            return CredentialRequired("Nike 账号尚未连接")
+        return CredentialUnavailable(message)

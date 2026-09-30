@@ -149,11 +149,123 @@ export interface Dashboard {
   daily_review_budget: number;
 }
 
-export interface CredentialStatus {
-  account_key: string;
-  status: "ACTIVE" | "EXPIRING" | "NEEDS_AUTHORIZATION";
+/**
+ * Personal Nike connection state, mirroring the backend `me/nike-credential`
+ * DTO. `NOT_CONNECTED` replaces the old shared/`UNASSIGNED` credential: the
+ * platform never exposes a default or another user's binding.
+ */
+export type NikeCredentialStatus =
+  | "NOT_CONNECTED"
+  | "ACTIVE"
+  | "EXPIRING"
+  | "NEEDS_AUTHORIZATION"
+  | "REVOKED";
+
+export interface NikeCredentialOut {
+  status: NikeCredentialStatus;
+  phone_masked: string | null;
   access_expires_at: string | null;
   last_refreshed_at: string | null;
-  last_error: string;
-  has_refresh_token: boolean;
+  last_error_code: string | null;
+  binding_generation: number | null;
+  login_available: boolean;
+}
+
+/** Lifecycle of one本站 phone/SMS bind session; the frozen upstream contract
+ * decides the code format, so the UI only drives off these server fields. */
+export type NikeAuthAttemptState =
+  | "SENDING"
+  | "CODE_SENT"
+  | "VERIFYING"
+  | "CONNECTED"
+  | "FAILED"
+  | "EXPIRED"
+  | "CANCELLED"
+  | "CHALLENGE_REQUIRED";
+
+/** Stable `error_code` values returned by the self-service auth endpoints. */
+export type NikeAuthErrorCode =
+  | "NIKE_AUTH_NOT_AVAILABLE"
+  | "NIKE_AUTH_IN_PROGRESS"
+  | "NIKE_AUTH_SESSION_MISMATCH"
+  | "NIKE_AUTH_REQUEST_CONFLICT"
+  | "NIKE_SMS_SEND_UNCERTAIN"
+  | "NIKE_VERIFY_UNCERTAIN"
+  | "NIKE_CHALLENGE_REQUIRED"
+  | "NIKE_AUTH_CONTRACT_CHANGED"
+  | "NIKE_CODE_INVALID"
+  | "NIKE_CODE_EXPIRED"
+  | "NIKE_AUTH_RATE_LIMITED"
+  | "NIKE_PHONE_CONNECT_UNAVAILABLE"
+  | "NIKE_CREDENTIAL_REQUIRED"
+  | "NIKE_CREDENTIAL_CHANGED"
+  | "NIKE_REAUTH_REQUIRED"
+  | "NIKE_UPSTREAM_UNAVAILABLE";
+
+export type NikeBootstrapState = "NONE" | "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED";
+
+/** 绑定后的预加载进度：门店目录用本人连接拉取，只属于本人（缓存）。 */
+export interface NikeBootstrapOut {
+  state: NikeBootstrapState;
+  progress: number;
+  stage: string;
+  store_count: number;
+  error_code: string | null;
+  updated_at: string | null;
+}
+
+/** Attempt DTO returned by `POST/GET me/nike-auth/sessions`. */
+export interface NikeAuthAttempt {
+  id: string;
+  state: NikeAuthAttemptState;
+  phone_masked: string;
+  expires_at: string | null;
+  resend_after: string | null;
+  attempts_remaining: number | null;
+  error_code: NikeAuthErrorCode | null;
+}
+
+/** Output alias kept for symmetry with the backend `NikeAuthAttemptOut` schema. */
+export type NikeAuthAttemptOut = NikeAuthAttempt;
+
+export type NotificationPlatform =
+  | "dingtalk"
+  | "feishu"
+  | "wecombot"
+  | "schan"
+  | "bark"
+  | "mailto"
+  | "custom";
+
+/** 一条推送渠道；target_hint 只保留非敏感的提示，完整地址不下发。 */
+export interface NotificationChannel {
+  id: string;
+  platform: NotificationPlatform;
+  name: string;
+  target_hint: string;
+  enabled: boolean;
+  last_ok_at: string | null;
+  last_error_code: string | null;
+  last_error: string | null;
+  last_error_at: string | null;
+  created_at: string;
+}
+
+export type NotificationDeliveryState = "PENDING" | "SENT" | "FAILED";
+
+/** 一次检查聚合出来的单条推送及其投递状态。 */
+export interface NotificationDelivery {
+  id: number;
+  job_id: string;
+  task_name: string | null;
+  channel_id: string;
+  channel_name: string;
+  platform: NotificationPlatform;
+  state: NotificationDeliveryState;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+  sent_at: string | null;
+  title: string;
+  summary: string;
 }

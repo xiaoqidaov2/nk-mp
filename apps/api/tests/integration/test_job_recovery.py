@@ -1,6 +1,8 @@
 """T03: job checkpoints, lease ownership and restart recovery.
 
-Uses a real PostgreSQL session and a scripted upstream client; no HTTP.
+Uses a real PostgreSQL session and a scripted upstream client; no HTTP. Jobs
+are personal now: the owner and credential binding are frozen at enqueue time
+and every persisted artifact carries that owner.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from app.services import jobs as jobs_module
 from app.services.credentials import CredentialService
 from app.services.jobs import enqueue_job, lease_next_job, requeue_failed_stores, run_job
 
-from .helpers import make_store, make_style, make_tenant
+from .helpers import make_store, make_style, make_tenant, make_user, store_credential
 
 
 class FakeNikeClient:
@@ -35,10 +37,17 @@ class FakeNikeClient:
     behaviours: dict[str, str] = {}
     calls: list[tuple[str, bool]] = []
 
-    def __init__(self, settings, access_token, token_provider=None):  # noqa: ANN001
+    def __init__(
+        self,
+        settings,
+        access_token,
+        token_provider=None,
+        credential_guard=None,
+    ):  # noqa: ANN001
         self.settings = settings
         self.access_token = access_token
         self.token_provider = token_provider
+        self.credential_guard = credential_guard
         self.transaction_listener = None
 
     def fetch_structure(self, store_code: str, style_code: str) -> SizeStructure:
@@ -84,18 +93,28 @@ def seeded():
     settings = get_settings()
     with SessionLocal() as db:
         tenant = make_tenant(db, budget=100000)
-        make_store(db, code="S1", name="一店", region_id="R1")
-        make_store(db, code="S2", name="二店", region_id="R2")
-        make_style(db, code="DN3707-202")
-        CredentialService(settings, db).store_tokens("access-token", "refresh-token")
+        user = make_user(db, tenant, email="job-owner@example.com")
+        make_store(db, owner=user, code="S1", name="一店", region_id="R1")
+        make_store(db, owner=user, code="S2", name="二店", region_id="R2")
+        make_style(db, owner=user, code="DN3707-202")
         db.commit()
-        return {"tenant_id": tenant.id}
+        seed = {"tenant_id": tenant.id, "user_id": user.id}
+    # Fake credential so the job's frozen binding is usable without HTTP.
+    seed["binding"] = store_credential(settings, seed["user_id"])
+    return seed
 
 
-def _enqueue(tenant_id) -> str:  # noqa: ANN001
+def _enqueue(seeded) -> str:  # noqa: ANN001
+    settings = get_settings()
     with SessionLocal() as db:
+        binding = CredentialService(settings, seeded["user_id"]).binding()
         job = enqueue_job(
-            db, tenant_id=tenant_id, store_codes=["S1", "S2"], style_codes=["DN3707-202"]
+            db,
+            tenant_id=seeded["tenant_id"],
+            store_codes=["S1", "S2"],
+            style_codes=["DN3707-202"],
+            owner_user_id=seeded["user_id"],
+            credential_binding=binding,
         )
         db.commit()
         return job.id
@@ -141,7 +160,7 @@ def test_completed_store_is_committed_before_a_crash(seeded, monkeypatch) -> Non
     FakeNikeClient.calls = []
     FakeNikeClient.behaviours = {"R1": "ok", "R2": "crash"}
 
-    job_id = _lease(_enqueue(seeded["tenant_id"]))
+    job_id = _lease(_enqueue(seeded))
     with pytest.raises(KeyboardInterrupt):
         _run(job_id)
 
@@ -155,8 +174,11 @@ def test_completed_store_is_committed_before_a_crash(seeded, monkeypatch) -> Non
         assert len(observations) == 1
         assert observations[0].availability == "IN_STOCK"
         assert observations[0].job_id is not None
+        assert observations[0].owner_user_id == seeded["user_id"]
+        assert observations[0].credential_id == seeded["binding"].credential_id
         latest = db.execute(select(ObservationLatest)).scalars().all()
         assert len(latest) == 1
+        assert latest[0].owner_user_id == seeded["user_id"]
     with SessionLocal() as db:
         job = db.get(ScanJob, job_id)
         assert job.status == JobStatus.RUNNING.value
@@ -169,7 +191,7 @@ def test_stolen_lease_stops_the_old_worker(seeded, monkeypatch) -> None:
     FakeNikeClient.calls = []
     FakeNikeClient.behaviours = {"R1": "takeover", "R2": "ok"}
 
-    job_id = _lease(_enqueue(seeded["tenant_id"]))
+    job_id = _lease(_enqueue(seeded))
     _run(job_id)
 
     store1, store2 = _store_id("S1"), _store_id("S2")
@@ -186,7 +208,7 @@ def test_stolen_lease_stops_the_old_worker(seeded, monkeypatch) -> None:
 
 def test_only_one_worker_can_hold_the_lease(seeded) -> None:
     settings = get_settings()
-    job_id = _enqueue(seeded["tenant_id"])
+    job_id = _enqueue(seeded)
 
     db1, db2 = SessionLocal(), SessionLocal()
     try:
@@ -218,7 +240,7 @@ def test_retry_requeues_only_incomplete_stores(seeded, monkeypatch) -> None:
     FakeNikeClient.calls = []
     FakeNikeClient.behaviours = {"R2": "untrusted"}
 
-    job_id = _lease(_enqueue(seeded["tenant_id"]))
+    job_id = _lease(_enqueue(seeded))
     _run(job_id)
 
     store1, store2 = _store_id("S1"), _store_id("S2")
@@ -246,3 +268,6 @@ def test_retry_requeues_only_incomplete_stores(seeded, monkeypatch) -> None:
         job = db.get(ScanJob, job_id)
         assert job.status == JobStatus.SUCCEEDED.value
         assert job.finished_at is not None
+        # The frozen owner never changes across retries.
+        assert job.owner_user_id == seeded["user_id"]
+        assert job.credential_id == seeded["binding"].credential_id

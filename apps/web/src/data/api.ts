@@ -1,11 +1,16 @@
 import { api, apiRequest } from "./client";
 import type {
   ChangeEvent,
-  CredentialStatus,
   CurrentUser,
   Dashboard,
   Matrix,
   MonitorTask,
+  NikeAuthAttemptOut,
+  NikeBootstrapOut,
+  NikeCredentialOut,
+  NotificationChannel,
+  NotificationDelivery,
+  NotificationPlatform,
   ScanJob,
   ScanStore,
   StoreOut,
@@ -77,15 +82,60 @@ export const dashboardApi = {
 };
 
 export const opsApi = {
-  credential: () => api.get<CredentialStatus>("/ops/credentials"),
-  refreshCredential: () => api.post<CredentialStatus>("/ops/credentials/refresh"),
   syncStores: () => api.post<{ ok: boolean; synced?: number }>("/ops/stores/sync"),
+  /** 运维自检：当前进程实际使用的 Nike 上游（离线联调时是本地假服务）。 */
+  healthDetail: () =>
+    api.get<{ queue_depth: number; running_jobs: number; stores: number; styles: number; nike_api_base: string }>(
+      "/ops/health/detail",
+    ),
+};
+
+/**
+ * Self-service Nike binding. Routes are the本站 `me/*` contract; the owner and
+ * attempts are always derived from the登录 session server-side.
+ */
+export const nikeCredentialApi = {
+  status: () => api.get<NikeCredentialOut>("/me/nike-credential"),
+  start: (payload: { phone: string; consent: true; request_id: string }) =>
+    api.post<NikeAuthAttemptOut>("/me/nike-auth/sessions", payload),
+  attempt: (id: string) => api.get<NikeAuthAttemptOut>(`/me/nike-auth/sessions/${id}`),
+  verify: (id: string, payload: { code: string }) =>
+    api.post<NikeCredentialOut>(`/me/nike-auth/sessions/${id}/verify`, payload),
+  cancel: (id: string) => api.delete<void>(`/me/nike-auth/sessions/${id}`),
+  disconnect: () => api.delete<void>("/me/nike-credential"),
+  /** 绑定后预加载进度（门店目录按用户缓存）。 */
+  bootstrap: () => api.get<NikeBootstrapOut>("/me/bootstrap"),
+  /** 重新排队预加载（失败重试 / 手动刷新缓存）。 */
+  startBootstrap: () => api.post<NikeBootstrapOut>("/me/bootstrap"),
+};
+
+export interface NotificationChannelPayload {
+  platform: NotificationPlatform;
+  name?: string;
+  fields: Record<string, string>;
+}
+
+/** 推送渠道只属于当前登录用户；目标地址由服务端拼装并加密保存。 */
+export const notificationApi = {
+  channels: () => api.get<NotificationChannel[]>("/me/notification-channels"),
+  createChannel: (payload: NotificationChannelPayload) =>
+    api.post<NotificationChannel>("/me/notification-channels", payload),
+  updateChannel: (id: string, payload: { name?: string; enabled?: boolean }) =>
+    api.patch<NotificationChannel>(`/me/notification-channels/${id}`, payload),
+  removeChannel: (id: string) => api.delete<void>(`/me/notification-channels/${id}`),
+  testChannel: (id: string) =>
+    api.post<{ ok: boolean; error: string | null }>(`/me/notification-channels/${id}/test`),
+  deliveries: (limit = 10) =>
+    api.get<NotificationDelivery[]>(`/me/notifications?limit=${limit}`),
+  retryDelivery: (id: number) => api.post<{ ok: boolean }>(`/me/notifications/${id}/retry`),
 };
 
 export interface ScanProgressHandlers {
   onProgress: (job: ScanJob) => void;
   onDone: () => void;
   onError: (message: string) => void;
+  /** 自动刷新断开、已回退为轮询（用于“进度自动更新已中断”提示）。 */
+  onFallback?: () => void;
 }
 
 /** Subscribes to scan progress over SSE, falling back to polling on failure. */
@@ -134,7 +184,10 @@ export function subscribeScanProgress(
   });
   source.onerror = () => {
     source.close();
-    if (!closed) startPolling();
+    if (!closed) {
+      startPolling();
+      handlers.onFallback?.();
+    }
   };
 
   return () => {

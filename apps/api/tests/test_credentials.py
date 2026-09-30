@@ -1,269 +1,219 @@
-"""T04: credential lifecycle.
+"""T04: credential lifecycle — the parts that need no real PostgreSQL.
 
-Covers forced refresh after a 401, single-flight serialisation, immediate
-persistence of rotated credentials and bounded retry behaviour.
+The old file exercised rotation, single-flight and commit isolation through a
+shared duck-typed session. Those invariants depend on row locks and separate
+short transactions, so they are verified against real PostgreSQL in
+``tests/integration`` and must not be "proved" with a fake session here.
+
+What remains genuinely unit-testable is pure logic:
+
+* :func:`_decode_expiry` — token claim decoding and its fallback to ``None``;
+* the stable ``NIKE_*`` ``.code`` on the credential exception hierarchy;
+* the ``status()`` derivation (ACTIVE -> EXPIRING / NEEDS_AUTHORIZATION)
+  against a single lightweight credential row.
 """
 
 from __future__ import annotations
 
-import threading
-import time
+import base64
+import json
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
-import httpx
 import pytest
 
 from app.models import Credential, CredentialStatus
-from app.nike.client import NikeClient
-from app.nike.errors import ErrorCode, ScanError
-from app.security import encrypt_secret
-from app.services import credentials as credentials_module
-from app.services.credentials import CredentialNotConfigured, CredentialService
+from app.services.credentials import (
+    CredentialChanged,
+    CredentialError,
+    CredentialReauthRequired,
+    CredentialRequired,
+    CredentialService,
+    CredentialUnavailable,
+    _decode_expiry,
+)
 
 from .conftest import make_jwt
 
+PHONE_MASKED = "+86****8000"
 
-class _Result:
-    def __init__(self, value):  # noqa: ANN001
+
+# --------------------------------------------------------------------- helpers
+
+
+class _ScalarResult:
+    def __init__(self, value):  # noqa: ANN001 - duck-typed for the test
         self._value = value
 
     def scalar_one_or_none(self):  # noqa: ANN201
         return self._value
 
 
-class _FakeSession:
-    """Duck-typed session; records commits so persistence can be asserted."""
+class _StubSession:
+    """Context-managing session that serves exactly one credential row."""
 
     def __init__(self, record: Credential | None) -> None:
         self.record = record
-        self.commits = 0
-        self.flushes = 0
+        self.closed = False
 
-    def execute(self, _stmt):  # noqa: ANN001
-        return _Result(self.record)
+    def execute(self, _stmt):  # noqa: ANN001 - duck-typed for the test
+        return _ScalarResult(self.record)
 
-    def commit(self) -> None:
-        self.commits += 1
+    def __enter__(self) -> _StubSession:
+        return self
 
-    def flush(self) -> None:
-        self.flushes += 1
+    def __exit__(self, *_exc: object) -> None:
+        self.closed = True
 
 
-def _record(*, access: str = "old-token", refresh: str = "refresh-token", expires_in: int = 3600) -> Credential:
-    return Credential(
-        account_key="default",
-        client_id="client",
-        access_token_enc=encrypt_secret(access),
-        refresh_token_enc=encrypt_secret(refresh),
-        status=CredentialStatus.ACTIVE.value,
-        access_expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
-        last_error="",
+def _service(settings, record: Credential | None = None) -> CredentialService:
+    return CredentialService(
+        settings, uuid4(), session_factory=lambda: _StubSession(record)
     )
 
 
-def _fake_response(payload: dict, status: int = 200) -> httpx.Response:
-    response = httpx.Response(status, json=payload)
-    response.request = httpx.Request("POST", "https://accounts.nike.com.cn/token/v1")
-    return response
+def _credential(**overrides) -> Credential:  # noqa: ANN003
+    fields: dict = {
+        "owner_user_id": uuid4(),
+        "binding_generation": 3,
+        "status": CredentialStatus.ACTIVE.value,
+        "access_expires_at": datetime.now(UTC) + timedelta(seconds=7200),
+        "last_refreshed_at": datetime.now(UTC) - timedelta(seconds=30),
+        "last_error_code": None,
+        "phone_masked": PHONE_MASKED,
+    }
+    fields.update(overrides)
+    return Credential(**fields)
 
 
-def _post_ok(monkeypatch, *, access: str, refresh: str | None = None) -> list[dict]:
-    calls: list[dict] = []
-
-    def fake_post(url, data=None, headers=None, timeout=None):  # noqa: ANN001
-        calls.append({"url": url, "data": data})
-        payload = {"access_token": access}
-        if refresh:
-            payload["refresh_token"] = refresh
-        return _fake_response(payload)
-
-    monkeypatch.setattr(credentials_module.httpx, "post", fake_post)
-    return calls
+def _token_with_claims(claims: object) -> str:  # noqa: ANN001
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"header.{payload}.signature"
 
 
-def test_unexpired_token_is_used_without_refresh(settings, monkeypatch) -> None:
-    calls = _post_ok(monkeypatch, access="unused")
-    session = _FakeSession(_record())
-    service = CredentialService(settings, session)
-    assert service.access_token() == "old-token"
-    assert calls == []
+# ---------------------------------------------------------------- _decode_expiry
 
 
-def test_expiring_token_is_refreshed(settings, monkeypatch) -> None:
-    new_token = make_jwt(3600)
-    calls = _post_ok(monkeypatch, access=new_token, refresh="refresh-2")
-    session = _FakeSession(_record(expires_in=60))
-    service = CredentialService(settings, session)
-    assert service.access_token() == new_token
-    assert len(calls) == 1
-    assert session.record.refresh_token_enc and session.commits >= 1
+def test_decode_expiry_reads_the_exp_claim() -> None:
+    decoded = _decode_expiry(make_jwt(3600))
+    assert decoded is not None
+    remaining = (decoded - datetime.now(UTC)).total_seconds()
+    assert 3500 < remaining < 3700
 
 
-def test_rejected_token_is_refreshed_even_when_unexpired(settings, monkeypatch) -> None:
-    """Regression: a 401 must rotate the credential even before its expiry."""
-    new_token = make_jwt(3600)
-    calls = _post_ok(monkeypatch, access=new_token)
-    session = _FakeSession(_record(expires_in=3600))
-    service = CredentialService(settings, session)
-    assert service.access_token(rejected_token="old-token") == new_token
-    assert len(calls) == 1
-
-
-def test_rejected_token_already_rotated_is_not_refreshed_again(settings, monkeypatch) -> None:
-    calls = _post_ok(monkeypatch, access="unused")
-    session = _FakeSession(_record(access="already-new"))
-    service = CredentialService(settings, session)
-    assert service.access_token(rejected_token="old-token") == "already-new"
-    assert calls == []
-
-
-def test_refresh_failure_marks_needs_authorization_and_commits(settings, monkeypatch) -> None:
-    def failing_post(*_args, **_kwargs):  # noqa: ANN001
-        raise httpx.ConnectError("oauth unreachable")
-
-    monkeypatch.setattr(credentials_module.httpx, "post", failing_post)
-    session = _FakeSession(_record(expires_in=60))
-    service = CredentialService(settings, session)
-    assert service.try_refresh() is False
-    assert session.record.status == CredentialStatus.NEEDS_AUTHORIZATION.value
-    assert "oauth unreachable" in session.record.last_error
-    assert session.commits == 1
-
-
-def test_failed_refresh_is_not_hammered_within_cooldown(settings, monkeypatch) -> None:
-    attempts = {"count": 0}
-
-    def failing_post(*_args, **_kwargs):  # noqa: ANN001
-        attempts["count"] += 1
-        raise httpx.ConnectError("oauth unreachable")
-
-    monkeypatch.setattr(credentials_module.httpx, "post", failing_post)
-    session = _FakeSession(_record(expires_in=60))
-    service = CredentialService(settings, session)
-    assert service.try_refresh() is False
-    assert service.try_refresh() is False
-    assert attempts["count"] == 1
-
-
-def test_single_flight_refresh_across_threads(settings, monkeypatch) -> None:
-    new_token = make_jwt(3600)
-    calls: list[dict] = []
-    barrier = threading.Barrier(2)
-
-    def slow_post(url, data=None, headers=None, timeout=None):  # noqa: ANN001
-        calls.append({"url": url, "data": data})
-        time.sleep(0.05)
-        return _fake_response({"access_token": new_token, "refresh_token": "rt-2"})
-
-    monkeypatch.setattr(credentials_module.httpx, "post", slow_post)
-    session = _FakeSession(_record(expires_in=60))
-    service = CredentialService(settings, session)
-    results: list[bool] = []
-
-    def worker() -> None:
-        barrier.wait()
-        results.append(service.try_refresh(force=True, expected_token="old-token"))
-
-    threads = [threading.Thread(target=worker) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert results == [True, True]
-    assert len(calls) == 1
-
-
-def test_401_recovery_flow_rotates_once_and_retries(settings, monkeypatch) -> None:
-    """End-to-end: 401 → provider rotates → the request is retried once."""
-    new_token = make_jwt(3600)
-    calls = _post_ok(monkeypatch, access=new_token)
-
-    responses = [
-        httpx.Response(401, json={"error": "unauthorized"}),
-        httpx.Response(202, json={}),
-        httpx.Response(
-            200,
-            json={"response": {"fulfillmentGroups": [{"items": [{"skuId": "g0", "itemCosts": {}}]}]}},
-        ),
-    ]
-    seen_auth: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen_auth.append(request.headers["Authorization"])
-        return responses.pop(0)
-
-    session = _FakeSession(_record(expires_in=3600))
-    service = CredentialService(settings, session)
-    client = NikeClient(
-        settings,
-        service.access_token(),
-        token_provider=service.token_provider(),
-        sleep=lambda _seconds: None,
-        transport=httpx.MockTransport(handler),
-    )
-    batch = client.review(["g0"], region_id="NIKE0S001")
-    assert batch.trusted is True
-    assert len(calls) == 1
-    assert seen_auth[0] == "Bearer old-token"
-    assert seen_auth[1] == f"Bearer {new_token}"
-
-
-def test_refresh_without_new_token_bounds_retries(settings, monkeypatch) -> None:
-    def failing_post(*_args, **_kwargs):  # noqa: ANN001
-        raise httpx.ConnectError("oauth unreachable")
-
-    monkeypatch.setattr(credentials_module.httpx, "post", failing_post)
-    responses = [httpx.Response(401, json={"error": "unauthorized"})]
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return responses.pop(0)
-
-    session = _FakeSession(_record(expires_in=3600))
-    service = CredentialService(settings, session)
-    client = NikeClient(
-        settings,
-        service.access_token(),
-        token_provider=service.token_provider(),
-        sleep=lambda _seconds: None,
-        transport=httpx.MockTransport(handler),
-    )
-    with pytest.raises(ScanError) as excinfo:
-        client.review(["g0"], region_id="NIKE0S001")
-    assert excinfo.value.code == ErrorCode.AUTH_REQUIRED
-    assert len(requests) == 1
-
-
-def _refresh_only_record() -> Credential:
-    return Credential(
-        account_key="default",
-        client_id="client",
-        access_token_enc="",
-        refresh_token_enc=encrypt_secret("refresh-token"),
-        status=CredentialStatus.ACTIVE.value,
-        access_expires_at=None,
-        last_error="",
+def test_decode_expiry_uses_the_exact_claim_value() -> None:
+    assert _decode_expiry(_token_with_claims({"exp": 1234567890})) == datetime.fromtimestamp(
+        1234567890, tz=UTC
     )
 
 
-def test_refresh_only_import_bootstraps_access_token(settings, monkeypatch) -> None:
-    """Only mp_refresh.txt is needed: the first access token comes from refresh."""
-    new_token = make_jwt(3600)
-    calls = _post_ok(monkeypatch, access=new_token, refresh="rt-2")
-    session = _FakeSession(_refresh_only_record())
-    service = CredentialService(settings, session)
-    assert service.access_token() == new_token
-    assert len(calls) == 1
-    assert session.commits >= 1
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("no-dots-here", id="not-a-jwt"),
+        pytest.param("header..signature", id="empty-payload"),
+        pytest.param("header.not-base64!!.signature", id="undecodable-payload"),
+        pytest.param(_token_with_claims({"sub": "no-expiry"}), id="missing-exp"),
+        pytest.param(_token_with_claims({"exp": "soon"}), id="non-numeric-exp"),
+        pytest.param(_token_with_claims([1, 2, 3]), id="non-object-claims"),
+    ],
+)
+def test_decode_expiry_returns_none_for_unknown_expiry(token: str) -> None:
+    assert _decode_expiry(token) is None
 
 
-def test_refresh_only_import_fails_clearly_when_refresh_fails(settings, monkeypatch) -> None:
-    def failing_post(*_args, **_kwargs):  # noqa: ANN001
-        raise httpx.ConnectError("oauth unreachable")
+# ------------------------------------------------------------- exception codes
 
-    monkeypatch.setattr(credentials_module.httpx, "post", failing_post)
-    service = CredentialService(settings, _FakeSession(_refresh_only_record()))
-    with pytest.raises(CredentialNotConfigured):
-        service.access_token()
+
+@pytest.mark.parametrize(
+    ("error_cls", "expected_code"),
+    [
+        (CredentialError, "NIKE_UPSTREAM_UNAVAILABLE"),
+        (CredentialRequired, "NIKE_CREDENTIAL_REQUIRED"),
+        (CredentialChanged, "NIKE_CREDENTIAL_CHANGED"),
+        (CredentialReauthRequired, "NIKE_REAUTH_REQUIRED"),
+        (CredentialUnavailable, "NIKE_UPSTREAM_UNAVAILABLE"),
+    ],
+)
+def test_credential_errors_expose_stable_codes(error_cls, expected_code: str) -> None:
+    assert issubclass(error_cls, CredentialError)
+    assert error_cls.code == expected_code
+    assert error_cls("message").code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_cls"),
+    [
+        (CredentialStatus.NEEDS_AUTHORIZATION.value, CredentialReauthRequired),
+        (CredentialStatus.REVOKED.value, CredentialChanged),
+        (CredentialStatus.UNASSIGNED.value, CredentialRequired),
+        (CredentialStatus.ACTIVE.value, CredentialUnavailable),
+        (CredentialStatus.EXPIRING.value, CredentialUnavailable),
+    ],
+)
+def test_auth_failure_maps_state_to_error(settings, status: str, expected_cls) -> None:
+    """A dead credential must surface as the matching stable NIKE_* error."""
+    service = _service(settings)
+    error = service._auth_failure(_credential(status=status), "boom")
+    assert type(error) is expected_cls
+    assert error.code == expected_cls.code
+
+
+# --------------------------------------------------------------- status() view
+
+
+def test_status_is_none_without_a_credential(settings) -> None:
+    assert _service(settings, None).status() is None
+
+
+def test_status_reports_active_when_far_from_expiry(settings) -> None:
+    info = _service(settings, _credential()).status()
+    assert info is not None
+    assert info.status == CredentialStatus.ACTIVE.value
+
+
+def test_status_derives_expiring_within_the_refresh_margin(settings) -> None:
+    record = _credential(access_expires_at=datetime.now(UTC) + timedelta(seconds=1800))
+    info = _service(settings, record).status()
+    assert info is not None
+    assert info.status == CredentialStatus.EXPIRING.value
+
+
+def test_status_derives_needs_authorization_when_expired(settings) -> None:
+    record = _credential(access_expires_at=datetime.now(UTC) - timedelta(seconds=60))
+    info = _service(settings, record).status()
+    assert info is not None
+    assert info.status == CredentialStatus.NEEDS_AUTHORIZATION.value
+
+
+def test_status_keeps_non_active_state_even_when_expired(settings) -> None:
+    """Only ACTIVE is re-derived; a revoked row must not look re-authorizable."""
+    record = _credential(
+        status=CredentialStatus.REVOKED.value,
+        access_expires_at=datetime.now(UTC) - timedelta(seconds=60),
+    )
+    info = _service(settings, record).status()
+    assert info is not None
+    assert info.status == CredentialStatus.REVOKED.value
+
+
+def test_status_without_expiry_stays_active(settings) -> None:
+    info = _service(settings, _credential(access_expires_at=None)).status()
+    assert info is not None
+    assert info.status == CredentialStatus.ACTIVE.value
+
+
+def test_status_exposes_row_metadata(settings) -> None:
+    refreshed = datetime.now(UTC) - timedelta(seconds=30)
+    record = _credential(
+        binding_generation=7,
+        last_refreshed_at=refreshed,
+        last_error_code="NIKE_REAUTH_REQUIRED",
+    )
+    info = _service(settings, record).status()
+    assert info is not None
+    assert info.phone_masked == PHONE_MASKED
+    assert info.access_expires_at == record.access_expires_at
+    assert info.last_refreshed_at == refreshed
+    assert info.last_error_code == "NIKE_REAUTH_REQUIRED"
+    assert info.binding_generation == 7

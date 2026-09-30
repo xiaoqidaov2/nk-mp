@@ -5,17 +5,35 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from app.models import ChangeEvent, Observation, ObservationLatest
+from app.models import ChangeEvent, Observation, ObservationLatest, User
+from app.services.credentials import CredentialBinding
 from app.services.observations import _detect_events, persist_observations
 
 
-class _FakeSession:
-    """Minimal stand-in for the SQLAlchemy session used by the diff helpers."""
+class _ScalarResult:
+    def __init__(self, value):  # noqa: ANN001 - duck-typed for the test
+        self._value = value
 
-    def __init__(self, latest: ObservationLatest | None = None) -> None:
+    def scalar_one_or_none(self):  # noqa: ANN201
+        return self._value
+
+
+class _FakeSession:
+    """Minimal stand-in for the SQLAlchemy session used by the diff helpers.
+
+    ``persist_observations`` queries three different entities, so the fake
+    dispatches on the selected entity instead of counting calls: first the
+    owner's ``User.tenant_id``, then the stored ``ObservationLatest`` row per
+    observation, then the ``ChangeEvent`` dedupe lookup. The dispatch keeps
+    working for any number of observations.
+    """
+
+    def __init__(
+        self, latest: ObservationLatest | None = None, *, tenant_id=None  # noqa: ANN001
+    ) -> None:
         self.added: list[object] = []
         self._latest = latest
-        self._lookups = 0
+        self._tenant_id = tenant_id
 
     def add(self, obj: object) -> None:
         self.added.append(obj)
@@ -23,18 +41,23 @@ class _FakeSession:
     def flush(self) -> None:
         return None
 
-    def execute(self, _stmt):  # noqa: ANN001 - duck-typed for the test
-        class _Result:
-            def __init__(self, value):  # noqa: ANN001
-                self._value = value
+    def execute(self, stmt):  # noqa: ANN001 - duck-typed for the test
+        entity = stmt.column_descriptions[0].get("entity")
+        if entity is User:
+            return _ScalarResult(self._tenant_id)
+        if entity is ObservationLatest:
+            return _ScalarResult(self._latest)
+        return _ScalarResult(None)
 
-            def scalar_one_or_none(self):  # noqa: ANN201
-                return self._value
 
-        self._lookups += 1
-        # The first lookup is the ObservationLatest row; later lookups (for
-        # example the STRUCTURE_CHANGED dedupe check) find nothing.
-        return _Result(self._latest if self._lookups == 1 else None)
+def _binding(*, generation: int = 1, **overrides):  # noqa: ANN003
+    fields: dict = {
+        "owner_user_id": uuid.uuid4(),
+        "credential_id": uuid.uuid4(),
+        "generation": generation,
+    }
+    fields.update(overrides)
+    return CredentialBinding(**fields)
 
 
 def _observation(
@@ -68,6 +91,8 @@ def _latest(
     style_id,
     *,
     gtin: str = "0001",
+    credential_id=None,  # noqa: ANN001
+    generation: int = 1,
 ) -> ObservationLatest:
     return ObservationLatest(
         store_id=store_id,
@@ -78,6 +103,8 @@ def _latest(
         trust="TRUSTED",
         price_status="OK",
         total_price=total,
+        credential_id=credential_id,
+        credential_generation=generation,
         baseline_ready=True,
         checked_at=when,
     )
@@ -97,7 +124,7 @@ def test_unknown_never_overwrites_baseline() -> None:
     session = _FakeSession()
     now = datetime.now(UTC)
     observation = _observation("UNKNOWN", None, now, uuid.uuid4(), uuid.uuid4())
-    persist_observations(session, [observation])
+    persist_observations(session, [observation], binding=_binding())
     assert session.added == [observation], "unknown observations must not create events"
 
 
@@ -147,32 +174,85 @@ def test_changed_gtin_for_same_size_never_reports_restock() -> None:
 def test_structure_change_suppresses_events_and_emits_diagnostic() -> None:
     store_id, style_id = uuid.uuid4(), uuid.uuid4()
     now = datetime.now(UTC)
-    previous = _latest("OUT_OF_STOCK", None, now - timedelta(minutes=30), store_id, style_id)
-    session = _FakeSession(previous)
+    binding = _binding(generation=2)
+    previous = _latest(
+        "OUT_OF_STOCK",
+        None,
+        now - timedelta(minutes=30),
+        store_id,
+        style_id,
+        credential_id=binding.credential_id,
+        generation=binding.generation,
+    )
+    tenant_id = uuid.uuid4()
+    session = _FakeSession(previous, tenant_id=tenant_id)
     current = _observation("IN_STOCK", None, now, store_id, style_id, gtin="new-gtin")
 
     summary = persist_observations(
-        session, [current], suppress_structures={style_id: "new-hash"}
+        session, [current], binding=binding, suppress_structures={style_id: "new-hash"}
     )
 
     assert summary.restock == 0
     events = [obj for obj in session.added if isinstance(obj, ChangeEvent)]
     assert [event.event_type for event in events] == ["STRUCTURE_CHANGED"]
-    assert events[0].tenant_id is None
+    assert events[0].tenant_id == tenant_id
+    assert events[0].owner_user_id == binding.owner_user_id
+    assert events[0].credential_id == binding.credential_id
+    assert events[0].credential_generation == binding.generation
 
 
-def test_shared_stock_event_has_no_tenant() -> None:
-    """Stock transitions belong to the shared observation, not one tenant."""
+def test_stock_event_is_owned_by_tenant_and_binding() -> None:
+    """Events are personal: they carry the owner, binding and its tenant."""
     store_id, style_id = uuid.uuid4(), uuid.uuid4()
     now = datetime.now(UTC)
-    previous = _latest("OUT_OF_STOCK", None, now - timedelta(minutes=30), store_id, style_id)
-    session = _FakeSession(previous)
+    binding = _binding(generation=4)
+    previous = _latest(
+        "OUT_OF_STOCK",
+        None,
+        now - timedelta(minutes=30),
+        store_id,
+        style_id,
+        credential_id=binding.credential_id,
+        generation=binding.generation,
+    )
+    tenant_id = uuid.uuid4()
+    session = _FakeSession(previous, tenant_id=tenant_id)
     current = _observation("IN_STOCK", None, now, store_id, style_id)
 
-    summary = persist_observations(session, [current])
+    summary = persist_observations(session, [current], binding=binding)
 
     assert summary.restock == 1
     events = [obj for obj in session.added if isinstance(obj, ChangeEvent)]
     assert len(events) == 1
-    assert events[0].tenant_id is None
-    assert events[0].after_observation_id is None or events[0].after_observation_id == current.id
+    event = events[0]
+    assert event.event_type == "RESTOCK"
+    assert event.tenant_id == tenant_id
+    assert event.owner_user_id == binding.owner_user_id
+    assert event.credential_id == binding.credential_id
+    assert event.credential_generation == binding.generation
+    assert event.after_observation_id is None or event.after_observation_id == current.id
+
+
+def test_older_observation_never_clobbers_a_newer_baseline() -> None:
+    """Rounds must be applied in checked_at order, regardless of arrival."""
+    store_id, style_id = uuid.uuid4(), uuid.uuid4()
+    now = datetime.now(UTC)
+    binding = _binding()
+    previous = _latest(
+        "IN_STOCK",
+        999.0,
+        now,
+        store_id,
+        style_id,
+        credential_id=binding.credential_id,
+        generation=binding.generation,
+    )
+    session = _FakeSession(previous, tenant_id=uuid.uuid4())
+    stale = _observation("OUT_OF_STOCK", None, now - timedelta(minutes=5), store_id, style_id)
+
+    summary = persist_observations(session, [stale], binding=binding)
+
+    assert summary.sold_out == 0
+    assert [obj for obj in session.added if isinstance(obj, ChangeEvent)] == []
+    assert previous.availability == "IN_STOCK"
+    assert previous.checked_at == now

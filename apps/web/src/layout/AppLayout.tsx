@@ -1,93 +1,174 @@
 import {
   AppstoreOutlined,
+  CloseOutlined,
   DashboardOutlined,
   HistoryOutlined,
-  TagsOutlined,
+  MenuOutlined,
   ToolOutlined,
   UserOutlined,
 } from "@ant-design/icons";
-import { Button, Layout, Menu, Space, Tag, Typography } from "antd";
+import { Button, Drawer, Layout, Menu, Tag, Typography } from "antd";
+import type { ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { useAuth } from "@/auth/AuthContext";
+import { APP_NAME, BTN, FOOTER_NOTE, NAV_ITEMS, UNOFFICIAL_TAG } from "@/copy";
 
-const { Header, Sider, Content } = Layout;
+const { Header, Sider, Content, Footer } = Layout;
+
+const MENU_ICONS: Record<string, ReactNode> = {
+  "/dashboard": <DashboardOutlined />,
+  "/tasks": <AppstoreOutlined />,
+  "/changes": <HistoryOutlined />,
+  "/account": <UserOutlined />,
+  "/ops": <ToolOutlined />,
+};
+
+/** 子页面（/tasks/:id、/scans/:id…）统一高亮“监控任务”。 */
+function menuKeyFor(pathname: string): string | undefined {
+  if (["/tasks", "/scans", "/stores", "/styles"].some((prefix) => pathname.startsWith(prefix))) {
+    return "/tasks";
+  }
+  return NAV_ITEMS.map((item) => item.key)
+    .filter((key) => pathname.startsWith(key))
+    .sort((a, b) => b.length - a.length)[0];
+}
 
 export function AppLayout() {
   const { user, logout, isOps } = useAuth();
   const navigate = useNavigate();
-  const location = useLocation();
+  const { pathname } = useLocation();
+  const [navOpen, setNavOpen] = useState(false);
+  const [dataOpen, setDataOpen] = useState(false);
 
-  const items = [
-    { key: "/dashboard", icon: <DashboardOutlined />, label: "概览大盘" },
-    { key: "/tasks", icon: <AppstoreOutlined />, label: "监控任务" },
-    { key: "/changes", icon: <HistoryOutlined />, label: "变化流水" },
-    { key: "/account", icon: <UserOutlined />, label: "账户与配额" },
-    ...(isOps ? [{ key: "/ops", icon: <ToolOutlined />, label: "服务方后台" }] : []),
-  ];
+  const visibleItems = useMemo(
+    () => NAV_ITEMS.filter((item) => item.key !== "/ops" || isOps),
+    [isOps],
+  );
 
-  const selected = items
-    .map((item) => item.key)
-    .filter((key) => location.pathname.startsWith(key))
-    .sort((a, b) => b.length - a.length)[0];
+  const menuItems = useMemo(
+    () =>
+      visibleItems.map((item) => ({
+        key: item.key,
+        icon: MENU_ICONS[item.key],
+        label: item.label,
+      })),
+    [visibleItems],
+  );
+
+  const drawerItems = useMemo(() => {
+    if (!isOps) return menuItems;
+    const opsIndex = menuItems.findIndex((item) => item.key === "/ops");
+    if (opsIndex <= 0) return menuItems;
+    return [
+      ...menuItems.slice(0, opsIndex),
+      { type: "divider" as const, key: "divider-ops" },
+      ...menuItems.slice(opsIndex),
+    ];
+  }, [isOps, menuItems]);
+
+  const selected = menuKeyFor(pathname);
+  const title = NAV_ITEMS.find((item) => item.key === selected)?.label ?? APP_NAME;
+
+  // 路由变化自动关闭抽屉（含点击遮罩/Esc/菜单项后的兜底）。
+  useEffect(() => {
+    setNavOpen(false);
+  }, [pathname]);
+
+  const accountLine = user ? `${user.tenant_name} · ${user.display_name || user.email}` : "";
 
   return (
     <Layout style={{ minHeight: "100vh" }}>
-      <Sider width={208} theme="light" style={{ borderRight: "1px solid #e6e9ef" }}>
-        <div style={{ padding: "18px 16px", fontSize: 15, fontWeight: 600 }}>门店监控台</div>
+      <Sider width={208} theme="light" className="app-sider desktop-only">
+        <div className="app-sider-brand">{APP_NAME}</div>
         <Menu
           mode="inline"
           selectedKeys={selected ? [selected] : []}
-          items={items}
+          items={menuItems}
           onClick={({ key }) => navigate(key)}
           style={{ borderInlineEnd: "none" }}
         />
       </Sider>
+
       <Layout>
-        <Header
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            borderBottom: "1px solid #e6e9ef",
-            paddingInline: 20,
-          }}
-        >
-          <Space size={12}>
-            <Typography.Text strong style={{ fontSize: 15 }}>
-              Nike 门店库存与价格监控
-            </Typography.Text>
-            <Tag color="default">非官方，仅信息聚合</Tag>
-          </Space>
-          <Space size={12}>
+        <Header className="app-header">
+          <div className="app-header__left">
+            <Button
+              type="text"
+              icon={<MenuOutlined />}
+              className="mobile-only touch-target"
+              aria-label="打开导航"
+              aria-expanded={navOpen}
+              onClick={() => setNavOpen(true)}
+            />
+            <span className="app-header__title">{title}</span>
+            <Tag color="default">{UNOFFICIAL_TAG}</Tag>
+          </div>
+          <div className="app-header__right desktop-only">
             {user ? (
-              <Space size={8}>
-                <TagsOutlined />
-                <Typography.Text>
-                  {user.tenant_name}
-                  <Typography.Text type="secondary"> · {user.display_name || user.email}</Typography.Text>
-                </Typography.Text>
-              </Space>
+              <Typography.Text type="secondary">{accountLine}</Typography.Text>
             ) : null}
-            <Button size="small" onClick={() => void logout()}>
-              退出登录
-            </Button>
-          </Space>
+            <Button onClick={() => void logout()}>{BTN.logout}</Button>
+          </div>
         </Header>
-        <Content style={{ padding: 16 }}>
+
+        <Content className="app-content">
           <Outlet />
         </Content>
-        <footer
-          style={{
-            padding: "12px 20px 20px",
-            fontSize: 12,
-            color: "#6b7280",
-          }}
-        >
-          数据来自公开渠道聚合，与品牌方无关联；单店全量商品清单不可得，页面仅展示已监控货号与满减专区预览池。
-        </footer>
+
+        <Footer className="app-footer">
+          <span className="desktop-only">{FOOTER_NOTE}</span>
+          <Button
+            type="link"
+            size="small"
+            className="mobile-only"
+            style={{ padding: 0 }}
+            onClick={() => setDataOpen(true)}
+          >
+            数据说明
+          </Button>
+        </Footer>
       </Layout>
+
+      <Drawer
+        placement="left"
+        width={272}
+        open={navOpen}
+        onClose={() => setNavOpen(false)}
+        title={APP_NAME}
+        closable
+        closeIcon={<CloseOutlined />}
+        styles={{ body: { padding: 0 } }}
+      >
+        <Menu
+          mode="inline"
+          className="drawer-menu"
+          selectedKeys={selected ? [selected] : []}
+          items={drawerItems}
+          onClick={({ key }) => {
+            setNavOpen(false);
+            navigate(key);
+          }}
+          style={{ borderInlineEnd: "none" }}
+        />
+        <div className="drawer-account">
+          <Typography.Text type="secondary">{accountLine}</Typography.Text>
+          <Button block onClick={() => void logout()}>
+            {BTN.logout}
+          </Button>
+        </div>
+      </Drawer>
+
+      <Drawer
+        placement="bottom"
+        height="auto"
+        open={dataOpen}
+        onClose={() => setDataOpen(false)}
+        title="数据说明"
+      >
+        <Typography.Paragraph style={{ marginBottom: 0 }}>{FOOTER_NOTE}</Typography.Paragraph>
+      </Drawer>
     </Layout>
   );
 }
-

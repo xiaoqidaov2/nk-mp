@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -12,10 +13,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import get_current_user, get_db, require_write
+from app.api.deps import get_current_session, get_db, require_write, settings_dep
+from app.api.http_errors import binding_changed_response, credential_error_response
+from app.config import Settings
 from app.db import SessionLocal
-from app.models import JobStatus, MonitorTask, ScanJob, ScanJobStore, Store, User
+from app.models import AuthSession, JobStatus, MonitorTask, ScanJob, ScanJobStore, Store, User
 from app.schemas import ScanCreateIn, ScanJobOut, ScanStoreOut
+from app.services.credentials import CredentialError, CredentialService
 from app.services.jobs import enqueue_job, requeue_failed_stores
 
 router = APIRouter(prefix="/scans", tags=["scans"])
@@ -55,9 +59,14 @@ def _job_out(db: Session, job: ScanJob) -> ScanJobOut:
     )
 
 
-def _load_job(db: Session, tenant_id, job_id: UUID) -> ScanJob:
+def _load_job(db: Session, user: User, job_id: UUID) -> ScanJob:
+    """Load a job inside the caller's tenant *and* owner boundary."""
     job = db.execute(
-        select(ScanJob).where(ScanJob.id == job_id, ScanJob.tenant_id == tenant_id)
+        select(ScanJob).where(
+            ScanJob.id == job_id,
+            ScanJob.tenant_id == user.tenant_id,
+            ScanJob.owner_user_id == user.id,
+        )
     ).scalar_one_or_none()
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "扫描任务不存在")
@@ -69,7 +78,13 @@ def create_scan(
     payload: ScanCreateIn,
     db: Session = Depends(get_db),
     user: User = Depends(require_write),
-) -> ScanJobOut:
+    settings: Settings = Depends(settings_dep),
+):
+    try:
+        binding = CredentialService(settings, user.id).binding()
+    except CredentialError as exc:
+        return credential_error_response(exc)
+
     style_codes = payload.style_codes
     store_codes = payload.store_codes
     task_id = payload.task_id
@@ -77,7 +92,9 @@ def create_scan(
     if task_id is not None:
         task = db.execute(
             select(MonitorTask).where(
-                MonitorTask.id == task_id, MonitorTask.tenant_id == user.tenant_id
+                MonitorTask.id == task_id,
+                MonitorTask.tenant_id == user.tenant_id,
+                MonitorTask.created_by == user.id,
             )
         ).scalar_one_or_none()
         if task is None:
@@ -88,7 +105,9 @@ def create_scan(
     if payload.all_stores or not store_codes:
         store_codes = list(
             db.execute(
-                select(Store.store_code).where(Store.is_active.is_(True)).order_by(Store.store_code)
+                select(Store.store_code)
+                .where(Store.owner_user_id == user.id, Store.is_active.is_(True))
+                .order_by(Store.store_code)
             ).scalars()
         )
     if not style_codes:
@@ -96,7 +115,9 @@ def create_scan(
 
     known = set(
         db.execute(
-            select(Store.store_code).where(Store.store_code.in_(store_codes))
+            select(Store.store_code).where(
+                Store.owner_user_id == user.id, Store.store_code.in_(store_codes)
+            )
         ).scalars()
     )
     resolved = [code for code in store_codes if code in known]
@@ -111,7 +132,11 @@ def create_scan(
         task_id=task_id,
         requested_by=user.id,
         kind="SCAN",
+        owner_user_id=user.id,
+        credential_binding=binding,
     )
+    # Commit before the 201 so a worker (or the next request) sees the job.
+    db.commit()
     return _job_out(db, job)
 
 
@@ -120,9 +145,13 @@ def list_scans(
     limit: int = 20,
     task_id: UUID | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> list[ScanJobOut]:
-    stmt = select(ScanJob).where(ScanJob.tenant_id == user.tenant_id)
+    user = payload[0]
+    stmt = select(ScanJob).where(
+        ScanJob.tenant_id == user.tenant_id,
+        ScanJob.owner_user_id == user.id,
+    )
     if task_id is not None:
         stmt = stmt.where(ScanJob.task_id == task_id)
     rows = db.execute(
@@ -135,18 +164,18 @@ def list_scans(
 def get_scan(
     job_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> ScanJobOut:
-    return _job_out(db, _load_job(db, user.tenant_id, job_id))
+    return _job_out(db, _load_job(db, payload[0], job_id))
 
 
 @router.get("/{job_id}/stores", response_model=list[ScanStoreOut])
 def scan_stores(
     job_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> list[ScanStoreOut]:
-    job = _load_job(db, user.tenant_id, job_id)
+    job = _load_job(db, payload[0], job_id)
     rows = db.execute(
         select(ScanJobStore, Store)
         .join(Store, Store.id == ScanJobStore.store_id)
@@ -175,22 +204,52 @@ def retry_failed(
     job_id: UUID,
     db: Session = Depends(get_db),
     user: User = Depends(require_write),
-) -> ScanJobOut:
-    job = _load_job(db, user.tenant_id, job_id)
+    settings: Settings = Depends(settings_dep),
+):
+    job = _load_job(db, user, job_id)
     if job.status not in TERMINAL:
         raise HTTPException(status.HTTP_409_CONFLICT, "扫描仍在运行")
+    try:
+        binding = CredentialService(settings, user.id).binding()
+    except CredentialError as exc:
+        return credential_error_response(exc)
+    if (
+        job.credential_id != binding.credential_id
+        or job.credential_generation != binding.generation
+        or job.owner_user_id != binding.owner_user_id
+    ):
+        # A retry must never continue a scan with a different Nike account.
+        return binding_changed_response()
     requeued = requeue_failed_stores(db, job)
     if requeued == 0:
         raise HTTPException(status.HTTP_409_CONFLICT, "没有需要重试的门店")
+    # Commit before returning so the requeued state is immediately visible.
+    db.commit()
     return _job_out(db, job)
 
 
-def _job_snapshot(job_ref: UUID) -> dict | None:
-    """Read one job snapshot from a dedicated short-lived session."""
+def _job_snapshot(
+    job_ref: UUID, user_id: UUID, tenant_id: UUID, auth_session_id: UUID
+) -> dict | None:
+    """Read one job snapshot from a dedicated short-lived session.
+
+    Every frame re-checks that the platform session is still valid and that
+    the job still belongs to the same user and tenant, so a logout or an
+    account switch stops the stream instead of leaking progress.
+    """
     stream_db = SessionLocal()
     try:
+        auth = stream_db.execute(
+            select(AuthSession).where(AuthSession.id == auth_session_id)
+        ).scalar_one_or_none()
+        if auth is None or auth.revoked_at is not None or auth.expires_at <= datetime.now(UTC):
+            return None
         fresh = stream_db.execute(
-            select(ScanJob).where(ScanJob.id == job_ref)
+            select(ScanJob).where(
+                ScanJob.id == job_ref,
+                ScanJob.tenant_id == tenant_id,
+                ScanJob.owner_user_id == user_id,
+            )
         ).scalar_one_or_none()
         if fresh is None:
             return None
@@ -202,10 +261,10 @@ def _job_snapshot(job_ref: UUID) -> dict | None:
 async def _progress_stream(
     request: Request,
     job_ref: UUID,
-    snapshot: Callable[[UUID], dict | None] | None = None,
+    snapshot: Callable[[UUID], dict | None],
 ) -> AsyncIterator[str]:
     """Yield SSE progress frames until the job finishes or the client leaves."""
-    fetch = snapshot or _job_snapshot
+    fetch = snapshot
     last_payload = ""
     deadline = time.monotonic() + STREAM_MAX_SECONDS
     while time.monotonic() < deadline:
@@ -229,13 +288,17 @@ def scan_progress(
     job_id: UUID,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> StreamingResponse:
-    job = _load_job(db, user.tenant_id, job_id)
+    user, auth_session = payload
+    job = _load_job(db, user, job_id)
     job_ref = job.id
 
+    def snapshot(ref: UUID) -> dict | None:
+        return _job_snapshot(ref, user.id, user.tenant_id, auth_session.id)
+
     return StreamingResponse(
-        _progress_stream(request, job_ref),
+        _progress_stream(request, job_ref, snapshot),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

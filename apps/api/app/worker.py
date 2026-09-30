@@ -11,7 +11,9 @@ import uuid
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.services.bootstrap import lease_next_plan, run_plan
 from app.services.jobs import LeaseLost, lease_next_job, run_job
+from app.services.push import deliver, lease_due_delivery
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("nike_mp.worker")
@@ -37,6 +39,22 @@ def main() -> None:
     while _running:
         session = SessionLocal()
         try:
+            plan = lease_next_plan(session, settings)
+            if plan is not None:
+                session.commit()
+                logger.info("bootstrap started for owner %s", plan.owner_user_id)
+                run_plan(session, settings, plan)
+                continue
+            drained = 0
+            while drained < settings.push_drain_batch:
+                delivery = lease_due_delivery(session, settings)
+                if delivery is None:
+                    break
+                session.commit()
+                deliver(session, settings, delivery)
+                drained += 1
+            if drained:
+                continue
             job = lease_next_job(session, settings, worker_id)
             if job is None:
                 session.commit()

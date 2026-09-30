@@ -6,29 +6,44 @@ import uuid
 from datetime import UTC, datetime
 
 from app.api.deps import CSRF_COOKIE, SESSION_COOKIE
+from app.config import get_settings
 from app.db import SessionLocal
 from app.models import ChangeEvent, MonitorTask, Role
 from app.services.jobs import enqueue_job
 
-from .helpers import auth_headers, login, make_store, make_style, make_tenant, make_user
+from .helpers import (
+    auth_headers,
+    login,
+    make_store,
+    make_style,
+    make_tenant,
+    make_user,
+    store_credential,
+)
 
 
 def _seed_two_tenants() -> dict:
+    settings = get_settings()
     with SessionLocal() as db:
         tenant_a = make_tenant(db, name="租户A")
         tenant_b = make_tenant(db, name="租户B")
-        make_user(db, tenant_a, email="a@example.com")
-        make_user(db, tenant_b, email="b@example.com")
+        user_a = make_user(db, tenant_a, email="a@example.com")
+        user_b = make_user(db, tenant_b, email="b@example.com")
         make_user(db, tenant_a, email="viewer@example.com", role=Role.TENANT_VIEWER.value)
-        store = make_store(db, code="S001")
-        style = make_style(db, code="DN3707-202")
+        store = make_store(db, owner=user_a, code="S001")
+        style = make_style(db, owner=user_a, code="DN3707-202")
         db.commit()
-        return {
+        seed = {
             "tenant_a": tenant_a.id,
             "tenant_b": tenant_b.id,
+            "user_a": user_a.id,
+            "user_b": user_b.id,
             "store_id": store.id,
             "style_id": style.id,
         }
+    # Enqueueing is personal: the acting user needs a frozen Nike binding.
+    seed["binding_a"] = store_credential(settings, seed["user_a"])
+    return seed
 
 
 def test_cross_tenant_task_access_is_denied(client) -> None:
@@ -63,62 +78,58 @@ def test_cross_tenant_scan_access_is_denied(client) -> None:
             tenant_id=seed["tenant_a"],
             store_codes=["S001"],
             style_codes=["DN3707-202"],
+            owner_user_id=seed["user_a"],
+            credential_binding=seed["binding_a"],
         )
         db.commit()
+        job_id = job.id
 
     login(client, "b@example.com")
-    assert client.get(f"/api/v1/scans/{job.id}").status_code == 404
-    assert client.get(f"/api/v1/scans/{job.id}/stores").status_code == 404
-    assert client.get(f"/api/v1/scans/{job.id}/events").status_code == 404
+    assert client.get(f"/api/v1/scans/{job_id}").status_code == 404
+    assert client.get(f"/api/v1/scans/{job_id}/stores").status_code == 404
+    assert client.get(f"/api/v1/scans/{job_id}/events").status_code == 404
 
 
-def test_changes_feed_shows_shared_and_own_events_only(client) -> None:
+def test_change_feed_is_owner_scoped(client) -> None:
+    """Every event is personal: no shared broadcast, no cross-owner leakage."""
     seed = _seed_two_tenants()
+    now = datetime.now(UTC)
     with SessionLocal() as db:
-        now = datetime.now(UTC)
-        shared = ChangeEvent(
-            tenant_id=None,
-            store_id=seed["store_id"],
-            style_id=seed["style_id"],
-            size_label="42",
-            event_type="RESTOCK",
-            dedupe_key=f"shared-{uuid.uuid4()}",
-            checked_at=now,
-        )
-        private_a = ChangeEvent(
-            tenant_id=seed["tenant_a"],
-            store_id=seed["store_id"],
-            style_id=seed["style_id"],
-            size_label="42",
-            event_type="SCAN_FAILED",
-            dedupe_key=f"a-{uuid.uuid4()}",
-            checked_at=now,
-        )
-        private_b = ChangeEvent(
-            tenant_id=seed["tenant_b"],
-            store_id=seed["store_id"],
-            style_id=seed["style_id"],
-            size_label="42",
-            event_type="SCAN_FAILED",
-            dedupe_key=f"b-{uuid.uuid4()}",
-            checked_at=now,
-        )
-        db.add_all([shared, private_a, private_b])
+        def _event(tenant_id, owner_user_id, tag: str) -> ChangeEvent:
+            return ChangeEvent(
+                tenant_id=tenant_id,
+                owner_user_id=owner_user_id,
+                store_id=seed["store_id"],
+                style_id=seed["style_id"],
+                size_label="42",
+                event_type="RESTOCK",
+                dedupe_key=f"{tag}-{uuid.uuid4()}",
+                checked_at=now,
+            )
+
+        owned_a = _event(seed["tenant_a"], seed["user_a"], "a")
+        owned_b = _event(seed["tenant_b"], seed["user_b"], "b")
+        unattributed = _event(None, None, "legacy")
+        db.add_all([owned_a, owned_b, unattributed])
         db.commit()
-        shared_id, private_a_id, private_b_id = shared.id, private_a.id, private_b.id
+        owned_a_id, owned_b_id, unattributed_id = (
+            owned_a.id,
+            owned_b.id,
+            unattributed.id,
+        )
 
     csrf_a = login(client, "a@example.com")
     ids_a = {row["id"] for row in client.get("/api/v1/changes").json()}
-    assert shared_id in ids_a
-    assert private_a_id in ids_a
-    assert private_b_id not in ids_a
+    assert owned_a_id in ids_a
+    assert owned_b_id not in ids_a
+    assert unattributed_id not in ids_a, "unattributed legacy rows are not served"
 
     client.post("/api/v1/auth/logout", headers=auth_headers(csrf_a))
     login(client, "b@example.com")
     ids_b = {row["id"] for row in client.get("/api/v1/changes").json()}
-    assert shared_id in ids_b
-    assert private_b_id in ids_b
-    assert private_a_id not in ids_b
+    assert owned_b_id in ids_b
+    assert owned_a_id not in ids_b
+    assert unattributed_id not in ids_b
 
 
 def test_write_requires_csrf_and_write_role(client) -> None:
@@ -169,7 +180,8 @@ def test_logout_clears_csrf_cookie_and_session(client) -> None:
     assert CSRF_COOKIE not in client.cookies
 
 
-def test_ops_read_endpoints_do_not_require_csrf(client) -> None:
+def test_ops_read_endpoints_use_personal_credential_route(client) -> None:
+    """Ops reads need no CSRF; the per-user credential view replaces the old one."""
     with SessionLocal() as db:
         platform = make_tenant(db, name="服务方", is_platform=True)
         make_user(db, platform, email="ops@example.com", role=Role.OPS_ADMIN.value)
@@ -178,19 +190,27 @@ def test_ops_read_endpoints_do_not_require_csrf(client) -> None:
         db.commit()
 
     login(client, "ops@example.com")
-    for path in ("/api/v1/ops/credentials", "/api/v1/ops/tenants", "/api/v1/ops/health/detail"):
+    # The logged-in user's own Nike connection is the only credential view now.
+    personal = client.get("/api/v1/me/nike-credential")
+    assert personal.status_code == 200, personal.text
+    assert personal.json()["status"] == "NOT_CONNECTED"
+    for path in ("/api/v1/ops/tenants", "/api/v1/ops/health/detail"):
         response = client.get(path)
         assert response.status_code == 200, f"{path}: {response.text}"
+
+    # The legacy platform-wide credential endpoints are gone.
+    assert client.get("/api/v1/ops/credentials").status_code == 404
+    assert client.post("/api/v1/ops/credentials/refresh").status_code == 404
+
     # Mutating ops endpoints still require the CSRF header.
     assert client.post("/api/v1/ops/stores/sync").status_code == 403
-    assert client.post("/api/v1/ops/credentials/refresh").status_code == 403
     client.post(
         "/api/v1/auth/logout", headers={"X-CSRF-Token": client.cookies.get(CSRF_COOKIE, "")}
     )
 
     # A customer tenant must not reach ops endpoints at all.
     login(client, "a@example.com")
-    assert client.get("/api/v1/ops/credentials").status_code == 403
+    assert client.get("/api/v1/ops/tenants").status_code == 403
 
 
 def test_unauthenticated_access_is_rejected(client) -> None:
@@ -208,6 +228,7 @@ def test_scan_list_filters_by_task_id(client) -> None:
             store_codes=["S001"],
             style_codes=["DN3707-202"],
             all_stores=False,
+            created_by=seed["user_a"],
         )
         db.add(task)
         db.flush()
@@ -217,10 +238,18 @@ def test_scan_list_filters_by_task_id(client) -> None:
             store_codes=["S001"],
             style_codes=["DN3707-202"],
             task_id=task.id,
+            requested_by=seed["user_a"],
             kind="MONITOR",
+            owner_user_id=seed["user_a"],
+            credential_binding=seed["binding_a"],
         )
         manual = enqueue_job(
-            db, tenant_id=seed["tenant_a"], store_codes=["S001"], style_codes=["DN3707-202"]
+            db,
+            tenant_id=seed["tenant_a"],
+            store_codes=["S001"],
+            style_codes=["DN3707-202"],
+            owner_user_id=seed["user_a"],
+            credential_binding=seed["binding_a"],
         )
         db.commit()
         task_id, linked_id, manual_id = task.id, linked.id, manual.id

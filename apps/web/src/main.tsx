@@ -1,4 +1,4 @@
-import { ConfigProvider } from "antd";
+import { App as AntdApp, ConfigProvider } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -18,13 +18,16 @@ if (!container) {
 createRoot(container).render(
   <StrictMode>
     <ConfigProvider locale={zhCN} theme={appTheme}>
-      <QueryProvider>
-        <BrowserRouter>
-          <AuthProvider>
-            <App />
-          </AuthProvider>
-        </BrowserRouter>
-      </QueryProvider>
+      {/* antd App：页面通过 App.useApp() 获得 message/modal 语义上下文 */}
+      <AntdApp>
+        <QueryProvider>
+          <BrowserRouter>
+            <AuthProvider>
+              <App />
+            </AuthProvider>
+          </BrowserRouter>
+        </QueryProvider>
+      </AntdApp>
     </ConfigProvider>
   </StrictMode>,
 );

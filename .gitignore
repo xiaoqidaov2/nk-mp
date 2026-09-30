@@ -60,6 +60,7 @@ dist/
 build/
 .vite/
 coverage/
+apps/web/tsconfig.tsbuildinfo
 
 # ---- Editors and OS ----
 .idea/

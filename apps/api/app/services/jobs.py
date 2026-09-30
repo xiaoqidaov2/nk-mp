@@ -3,12 +3,18 @@
 Each store unit is committed independently as soon as it finishes, so a crash
 or a stolen lease never rolls back work that already succeeded. A worker may
 only keep working (and finalising) while it still owns the job lease.
+
+Jobs are personal: the owner user and the credential binding are frozen at
+enqueue time. A worker never derives the owner from ``requested_by`` or the
+task, and a job whose binding was replaced or revoked stops instead of
+silently switching accounts.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -22,15 +28,24 @@ from app.models import (
     Store,
     StoreJobStatus,
     Tenant,
+    User,
 )
 from app.nike.client import NikeClient, NikeTransportError
 from app.nike.errors import ErrorCode, ScanError
-from app.services.credentials import CredentialNotConfigured, CredentialService
+from app.services import push
+from app.services.credentials import (
+    CredentialBinding,
+    CredentialError,
+    CredentialRequired,
+    CredentialService,
+)
 from app.services.observations import mark_failed_job_event, persist_observations
 from app.services.probe import probe_store
 from app.services.quota import QuotaGuard
 
 logger = logging.getLogger("nike_mp.jobs")
+
+ORPHAN_JOB_CODE = "NIKE_CREDENTIAL_REQUIRED"
 
 
 class LeaseLost(RuntimeError):
@@ -45,7 +60,15 @@ def enqueue_job(
     task_id=None,
     requested_by=None,
     kind: str = "SCAN",
+    *,
+    owner_user_id: UUID,
+    credential_binding: CredentialBinding,
 ) -> ScanJob:
+    user = session.execute(select(User).where(User.id == owner_user_id)).scalar_one_or_none()
+    if user is None or not user.is_active or user.tenant_id != tenant_id:
+        raise CredentialRequired("需要先连接 Nike 账号")
+    if credential_binding.owner_user_id != owner_user_id:
+        raise CredentialRequired("需要先连接 Nike 账号")
     job = ScanJob(
         tenant_id=tenant_id,
         task_id=task_id,
@@ -55,6 +78,9 @@ def enqueue_job(
         style_codes=list(style_codes),
         total_stores=len(store_codes),
         requested_by=requested_by,
+        owner_user_id=owner_user_id,
+        credential_id=credential_binding.credential_id,
+        credential_generation=credential_binding.generation,
     )
     session.add(job)
     session.flush()
@@ -62,7 +88,9 @@ def enqueue_job(
     stores = {
         store.store_code: store
         for store in session.execute(
-            select(Store).where(Store.store_code.in_(store_codes))
+            select(Store).where(
+                Store.owner_user_id == owner_user_id, Store.store_code.in_(store_codes)
+            )
         ).scalars()
     }
     for store_code in store_codes:
@@ -76,17 +104,40 @@ def enqueue_job(
 
 def lease_next_job(session: Session, settings: Settings, worker_id: str | None = None) -> ScanJob | None:
     now = datetime.now(UTC)
+    assignable = (
+        ScanJob.owner_user_id.is_not(None),
+        ScanJob.credential_id.is_not(None),
+        ScanJob.credential_generation.is_not(None),
+    )
     job = session.execute(
         select(ScanJob)
         .where(
             ScanJob.status.in_([JobStatus.QUEUED.value, JobStatus.RUNNING.value]),
             (ScanJob.lease_expires_at.is_(None)) | (ScanJob.lease_expires_at < now),
+            *assignable,
         )
         .order_by(ScanJob.created_at)
         .limit(1)
         .with_for_update(skip_locked=True)
     ).scalar_one_or_none()
     if job is None:
+        # Defensive: a job without a frozen binding can never run. Terminate
+        # it instead of leaving it in the queue forever.
+        orphans = session.execute(
+            select(ScanJob).where(
+                ScanJob.status.in_([JobStatus.QUEUED.value, JobStatus.RUNNING.value]),
+                (ScanJob.lease_expires_at.is_(None)) | (ScanJob.lease_expires_at < now),
+                ~(
+                    ScanJob.owner_user_id.is_not(None)
+                    & ScanJob.credential_id.is_not(None)
+                    & ScanJob.credential_generation.is_not(None)
+                ),
+            ).limit(20)
+        ).scalars().all()
+        for orphan in orphans:
+            _finalize(session, settings, orphan, JobStatus.FAILED.value, ORPHAN_JOB_CODE, None)
+        if orphans:
+            logger.warning("terminated %s job(s) without a frozen credential binding", len(orphans))
         return None
     job.status = JobStatus.RUNNING.value
     job.attempt += 1
@@ -124,15 +175,42 @@ def _lease_held(session: Session, job: ScanJob, worker_id: str | None) -> bool:
     return current == worker_id
 
 
+def _auth_code(exc: ScanError) -> str:
+    message = (exc.message or "").strip()
+    if message.startswith("NIKE_"):
+        return message
+    return "NIKE_CREDENTIAL_REQUIRED"
+
+
 def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str | None = None) -> None:
-    credentials = CredentialService(settings, session)
-    try:
-        token = credentials.access_token()
-    except CredentialNotConfigured as exc:
-        _finalize(session, settings, job, JobStatus.FAILED.value, str(exc), worker_id)
+    if (
+        job.owner_user_id is None
+        or job.credential_id is None
+        or job.credential_generation is None
+    ):
+        _finalize(session, settings, job, JobStatus.FAILED.value, ORPHAN_JOB_CODE, worker_id)
         return
 
-    client = NikeClient(settings, token, token_provider=credentials.token_provider())
+    binding = CredentialBinding(
+        owner_user_id=job.owner_user_id,
+        credential_id=job.credential_id,
+        generation=job.credential_generation,
+    )
+    credentials = CredentialService(settings, job.owner_user_id)
+    try:
+        credentials.assert_binding(binding)
+        token = credentials.access_token(binding=binding)
+    except CredentialError as exc:
+        # No upstream request is issued when the credential is not usable.
+        _finalize(session, settings, job, JobStatus.FAILED.value, exc.code, worker_id)
+        return
+
+    client = NikeClient(
+        settings,
+        token,
+        token_provider=credentials.token_provider(binding),
+        credential_guard=lambda: credentials.assert_binding(binding),
+    )
     try:
         tenant = session.execute(
             select(Tenant).where(Tenant.id == job.tenant_id)
@@ -217,6 +295,9 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
                         store.store_code,
                     )
                     return
+                if isinstance(exc, ScanError) and exc.code == ErrorCode.AUTH_REQUIRED:
+                    _abort_auth_failure(session, settings, job, rows, stores, _auth_code(exc), worker_id)
+                    return
                 _fail_store_row(session, job, row, store, code, str(exc))
                 session.commit()
                 continue
@@ -259,6 +340,7 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
             summary = persist_observations(
                 session,
                 result.observations,
+                binding=binding,
                 max_gap_seconds=max_gap_seconds,
                 suppress_structures=result.structure_changes,
             )
@@ -274,6 +356,35 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
         _finalize(session, settings, job, None, "", worker_id)
     finally:
         client.close()
+
+
+def _abort_auth_failure(
+    session: Session,
+    settings: Settings,
+    job: ScanJob,
+    rows: list[ScanJobStore],
+    stores: dict,
+    code: str,
+    worker_id: str | None,
+) -> None:
+    """Terminate a job whose credential became unusable mid-run.
+
+    Successful store checkpoints stay; every unfinished store is failed with
+    the stable code and the job itself ends as FAILED with that code. No
+    further upstream request is made for this job.
+    """
+    now = datetime.now(UTC)
+    for row in rows:
+        if row.status == StoreJobStatus.SUCCEEDED.value:
+            continue
+        row.status = StoreJobStatus.FAILED.value
+        row.error_code = code
+        row.message = code
+        row.finished_at = now
+        store = stores.get(row.store_id)
+        if store is not None:
+            mark_failed_job_event(session, job.tenant_id, job, store.id, code)
+    _finalize(session, settings, job, JobStatus.FAILED.value, code, worker_id)
 
 
 def _fail_store_row(session, job, row, store, code: str, message: str) -> None:
@@ -338,9 +449,17 @@ def _finalize(
             task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
             session.flush()
 
+    # 检查结束后按任务的提醒开关聚合推送；提交由调用方负责。
+    if settings is not None:
+        push.enqueue_for_job(session, settings, job)
+
 
 def requeue_failed_stores(session: Session, job: ScanJob) -> int:
-    """Requeue failed and data-incomplete stores for another attempt."""
+    """Requeue failed and data-incomplete stores for another attempt.
+
+    The frozen credential binding is kept; the caller must first verify the
+    binding is still current (a replaced account has to start a new scan).
+    """
     rows = session.execute(
         select(ScanJobStore).where(
             ScanJobStore.job_id == job.id,

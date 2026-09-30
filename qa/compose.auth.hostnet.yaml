@@ -1,0 +1,150 @@
+# Host-network variant of qa/compose.auth.yaml.
+#
+# Some sandboxes cannot open TCP between sibling bridge containers (in this
+# repo: `db:5432` times out across the bridge, so `migrate` exits with a
+# psycopg ConnectionTimeout), while host <-> published ports works. This file
+# keeps the same isolation (project name, volume, ports) and simply shares the
+# host network; every service talks over 127.0.0.1.
+#
+#   docker compose -p nike-mp-auth-qa -f qa/compose.auth.hostnet.yaml up -d --build
+#   docker compose -p nike-mp-auth-qa -f qa/compose.auth.hostnet.yaml \
+#     exec -T api python - < qa/seed_qa.py
+#   QA_API=http://127.0.0.1:18000 QA_STUB=http://127.0.0.1:19100 \
+#     apps/api/.venv/bin/python qa/smoke.py
+#
+# Ports come from the environment the same way as the bridge variant, plus
+# QA_DB_PORT (default 15432) so the QA database never fights a local postgres.
+
+name: nike-mp-auth-qa
+
+x-auth-env: &auth-env
+  NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@127.0.0.1:${QA_DB_PORT:-15432}/nike_mp
+  NIKE_MP_CREDENTIAL_KEY: ${QA_CREDENTIAL_KEY:-qa-auth-fake-credential-key}
+  # 默认接真实 Nike 接口；离线 smoke 用 -f qa/compose.stub.hostnet.yaml 叠加回 stub。
+  NIKE_MP_NIKE_API_BASE: ${QA_NIKE_API_BASE:-https://api.nike.com.cn}
+  NIKE_MP_NIKE_TEST_API_BASE: ${QA_NIKE_TEST_API_BASE:-https://api-test.nike.com.cn}
+  NIKE_MP_NIKE_OAUTH_BASE: ${QA_NIKE_OAUTH_BASE:-https://accounts.nike.com.cn}
+  NIKE_MP_NIKE_PHONE_AUTH_ENABLED: "true"
+  NIKE_MP_NIKE_PHONE_AUTH_CONTRACT_VERSION: "2026-09-29/mp-phone-otc-pkce"
+  TZ: Asia/Shanghai
+
+services:
+  db:
+    image: postgres:17-alpine
+    network_mode: host
+    command: postgres -p ${QA_DB_PORT:-15432}
+    environment:
+      POSTGRES_DB: nike_mp
+      POSTGRES_USER: nike_mp
+      POSTGRES_PASSWORD: nike_mp
+      TZ: Asia/Shanghai
+    volumes:
+      - auth-qa-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -h 127.0.0.1 -p ${QA_DB_PORT:-15432} -U nike_mp -d nike_mp
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  stub:
+    build:
+      context: .
+      dockerfile: Dockerfile.stub
+    network_mode: host
+    environment:
+      STUB_PORT: "${QA_STUB_PORT:-19100}"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:${QA_STUB_PORT:-19100}/healthz')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment: *auth-env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+    restart: "no"
+
+  api:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment: *auth-env
+    depends_on:
+      db:
+        condition: service_healthy
+      stub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://127.0.0.1:${QA_API_PORT:-18000}/api/v1/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    command: uvicorn app.main:app --host 0.0.0.0 --port ${QA_API_PORT:-18000}
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment:
+      <<: *auth-env
+      NIKE_MP_WORKER_POLL_SECONDS: "1"
+      NIKE_MP_WORKER_LEASE_SECONDS: "60"
+    depends_on:
+      db:
+        condition: service_healthy
+      stub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.worker
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment:
+      <<: *auth-env
+      NIKE_MP_SCHEDULER_INTERVAL_SECONDS: "5"
+    depends_on:
+      db:
+        condition: service_healthy
+      stub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.scheduler_main
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../apps/web
+    network_mode: host
+    environment:
+      VITE_API_TARGET: http://127.0.0.1:${QA_API_PORT:-18000}
+    depends_on:
+      api:
+        condition: service_healthy
+    command: npm run dev -- --host 0.0.0.0 --port ${QA_WEB_PORT:-15173}
+    restart: unless-stopped
+
+volumes:
+  auth-qa-db-data:

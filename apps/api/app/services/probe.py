@@ -49,7 +49,9 @@ def get_or_fetch_structure(
     now = datetime.now(UTC)
     cached = session.execute(
         select(GtinStructure).where(
-            GtinStructure.store_id == store.id, GtinStructure.style_id == style.id
+            GtinStructure.owner_user_id == store.owner_user_id,
+            GtinStructure.store_id == store.id,
+            GtinStructure.style_id == style.id,
         )
     ).scalar_one_or_none()
 
@@ -73,7 +75,9 @@ def get_or_fetch_structure(
         changed = _hash_structure(structure) != cached.structure_hash
 
     if cached is None:
-        cached = GtinStructure(store_id=store.id, style_id=style.id)
+        cached = GtinStructure(
+            owner_user_id=store.owner_user_id, store_id=store.id, style_id=style.id
+        )
         session.add(cached)
     cached.status = structure.status
     cached.structure_hash = _hash_structure(structure)
@@ -105,10 +109,12 @@ def probe_store(
     changed_structures: dict = {}
     for style_code in style_codes:
         style = session.execute(
-            select(Style).where(Style.style_code == style_code)
+            select(Style).where(
+                Style.owner_user_id == store.owner_user_id, Style.style_code == style_code
+            )
         ).scalar_one_or_none()
         if style is None:
-            style = Style(style_code=style_code)
+            style = Style(style_code=style_code, owner_user_id=store.owner_user_id)
             session.add(style)
             session.flush()
         styles[style_code] = style
@@ -153,6 +159,10 @@ def probe_store(
         try:
             batch = client.review(gtins, region_id=store.region_id)
         except (ScanError, NikeTransportError) as exc:
+            if isinstance(exc, ScanError) and exc.code == ErrorCode.AUTH_REQUIRED:
+                # The credential is gone; swallowing it into UNKNOWN would
+                # keep scanning other stores with a dead binding.
+                raise
             code = exc.code.value if isinstance(exc, ScanError) else ErrorCode.TRANSPORT_ERROR.value
             return ProbeResult(
                 store_code=store.store_code,
@@ -182,6 +192,8 @@ def probe_store(
         try:
             price_batch = client.review(group, region_id=store.region_id, with_price=True)
         except ScanError as exc:
+            if exc.code == ErrorCode.AUTH_REQUIRED:
+                raise
             if exc.code == ErrorCode.BUDGET_EXHAUSTED:
                 break
             continue

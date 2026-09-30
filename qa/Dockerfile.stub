@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# STUB_PORT lets the same image serve the overlay (9100) and the self-contained
+# auth stack (19100) without rebuilding.
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 STUB_PORT=9100
 
 WORKDIR /srv
 
@@ -10,4 +12,4 @@ COPY stub_upstream.py /srv/stub_upstream.py
 
 EXPOSE 9100
 
-CMD ["uvicorn", "stub_upstream:app", "--host", "0.0.0.0", "--port", "9100"]
+CMD ["sh", "-c", "exec uvicorn stub_upstream:app --host 0.0.0.0 --port ${STUB_PORT}"]

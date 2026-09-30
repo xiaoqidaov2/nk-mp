@@ -65,19 +65,28 @@ def seed_isolated_demo() -> None:
             db.flush()
         user = db.execute(select(User).where(User.email == "demo@example.com")).scalar_one_or_none()
         if user is None:
-            db.add(
-                User(
-                    tenant_id=tenant.id,
-                    email="demo@example.com",
-                    display_name="演示账号",
-                    password_hash=hash_password("demo-password"),
-                    role=Role.TENANT_ADMIN.value,
-                )
+            user = User(
+                tenant_id=tenant.id,
+                email="demo@example.com",
+                display_name="演示账号",
+                password_hash=hash_password("demo-password"),
+                role=Role.TENANT_ADMIN.value,
             )
+            db.add(user)
+            db.flush()
+        # 演示目录归属演示账号自己（目录按连接归属，不共享）。
         for code, name in (("3752", "南昌明矾"), ("3875", "西安门店")):
-            if db.execute(select(Store).where(Store.store_code == code)).scalar_one_or_none() is None:
+            if (
+                db.execute(
+                    select(Store).where(
+                        Store.owner_user_id == user.id, Store.store_code == code
+                    )
+                ).scalar_one_or_none()
+                is None
+            ):
                 db.add(
                     Store(
+                        owner_user_id=user.id,
                         store_code=code,
                         display_name=name,
                         address="演示数据",
@@ -86,8 +95,15 @@ def seed_isolated_demo() -> None:
                     )
                 )
         for code in ("DN3707-202", "IO5031-600"):
-            if db.execute(select(Style).where(Style.style_code == code)).scalar_one_or_none() is None:
-                db.add(Style(style_code=code, title=f"演示货号 {code}"))
+            if (
+                db.execute(
+                    select(Style).where(
+                        Style.owner_user_id == user.id, Style.style_code == code
+                    )
+                ).scalar_one_or_none()
+                is None
+            ):
+                db.add(Style(style_code=code, title=f"演示货号 {code}", owner_user_id=user.id))
         if db.execute(select(MonitorTask).where(MonitorTask.name == "演示任务")).scalar_one_or_none() is None:
             db.add(
                 MonitorTask(

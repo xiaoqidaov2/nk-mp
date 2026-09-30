@@ -5,11 +5,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, require_write
-from app.models import MonitorTask, Store, Style, User
+from app.api.deps import get_current_session, get_db, require_write, settings_dep
+from app.api.http_errors import credential_error_response
+from app.config import Settings
+from app.models import AuthSession, MonitorTask, Store, Style, User
 from app.schemas import TaskIn, TaskOut, TaskUpdate
+from app.services.credentials import CredentialError, CredentialService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -34,10 +38,13 @@ def _to_out(task: MonitorTask) -> TaskOut:
     )
 
 
-def _load(db: Session, tenant_id, task_id: UUID) -> MonitorTask:
+def _load(db: Session, user: User, task_id: UUID) -> MonitorTask:
+    """Tasks belong to their creator: tenant + owner are both required."""
     task = db.execute(
         select(MonitorTask).where(
-            MonitorTask.id == task_id, MonitorTask.tenant_id == tenant_id
+            MonitorTask.id == task_id,
+            MonitorTask.tenant_id == user.tenant_id,
+            MonitorTask.created_by == user.id,
         )
     ).scalar_one_or_none()
     if task is None:
@@ -48,11 +55,15 @@ def _load(db: Session, tenant_id, task_id: UUID) -> MonitorTask:
 @router.get("", response_model=list[TaskOut])
 def list_tasks(
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> list[TaskOut]:
+    user = payload[0]
     rows = db.execute(
         select(MonitorTask)
-        .where(MonitorTask.tenant_id == user.tenant_id)
+        .where(
+            MonitorTask.tenant_id == user.tenant_id,
+            MonitorTask.created_by == user.id,
+        )
         .order_by(MonitorTask.created_at.desc())
     ).scalars().all()
     return [_to_out(row) for row in rows]
@@ -63,13 +74,22 @@ def create_task(
     payload: TaskIn,
     db: Session = Depends(get_db),
     user: User = Depends(require_write),
-) -> TaskOut:
+    settings: Settings = Depends(settings_dep),
+):
     if not payload.style_codes:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "请至少提供一个货号")
+    try:
+        CredentialService(settings, user.id).binding()
+    except CredentialError as exc:
+        return credential_error_response(exc)
     store_codes = list(payload.store_codes)
     if store_codes:
         known = set(
-            db.execute(select(Store.store_code).where(Store.store_code.in_(store_codes))).scalars()
+            db.execute(
+                select(Store.store_code).where(
+                    Store.owner_user_id == user.id, Store.store_code.in_(store_codes)
+                )
+            ).scalars()
         )
         unknown = [code for code in store_codes if code not in known]
         if unknown:
@@ -79,10 +99,10 @@ def create_task(
             )
     for code in payload.style_codes:
         existing = db.execute(
-            select(Style).where(Style.style_code == code)
+            select(Style).where(Style.owner_user_id == user.id, Style.style_code == code)
         ).scalar_one_or_none()
         if existing is None:
-            db.add(Style(style_code=code, title=code))
+            db.add(Style(style_code=code, title=code, owner_user_id=user.id))
     task = MonitorTask(
         tenant_id=user.tenant_id,
         name=payload.name.strip(),
@@ -98,7 +118,11 @@ def create_task(
         created_by=user.id,
     )
     db.add(task)
-    db.flush()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "同名任务已存在") from exc
     return _to_out(task)
 
 
@@ -106,9 +130,9 @@ def create_task(
 def get_task(
     task_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> TaskOut:
-    return _to_out(_load(db, user.tenant_id, task_id))
+    return _to_out(_load(db, payload[0], task_id))
 
 
 @router.patch("/{task_id}", response_model=TaskOut)
@@ -117,8 +141,15 @@ def update_task(
     payload: TaskUpdate,
     db: Session = Depends(get_db),
     user: User = Depends(require_write),
-) -> TaskOut:
-    task = _load(db, user.tenant_id, task_id)
+    settings: Settings = Depends(settings_dep),
+):
+    task = _load(db, user, task_id)
+    if payload.is_active is True and not task.is_active:
+        # Enabling a task will start scans with this user's own account.
+        try:
+            CredentialService(settings, user.id).binding()
+        except CredentialError as exc:
+            return credential_error_response(exc)
     if payload.name is not None:
         task.name = payload.name.strip()
     if payload.cadence_seconds is not None:
@@ -132,7 +163,11 @@ def update_task(
         task.notify_on_sold_out = payload.notify_on_sold_out
     if payload.notify_on_price_change is not None:
         task.notify_on_price_change = payload.notify_on_price_change
-    db.flush()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "同名任务已存在") from exc
     return _to_out(task)
 
 
@@ -142,6 +177,7 @@ def delete_task(
     db: Session = Depends(get_db),
     user: User = Depends(require_write),
 ) -> None:
-    task = _load(db, user.tenant_id, task_id)
+    task = _load(db, user, task_id)
     db.delete(task)
-    db.flush()
+    # Commit before the 204: the row must already be gone for the next read.
+    db.commit()
