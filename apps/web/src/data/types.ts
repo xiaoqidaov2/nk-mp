@@ -230,6 +230,7 @@ export type NikeAuthAttemptOut = NikeAuthAttempt;
 
 export type NotificationPlatform =
   | "dingtalk"
+  | "dingtalk_app"
   | "feishu"
   | "wecombot"
   | "schan"
@@ -268,4 +269,13 @@ export interface NotificationDelivery {
   sent_at: string | null;
   title: string;
   summary: string;
+}
+
+/** 平台机器人在钉钉里绑定的一个会话（群或单聊）。 */
+export interface DingTalkLink {
+  id: string;
+  conversation_title: string;
+  /** 1 单聊，2 群聊 */
+  conversation_type: number;
+  created_at: string;
 }

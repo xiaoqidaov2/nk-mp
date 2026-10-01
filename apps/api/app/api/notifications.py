@@ -19,6 +19,7 @@ from app.api.deps import get_current_session, get_db, require_self_write, settin
 from app.config import Settings
 from app.models import (
     AuthSession,
+    DingTalkBotLink,
     MonitorTask,
     NotificationChannel,
     NotificationDelivery,
@@ -26,13 +27,15 @@ from app.models import (
     User,
 )
 from app.schemas import (
+    DingTalkLinkCodeOut,
+    DingTalkLinkOut,
     NotificationChannelIn,
     NotificationChannelOut,
     NotificationChannelPatch,
     NotificationDeliveryOut,
 )
 from app.security import decrypt_secret, encrypt_secret, secret_fingerprint
-from app.services import push
+from app.services import dingtalk_bot, push
 
 router = APIRouter(prefix="/me", tags=["push"])
 
@@ -256,3 +259,67 @@ def retry_notification(
     push.retry_delivery(db, settings, delivery)
     db.commit()
     return {"ok": True}
+
+
+@router.post("/dingtalk/link-code", response_model=DingTalkLinkCodeOut)
+def create_dingtalk_link_code(
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+    payload: tuple[User, AuthSession] = Depends(require_self_write),
+) -> DingTalkLinkCodeOut:
+    """生成一次性验证码：在钉钉里把它发给平台机器人，即完成本账号的会话绑定。"""
+    user, _ = payload
+    if not (settings.dingtalk_bot_enabled and settings.dingtalk_bot_client_id):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "钉钉机器人还没有配置，请联系管理员。"
+        )
+    row = dingtalk_bot.issue_code(db, settings, user.id)
+    db.commit()
+    return DingTalkLinkCodeOut(code=row.code, expires_at=row.expires_at)
+
+
+@router.get("/dingtalk/links", response_model=list[DingTalkLinkOut])
+def list_dingtalk_links(
+    db: Session = Depends(get_db),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
+) -> list[DingTalkLinkOut]:
+    user = payload[0]
+    rows = (
+        db.execute(
+            select(DingTalkBotLink)
+            .where(DingTalkBotLink.owner_user_id == user.id)
+            .order_by(DingTalkBotLink.created_at)
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        DingTalkLinkOut(
+            id=row.id,
+            conversation_title=row.conversation_title,
+            conversation_type=row.conversation_type,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@router.delete("/dingtalk/links/{link_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_dingtalk_link(
+    link_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+    payload: tuple[User, AuthSession] = Depends(require_self_write),
+) -> Response:
+    user, _ = payload
+    row = db.execute(
+        select(DingTalkBotLink).where(
+            DingTalkBotLink.id == link_id, DingTalkBotLink.owner_user_id == user.id
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "没有找到这个绑定。")
+    dingtalk_bot.drop_channel(db, settings, row)
+    db.delete(row)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

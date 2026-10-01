@@ -8,6 +8,7 @@ import type {
   NikeAuthAttemptOut,
   NikeBootstrapOut,
   NikeCredentialOut,
+  DingTalkLink,
   NotificationChannel,
   NotificationDelivery,
   NotificationPlatform,
@@ -128,6 +129,10 @@ export const notificationApi = {
   deliveries: (limit = 10) =>
     api.get<NotificationDelivery[]>(`/me/notifications?limit=${limit}`),
   retryDelivery: (id: number) => api.post<{ ok: boolean }>(`/me/notifications/${id}/retry`),
+  dingtalkLinkCode: () =>
+    api.post<{ code: string; expires_at: string }>("/me/dingtalk/link-code"),
+  dingtalkLinks: () => api.get<DingTalkLink[]>("/me/dingtalk/links"),
+  removeDingTalkLink: (id: string) => api.delete<void>(`/me/dingtalk/links/${id}`),
 };
 
 export interface ScanProgressHandlers {

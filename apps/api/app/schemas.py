@@ -309,3 +309,18 @@ class NotificationDeliveryOut(BaseModel):
     sent_at: datetime | None
     title: str
     summary: str
+
+
+class DingTalkLinkCodeOut(BaseModel):
+    """一次性绑定码：在钉钉里发给平台机器人即完成账号↔会话绑定。"""
+
+    code: str
+    expires_at: datetime
+
+
+class DingTalkLinkOut(BaseModel):
+    id: uuid.UUID
+    conversation_title: str
+    #: 1 单聊，2 群聊
+    conversation_type: int
+    created_at: datetime

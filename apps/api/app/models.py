@@ -117,6 +117,8 @@ class StructureStatus(StrEnum):
 
 class NotificationPlatform(StrEnum):
     DINGTALK = "dingtalk"
+    #: 钉钉企业内部应用机器人：AppKey/AppSecret 换 accessToken 后调新版群消息接口。
+    DINGTALK_APP = "dingtalk_app"
     FEISHU = "feishu"
     WECOMBOT = "wecombot"
     SCHAN = "schan"
@@ -671,3 +673,36 @@ class NotificationDelivery(Base):
     last_error: Mapped[str | None] = mapped_column(String(300))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DingTalkLinkCode(Base):
+    """一次性绑定码：用户在钉钉里把它发给平台机器人即完成账号↔会话绑定。"""
+
+    __tablename__ = "dingtalk_link_code"
+
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("app_user.id", ondelete="CASCADE"), primary_key=True
+    )
+    code: Mapped[str] = mapped_column(String(12))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DingTalkBotLink(Base):
+    """平台机器人绑定的会话：该会话里可以用本账号的数据，提醒也推到这里。"""
+
+    __tablename__ = "dingtalk_bot_link"
+    __table_args__ = (UniqueConstraint("conversation_id", name="uq_dingtalk_bot_link_conversation"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=_uuid)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_user.id", ondelete="CASCADE"))
+    dingtalk_user_id: Mapped[str] = mapped_column(String(64), default="")
+    dingtalk_corp_id: Mapped[str] = mapped_column(String(64), default="")
+    conversation_id: Mapped[str] = mapped_column(String(128))
+    #: 1 单聊，2 群聊（与钉钉回调一致）。
+    conversation_type: Mapped[int] = mapped_column(Integer, default=2)
+    conversation_title: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

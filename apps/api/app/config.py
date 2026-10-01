@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     push_drain_batch: int = 10
     #: 允许推送到内网/回环地址（仅离线冒烟需要，生产保持 False）。
     push_allow_private_targets: bool = False
+
+    #: 平台自己的钉钉机器人（企业内部应用）：用户把账号绑到会话后由它推送与应答。
+    dingtalk_bot_enabled: bool = False
+    dingtalk_bot_client_id: str = ""
+    dingtalk_bot_client_secret: str = ""
+    #: 会话绑定码有效期（秒）。
+    dingtalk_link_code_ttl_seconds: int = 900
     #: 门店目录缓存的保鲜期（秒）：到期后调度器会用该用户自己的连接自动重取。
     catalog_ttl_seconds: int = 86400
     worker_heartbeat_seconds: int = 20

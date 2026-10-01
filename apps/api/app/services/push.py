@@ -17,6 +17,7 @@ URL.
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import re
 import socket
@@ -24,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote, urlsplit
 
 import apprise
+import httpx
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -59,9 +61,11 @@ DEFAULT_TIMEOUT_SECONDS = 8
 DELIVERY_LEASE_SECONDS = 120
 DELIVERY_RUNNING = "RUNNING"
 
-#: 允许的 Apprise scheme；其余一律拒绝（含未知/危险 scheme）。
+#: 允许的 scheme；其余一律拒绝（含未知/危险 scheme）。
+#: 其中 dingtalkapp 不是 Apprise scheme：它是企业机器人（AppKey/AppSecret + openConversationId）。
 ALLOWED_SCHEMES = {
     "dingtalk",
+    "dingtalkapp",
     "feishu",
     "wecombot",
     "schan",
@@ -99,6 +103,9 @@ HOST_SCHEMES = {
 FIELD_LABELS = {
     "access_token": "Webhook access_token",
     "secret": "加签密钥",
+    "robot_code": "AppKey（robotCode）",
+    "robot_secret": "AppSecret",
+    "conversation_id": "群会话 openConversationId",
     "token": "机器人 token",
     "key_or_url": "Webhook 地址或 key",
     "sendkey": "SendKey",
@@ -116,6 +123,7 @@ FIELD_LABELS = {
 #: 渠道留空名称时的默认名。
 PLATFORM_LABELS = {
     NotificationPlatform.DINGTALK.value: "钉钉群机器人",
+    NotificationPlatform.DINGTALK_APP.value: "钉钉企业机器人",
     NotificationPlatform.FEISHU.value: "飞书机器人",
     NotificationPlatform.WECOMBOT.value: "企业微信机器人",
     NotificationPlatform.SCHAN.value: "Server酱",
@@ -126,6 +134,11 @@ PLATFORM_LABELS = {
 
 _DEFAULT_BARK_SERVER = "https://api.day.app"
 _WECOMBOT_KEY = re.compile(r"[?&]key=([A-Za-z0-9_-]+)")
+
+#: 钉钉企业内部应用机器人（新版接口）：AppKey/AppSecret 换 token 后发消息。
+DINGTALK_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+DINGTALK_GROUP_SEND_URL = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+DINGTALK_DM_SEND_URL = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
 
 _CATEGORIES = (
     (EventType.RESTOCK.value, "补货"),
@@ -153,7 +166,16 @@ def _require(fields: dict[str, str], name: str) -> str:
 
 
 def build_target(platform: str, fields: dict[str, str]) -> str:
-    """Turn the per-platform form fields into the Apprise URL we store."""
+    """Turn the per-platform form fields into the target we store."""
+    if platform == NotificationPlatform.DINGTALK_APP.value:
+        robot_code = _require(fields, "robot_code")
+        robot_secret = _require(fields, "robot_secret")
+        conversation_id = _require(fields, "conversation_id")
+        return (
+            f"dingtalkapp://{quote(robot_code, safe='')}"
+            f"?secret={quote(robot_secret, safe='')}"
+            f"&conversation={quote(conversation_id, safe='')}"
+        )
     if platform == NotificationPlatform.DINGTALK.value:
         access_token = _require(fields, "access_token")
         secret = str(fields.get("secret") or "").strip()
@@ -205,6 +227,13 @@ def target_hint(platform: str, url: str) -> str:
     if platform == NotificationPlatform.MAILTO.value:
         values = parse_qs(urlsplit(url).query).get("to") or [""]
         return values[0][:120]
+    if platform == NotificationPlatform.DINGTALK_APP.value:
+        parsed = _dingtalk_app_target(url)
+        if parsed is None:
+            return "••••"
+        robot, _secret, conversation, user_id, is_dm = parsed
+        tail = (user_id or conversation)[-4:]
+        return f"{'钉钉单聊' if is_dm else '钉钉群'} · {robot[:20]} → ••••{tail}"
     return "••••" + url[-4:]
 
 
@@ -249,6 +278,11 @@ def validate_target(url: str, settings: Settings) -> None:
         )
     if scheme in HOST_SCHEMES:
         _reject_private_host(url, scheme, settings)
+    if scheme == "dingtalkapp":
+        # 平台机器人不走 Apprise：结构对即可（凭证在发送时校验）。
+        if not (urlsplit(url).hostname and _dingtalk_app_target(url)):
+            raise PushTargetError(PUSH_TARGET_INVALID, "渠道地址无法识别，请检查填写内容。")
+        return
     if not apprise.Apprise().add(url):
         raise PushTargetError(PUSH_TARGET_INVALID, "渠道地址无法识别，请检查填写内容。")
 
@@ -314,10 +348,91 @@ def build_message(
     return title, render(entries)
 
 
+def _dingtalk_app_target(url: str) -> tuple[str, str, str, str, bool] | None:
+    """读 ``dingtalkapp://robot?secret=…&conversation=…`` 或 ``…&user=…&dm=1``。
+
+    返回 ``(robot_code, secret, conversation_id, user_id, is_dm)``；凭证不全返回 None。
+    """
+    parts = urlsplit(url)
+    query = parse_qs(parts.query)
+    robot_code = (parts.hostname or "").strip()
+    secret = (query.get("secret") or [""])[0].strip()
+    conversation = (query.get("conversation") or [""])[0].strip()
+    user_id = (query.get("user") or [""])[0].strip()
+    is_dm = (query.get("dm") or [""])[0] == "1"
+    if not (robot_code and secret):
+        return None
+    if not conversation and not user_id:
+        return None
+    return robot_code, secret, conversation, user_id, is_dm
+
+
+def build_bot_target(
+    robot_code: str, robot_secret: str, *, conversation_id: str = "", user_id: str = ""
+) -> str:
+    """平台机器人在一个已绑定会话里的推送目标：群会话或单聊（二选一）。"""
+    base = f"dingtalkapp://{quote(robot_code, safe='')}?secret={quote(robot_secret, safe='')}"
+    if conversation_id:
+        return f"{base}&conversation={quote(conversation_id, safe='')}"
+    return f"{base}&user={quote(user_id, safe='')}&dm=1"
+
+
+def _send_dingtalk_app(
+    target: str, title: str, body: str, settings: Settings
+) -> tuple[bool, str | None]:
+    """平台机器人：换 accessToken 后按会话类型调群消息/单聊接口（不走 Apprise）。"""
+    parsed = _dingtalk_app_target(target)
+    if parsed is None:
+        return False, PUSH_TARGET_INVALID
+    robot_code, robot_secret, conversation_id, user_id, is_dm = parsed
+    timeout = settings.push_timeout_seconds or DEFAULT_TIMEOUT_SECONDS
+    try:
+        token_response = httpx.post(
+            DINGTALK_TOKEN_URL,
+            json={"appKey": robot_code, "appSecret": robot_secret},
+            timeout=timeout,
+        )
+        token_response.raise_for_status()
+        access_token = str(token_response.json().get("accessToken") or "")
+    except Exception:  # noqa: BLE001 - 网络/凭证问题都按投递失败处理
+        logger.warning("dingtalk bot token request failed", exc_info=True)
+        return False, PUSH_DELIVERY_FAILED
+    if not access_token:
+        logger.warning("dingtalk bot token response carried no accessToken")
+        return False, PUSH_DELIVERY_FAILED
+    payload: dict[str, object] = {
+        "robotCode": robot_code,
+        "msgKey": "sampleMarkdown",
+        "msgParam": json.dumps({"title": title, "text": body}, ensure_ascii=False),
+    }
+    if is_dm:
+        payload["userIds"] = [user_id]
+        send_url = DINGTALK_DM_SEND_URL
+    else:
+        payload["openConversationId"] = conversation_id
+        send_url = DINGTALK_GROUP_SEND_URL
+    try:
+        response = httpx.post(
+            send_url,
+            headers={"x-acs-dingtalk-access-token": access_token},
+            json=payload,
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("dingtalk bot send raised", exc_info=True)
+        return False, PUSH_DELIVERY_FAILED
+    if response.status_code >= 400:
+        logger.warning("dingtalk bot send rejected: HTTP %s", response.status_code)
+        return False, PUSH_DELIVERY_FAILED
+    return True, None
+
+
 def send_now(
     target: str, title: str, body: str, settings: Settings
 ) -> tuple[bool, str | None]:
     """Send one message now; returns ``(ok, error_code)`` with fixed codes."""
+    if urlsplit(target).scheme.lower() == "dingtalkapp":
+        return _send_dingtalk_app(target, title, body, settings)
     apobj = apprise.Apprise()
     if not apobj.add(target):
         return False, PUSH_TARGET_INVALID

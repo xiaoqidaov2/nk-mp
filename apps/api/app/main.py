@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -20,7 +24,27 @@ from app.api import (
 )
 from app.config import get_settings
 
+logger = logging.getLogger("nike_mp.api")
+
 settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """平台钉钉机器人：绑定会话、关键字指令；未配置时什么都不做。"""
+    task: asyncio.Task | None = None
+    try:
+        from app.services import dingtalk_bot
+
+        task = asyncio.create_task(dingtalk_bot.run_forever(settings))
+    except Exception:  # noqa: BLE001 - 机器人不在时 API 必须照常工作
+        logger.exception("dingtalk bot did not start")
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+
 
 app = FastAPI(
     title="Nike 门店监控平台 API",
@@ -28,6 +52,7 @@ app = FastAPI(
     description="门店价格与尺码库存监控服务。所有采集均通过只读接口完成。",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
+    lifespan=lifespan,
 )
 
 API_PREFIX = "/api/v1"

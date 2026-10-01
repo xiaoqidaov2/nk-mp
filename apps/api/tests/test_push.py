@@ -188,3 +188,89 @@ def test_backoff_seconds_parsing_falls_back_to_one_minute() -> None:
     ]
     assert push._backoff_seconds(_settings(push_backoff_seconds="bad")) == [60]
     assert push._backoff_seconds(_settings(push_backoff_seconds="")) == [60]
+
+
+def test_build_target_supports_the_enterprise_robot() -> None:
+    target = push.build_target(
+        "dingtalk_app",
+        {
+            "robot_code": "dingw9i1o98w3eyn8qwu",
+            "robot_secret": "s3cret_with_underscore",
+            "conversation_id": "cid6KeBBLoveMJOGXoYKF5x7EeiodoA==",
+        },
+    )
+    assert target == (
+        "dingtalkapp://dingw9i1o98w3eyn8qwu"
+        "?secret=s3cret_with_underscore"
+        "&conversation=cid6KeBBLoveMJOGXoYKF5x7EeiodoA%3D%3D"
+    )
+    assert push.target_hint("dingtalk_app", target) == "钉钉群 · dingw9i1o98w3eyn8qwu → ••••oA=="
+
+
+def test_bot_target_supports_group_and_single_chat() -> None:
+    group = push.build_bot_target("ding", "s", conversation_id="cid")
+    assert group == "dingtalkapp://ding?secret=s&conversation=cid"
+    assert push.target_hint("dingtalk_app", group) == "钉钉群 · ding → ••••cid"
+    dm = push.build_bot_target("ding", "s", user_id="452523285939877041")
+    assert dm == "dingtalkapp://ding?secret=s&user=452523285939877041&dm=1"
+    assert push.target_hint("dingtalk_app", dm) == "钉钉单聊 · ding → ••••7041"
+
+
+def test_bot_target_needs_credentials_and_a_destination() -> None:
+    push.validate_target("dingtalkapp://ding?secret=s&conversation=cid", _settings())
+    push.validate_target("dingtalkapp://ding?secret=s&user=u1&dm=1", _settings())
+    with pytest.raises(push.PushTargetError) as excinfo:
+        push.validate_target("dingtalkapp://ding?secret=s", _settings())
+    assert excinfo.value.code == push.PUSH_TARGET_INVALID
+    with pytest.raises(push.PushTargetError) as excinfo:
+        push.build_target("dingtalk_app", {"robot_code": "ding"})
+    assert excinfo.value.detail == "请填写AppSecret。"
+
+
+def test_enterprise_robot_send_mints_a_token_and_posts_the_group_message(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class _Response:
+        def __init__(self, status_code: int, payload: dict | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError("http error")
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        if url == push.DINGTALK_TOKEN_URL:
+            return _Response(200, {"accessToken": "tok-123"})
+        return _Response(200, {})
+
+    monkeypatch.setattr(push.httpx, "post", fake_post)
+    target = push.build_target(
+        "dingtalk_app",
+        {"robot_code": "ding", "robot_secret": "s", "conversation_id": "cid"},
+    )
+    ok, code = push.send_now(target, "标题", "正文", _settings(push_timeout_seconds=3))
+    assert (ok, code) == (True, None)
+    assert calls[0]["json"] == {"appKey": "ding", "appSecret": "s"}
+    assert calls[1]["headers"] == {"x-acs-dingtalk-access-token": "tok-123"}
+    assert calls[1]["json"] == {
+        "robotCode": "ding",
+        "msgKey": "sampleMarkdown",
+        "msgParam": '{"title": "标题", "text": "正文"}',
+        "openConversationId": "cid",
+    }
+
+    def failing_post(url, **kwargs):
+        if url == push.DINGTALK_TOKEN_URL:
+            return _Response(200, {"accessToken": "tok-123"})
+        return _Response(400, {})
+
+    monkeypatch.setattr(push.httpx, "post", failing_post)
+    assert push.send_now(target, "标题", "正文", _settings(push_timeout_seconds=3)) == (
+        False,
+        push.PUSH_DELIVERY_FAILED,
+    )

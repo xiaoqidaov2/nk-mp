@@ -6,6 +6,7 @@ import { BTN, ERR, PUSH, TASK_LIST, formatDate } from "@/copy";
 import { ApiError } from "@/data/client";
 import { notificationApi } from "@/data/api";
 import type {
+  DingTalkLink,
   NotificationChannel,
   NotificationDelivery,
   NotificationPlatform,
@@ -13,11 +14,15 @@ import type {
 
 import { SectionCard } from "./SectionCard";
 
-const PLATFORM_KEYS = Object.keys(PUSH.platforms) as NotificationPlatform[];
+//: dingtalk_app 由「钉钉机器人」绑定自动创建，不放进手填列表。
+const PLATFORM_KEYS = (Object.keys(PUSH.platforms) as NotificationPlatform[]).filter(
+  (key) => key !== "dingtalk_app",
+);
 
 /** 平台表单字段；顺序即表单顺序，与后端 4.1 表一致。 */
 const PLATFORM_FIELDS: Record<NotificationPlatform, string[]> = {
   dingtalk: ["access_token", "secret"],
+  dingtalk_app: ["robot_code", "robot_secret", "conversation_id"],
   feishu: ["token"],
   wecombot: ["key_or_url"],
   schan: ["sendkey"],
@@ -31,6 +36,8 @@ const OPTIONAL_FIELDS: Record<string, true> = {
   secret: true,
   server: true,
   smtp_port: true,
+  //: 留空即进入“@ 机器人 自动绑定”流程。
+  conversation_id: true,
 };
 
 const STATE_LABEL: Record<NotificationDelivery["state"], string> = {
@@ -75,6 +82,11 @@ export function PushChannelsCard() {
   const channels = useQuery<NotificationChannel[]>({
     queryKey: ["notification-channels"],
     queryFn: () => notificationApi.channels(),
+  });
+  const [linkCode, setLinkCode] = useState("");
+  const links = useQuery<DingTalkLink[]>({
+    queryKey: ["dingtalk-links"],
+    queryFn: () => notificationApi.dingtalkLinks(),
   });
   const deliveries = useQuery<NotificationDelivery[]>({
     queryKey: ["notification-deliveries"],
@@ -130,6 +142,32 @@ export function PushChannelsCard() {
     },
     onError: (error) => message.error(errorText(error)),
   });
+
+  const bindCode = useMutation({
+    mutationFn: () => notificationApi.dingtalkLinkCode(),
+    onSuccess: (result) => setLinkCode(result.code),
+    onError: (error) => message.error(errorText(error)),
+  });
+
+  const unbind = useMutation({
+    mutationFn: (id: string) => notificationApi.removeDingTalkLink(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["dingtalk-links"] });
+      invalidateChannels();
+    },
+    onError: (error) => message.error(errorText(error)),
+  });
+
+  const confirmUnbind = (link: DingTalkLink) => {
+    modal.confirm({
+      title: PUSH.dingtalkUnbindConfirmTitle,
+      content: PUSH.dingtalkUnbindConfirmBody,
+      okText: PUSH.dingtalkUnbindConfirmOk,
+      cancelText: BTN.cancel,
+      okButtonProps: { danger: true },
+      onOk: () => unbind.mutateAsync(link.id),
+    });
+  };
 
   const confirmRemove = (channel: NotificationChannel) => {
     modal.confirm({
@@ -207,6 +245,34 @@ export function PushChannelsCard() {
                   {PUSH.remove}
                 </Button>
               </Space>
+            </Space>
+          ))
+        )}
+
+        <Divider style={{ margin: "8px 0" }} />
+        <Typography.Title level={5} style={{ margin: 0 }}>
+          {PUSH.dingtalkTitle}
+        </Typography.Title>
+        <Typography.Text type="secondary">{PUSH.dingtalkNote}</Typography.Text>
+        <Space wrap size={8} align="center">
+          <Button size="small" loading={bindCode.isPending} onClick={() => bindCode.mutate()}>
+            {PUSH.dingtalkBind}
+          </Button>
+          {linkCode ? (
+            <Typography.Text>{PUSH.dingtalkBindTip(linkCode)}</Typography.Text>
+          ) : null}
+        </Space>
+        <Typography.Text type="secondary">{PUSH.dingtalkKeywords}</Typography.Text>
+        {(links.data ?? []).length === 0 ? (
+          <Typography.Text type="secondary">{PUSH.dingtalkLinksEmpty}</Typography.Text>
+        ) : (
+          (links.data ?? []).map((link) => (
+            <Space key={link.id} wrap size={8} align="center">
+              <Tag>{link.conversation_type === 1 ? PUSH.dingtalkLinkDm : PUSH.dingtalkLinkGroup}</Tag>
+              <Typography.Text>{link.conversation_title || PUSH.dingtalkLinkDm}</Typography.Text>
+              <Button size="small" danger onClick={() => confirmUnbind(link)}>
+                {PUSH.dingtalkUnbind}
+              </Button>
             </Space>
           ))
         )}
