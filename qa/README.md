@@ -148,6 +148,35 @@ QA_API=http://127.0.0.1:18000 QA_STUB=http://127.0.0.1:19100 \
 - 数据归属：门店/货号/尺码表目录都通过**用户自己的 Nike 连接**取得，只属于该用户（缓存）；
   绑定成功的瞬间会自动预加载，界面显示环形进度。
 
+## 钉钉机器人（可选，默认关闭）
+
+平台自己持有一个钉钉企业内部应用机器人：用户在网页「账户与额度 → 消息推送 → 钉钉机器人」
+生成一次性验证码，在群里 @ 机器人或单聊发给它即完成「账号 ↔ 会话」绑定；之后关键字指令
+都用**绑定账号**的鉴权与数据回答，提醒也推到这个会话（自动生成 `dingtalk_app` 渠道）。
+
+配置（凭据只进部署环境，绝不入库；QA 用仓库外的 override 文件注入）：
+
+```yaml
+# /tmp/qa-bot-override.yaml 示例（不要提交）
+services:
+  api:
+    environment:
+      NIKE_MP_DINGTALK_BOT_ENABLED: "true"
+      NIKE_MP_DINGTALK_BOT_CLIENT_ID: "ding…"     # 应用 AppKey / robotCode
+      NIKE_MP_DINGTALK_BOT_CLIENT_SECRET: "…"     # 应用 AppSecret
+      NIKE_MP_DINGTALK_LINK_CODE_TTL_SECONDS: "3600"
+```
+
+```bash
+docker compose -p nike-mp-auth-qa -f qa/compose.auth.hostnet.yaml \
+  -f /tmp/qa-bot-override.yaml up -d --build api
+# 日志出现 wss://wss-open-connection-union.dingtalk.com 即已连上钉钉
+```
+
+已支持指令（在钉钉里发「帮助」查看）：`绑定/解绑/注销`、`任务/概览/额度/变化/门店/货号/状态`、
+`检查/暂停/启用/删除`、`新建`、`加货号/删货号`、`加门店/删门店`、`盯`、`频率`、`通知`、
+`上次检查/重试失败`。写操作全部作用于绑定账号自己的任务。
+
 ## 已知问题（`app/` 侧，本轮只记录未修改）
 
 ### 登录响应后会话短暂不可见（可复现竞态）

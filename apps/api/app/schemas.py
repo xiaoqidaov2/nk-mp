@@ -299,9 +299,9 @@ class NotificationDeliveryOut(BaseModel):
     id: int
     job_id: uuid.UUID
     task_name: str | None
-    channel_id: uuid.UUID
-    channel_name: str
-    platform: str
+    channel_id: uuid.UUID | None
+    channel_name: str | None
+    platform: str | None
     state: str
     attempts: int
     last_error: str | None

@@ -259,9 +259,9 @@ export interface NotificationDelivery {
   id: number;
   job_id: string;
   task_name: string | null;
-  channel_id: string;
-  channel_name: string;
-  platform: NotificationPlatform;
+  channel_id: string | null;
+  channel_name: string | null;
+  platform: NotificationPlatform | null;
   state: NotificationDeliveryState;
   attempts: number;
   last_error: string | null;

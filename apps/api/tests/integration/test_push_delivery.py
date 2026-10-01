@@ -247,3 +247,46 @@ def test_delivery_retries_then_fails_and_can_be_retried(monkeypatch) -> None:
         assert row.state == NotificationDeliveryState.SENT.value
         assert row.sent_at is not None
         assert db.get(NotificationChannel, channel_id).last_ok_at is not None
+
+
+def test_deleting_a_channel_keeps_delivery_history() -> None:
+    settings = _settings()
+    with SessionLocal() as db:
+        _user, _task, job, channel = _seed(db)
+        assert push.enqueue_for_job(db, settings, job) == 1
+        db.commit()
+        delivery_id = db.execute(select(NotificationDelivery)).scalar_one().id
+        channel_id = channel.id
+
+    with SessionLocal() as db:
+        db.delete(db.get(NotificationChannel, channel_id))
+        db.commit()
+
+    with SessionLocal() as db:
+        row = db.get(NotificationDelivery, delivery_id)
+        assert row is not None
+        assert row.channel_id is None
+
+
+def test_delivery_for_a_removed_channel_fails_instead_of_looping() -> None:
+    settings = _settings()
+    with SessionLocal() as db:
+        _user, _task, job, channel = _seed(db)
+        assert push.enqueue_for_job(db, settings, job) == 1
+        db.commit()
+        db.delete(channel)
+        db.commit()
+
+    with SessionLocal() as db:
+        delivery = push.lease_due_delivery(db, settings)
+        assert delivery is not None
+        assert delivery.channel_id is None
+        db.commit()
+        push.deliver(db, settings, delivery)
+
+    with SessionLocal() as db:
+        row = db.execute(select(NotificationDelivery)).scalar_one()
+        assert row.state == NotificationDeliveryState.FAILED.value
+        assert row.last_error_code == push.CHANNEL_REMOVED
+        assert row.last_error == push.CHANNEL_REMOVED_TEXT
+        assert row.lease_until is None

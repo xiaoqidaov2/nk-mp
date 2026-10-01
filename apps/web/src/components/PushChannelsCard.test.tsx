@@ -156,6 +156,15 @@ describe("PushChannelsCard", () => {
     expect(screen.getByText(PUSH.stateSent)).toBeTruthy();
   });
 
+  it("keeps a delivery row whose channel was deleted, without a retry button", async () => {
+    deliveriesMock.mockResolvedValue([
+      delivery({ channel_id: null, channel_name: null, state: "FAILED", last_error: "这条提醒的渠道已被删除，没有发送。" }),
+    ]);
+    renderCard();
+    expect(await screen.findByText(/已删除的渠道/)).toBeTruthy();
+    expect(buttonByText(PUSH.retry)).toBeNull();
+  });
+
   it("shows the failure text a channel recorded", async () => {
     channelsMock.mockResolvedValue([channel({ last_ok_at: null, last_error: FAIL_TEXT })]);
     renderCard();

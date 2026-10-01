@@ -47,9 +47,13 @@ logger = logging.getLogger("nike_mp.push")
 PUSH_TARGET_INVALID = "PUSH_TARGET_INVALID"
 PUSH_TARGET_PRIVATE = "PUSH_TARGET_PRIVATE"
 PUSH_DELIVERY_FAILED = "PUSH_DELIVERY_FAILED"
+CHANNEL_REMOVED = "CHANNEL_REMOVED"
 
 #: 发送失败时对用户展示的固定文案；绝不透出 Apprise 日志或渠道地址。
 DELIVERY_FAILED_TEXT = "发送失败：平台没有接受这条消息（可在渠道里点“发送测试”复查）。"
+
+#: 渠道被删除后残留的投递记录：历史保留，但不再尝试发送。
+CHANNEL_REMOVED_TEXT = "这条提醒的渠道已被删除，没有发送。"
 
 #: 测试消息（渠道详情页的“发送测试”）。
 TEST_TITLE = "【测试】门店监控台"
@@ -586,8 +590,19 @@ def lease_due_delivery(session: Session, settings: Settings) -> NotificationDeli
 
 def deliver(session: Session, settings: Settings, delivery: NotificationDelivery) -> None:
     """Send one leased delivery and record the outcome; commits the row."""
-    channel = session.get(NotificationChannel, delivery.channel_id)
+    channel = (
+        session.get(NotificationChannel, delivery.channel_id)
+        if delivery.channel_id is not None
+        else None
+    )
     if channel is None:
+        # 渠道已被删除：这条投递没有去处，标记失败而不是无限续租。
+        delivery.state = NotificationDeliveryState.FAILED.value
+        delivery.lease_until = None
+        delivery.attempts += 1
+        delivery.last_error_code = CHANNEL_REMOVED
+        delivery.last_error = CHANNEL_REMOVED_TEXT
+        session.commit()
         return
     now = datetime.now(UTC)
     try:

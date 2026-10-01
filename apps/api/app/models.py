@@ -658,8 +658,8 @@ class NotificationDelivery(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     owner_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_user.id", ondelete="CASCADE"))
-    channel_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("notification_channel.id", ondelete="CASCADE")
+    channel_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("notification_channel.id", ondelete="SET NULL")
     )
     job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scan_job.id", ondelete="CASCADE"))
     task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("monitor_task.id", ondelete="SET NULL"))

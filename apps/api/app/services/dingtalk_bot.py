@@ -27,7 +27,7 @@ from dingtalk_stream import (
 from dingtalk_stream import (
     Credential as StreamCredential,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -57,6 +57,7 @@ logger = logging.getLogger("nike_mp.bot")
 HELP_TEXT = (
     "可用指令：\n"
     "· 绑定 <验证码>：把本会话绑到你的平台账号（验证码在“账户与额度 → 消息推送”生成）\n"
+    "· 概览：今天的检查概况\n"
     "· 任务：查看我的监控任务\n"
     "· 检查 [任务名]：马上检查一次\n"
     "· 暂停 <任务名> / 启用 <任务名>：停止或恢复自动检查\n"
@@ -792,6 +793,55 @@ def _disconnect_reply(session: Session, settings: Settings, owner_user_id, comma
     return "已断开 Nike 连接，检查会停。想恢复就到网页「账户与额度」重新连接。"
 
 
+def _overview_reply(session: Session, owner_user_id) -> str:
+    user = session.get(User, owner_user_id)
+    if user is None:
+        return "账号状态异常，请稍后再试。"
+    today = datetime.now(UTC)
+    day = datetime(today.year, today.month, today.day, tzinfo=UTC)
+    tasks = (
+        session.execute(
+            select(MonitorTask).where(MonitorTask.created_by == owner_user_id)
+        ).scalars().all()
+    )
+    active = [task for task in tasks if task.is_active]
+    counts: dict[str, int] = {}
+    for event in ("RESTOCK", "SOLD_OUT", "PRICE_CHANGE"):
+        counts[event] = int(
+            session.execute(
+                select(func.count())
+                .select_from(ChangeEvent)
+                .where(
+                    ChangeEvent.owner_user_id == owner_user_id,
+                    ChangeEvent.tenant_id == user.tenant_id,
+                    ChangeEvent.event_type == event,
+                    ChangeEvent.detected_at >= day,
+                )
+            ).scalar_one()
+        )
+    last_job = session.execute(
+        select(ScanJob)
+        .where(ScanJob.owner_user_id == owner_user_id)
+        .order_by(ScanJob.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    last = ""
+    if last_job is not None:
+        when = last_job.finished_at or last_job.started_at or last_job.created_at
+        stamp = when.astimezone(_CST).strftime("%m-%d %H:%M") if when else "—"
+        last = f"最近一次检查：{_JOB_STATE.get(last_job.status, last_job.status)}（{stamp}）。"
+    restock, sold_out, price_change = counts["RESTOCK"], counts["SOLD_OUT"], counts["PRICE_CHANGE"]
+    lines = [
+        f"监控任务 {len(active)} 个启用（共 {len(tasks)} 个）。",
+        f"今天：补货 {restock} 条、售罄 {sold_out} 条、变价 {price_change} 条。",
+    ]
+    if last:
+        lines.append(last)
+    if active and all(task.next_run_at is None for task in active):
+        lines.append("任务还没有排下一次检查，发「检查 <任务名>」可以马上跑。")
+    return "\n".join(lines)
+
+
 def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text: str) -> str:
     """已绑定会话里的关键字路由（纯函数，方便单测）。"""
     command = text.strip()
@@ -814,6 +864,8 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
         return _toggle_task(session, link.owner_user_id, arg, active=True)
     if "额度" in command:
         return _quota_reply(session, link.owner_user_id)
+    if "概览" in command:
+        return _overview_reply(session, link.owner_user_id)
     arg = _command_arg(command, "新建")
     if arg is not None:
         return _create_task(session, link.owner_user_id, arg)

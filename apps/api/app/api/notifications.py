@@ -213,7 +213,7 @@ def list_notifications(
     user = payload[0]
     rows = db.execute(
         select(NotificationDelivery, NotificationChannel, MonitorTask)
-        .join(NotificationChannel, NotificationChannel.id == NotificationDelivery.channel_id)
+        .outerjoin(NotificationChannel, NotificationChannel.id == NotificationDelivery.channel_id)
         .outerjoin(MonitorTask, MonitorTask.id == NotificationDelivery.task_id)
         .where(NotificationDelivery.owner_user_id == user.id)
         .order_by(NotificationDelivery.created_at.desc(), NotificationDelivery.id.desc())
@@ -225,8 +225,8 @@ def list_notifications(
             job_id=delivery.job_id,
             task_name=task.name if task is not None else None,
             channel_id=delivery.channel_id,
-            channel_name=channel.name,
-            platform=channel.platform,
+            channel_name=channel.name if channel is not None else None,
+            platform=channel.platform if channel is not None else None,
             state=delivery.state,
             attempts=delivery.attempts,
             last_error=delivery.last_error,
@@ -256,6 +256,8 @@ def retry_notification(
     ).scalar_one_or_none()
     if delivery is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "没有找到这条推送记录。")
+    if delivery.channel_id is None or db.get(NotificationChannel, delivery.channel_id) is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "这条记录的渠道已被删除，不能再发送。")
     push.retry_delivery(db, settings, delivery)
     db.commit()
     return {"ok": True}

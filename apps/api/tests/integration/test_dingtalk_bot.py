@@ -100,8 +100,11 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
     with SessionLocal() as db:
         assert db.execute(select(MonitorTask)).scalar_one().is_active is True
 
-    # 额度
+    # 额度 / 概览
     assert "今日额度" in (dingtalk_bot.handle_message(settings, _message("cid-group", "额度")) or "")
+    overview = dingtalk_bot.handle_message(settings, _message("cid-group", "概览")) or ""
+    assert "监控任务 1 个启用" in overview
+    assert "补货" in overview
 
     # 检查：未连接 Nike 时给出可操作的提示
     assert "连接 Nike 账号" in (

@@ -287,19 +287,21 @@ export function PushChannelsCard() {
           records.map((record) => (
             <Space key={record.id} wrap size={8} align="center">
               <Typography.Text type="secondary">
-                {`${formatDate(record.created_at)} · ${record.task_name ?? TASK_LIST.manualCheck} · ${record.channel_name}`}
+                {`${formatDate(record.created_at)} · ${record.task_name ?? TASK_LIST.manualCheck} · ${record.channel_name ?? PUSH.channelRemoved}`}
               </Typography.Text>
               <Tag color={STATE_COLOR[record.state]}>{STATE_LABEL[record.state]}</Tag>
               {record.last_error ? (
                 <Typography.Text type="warning">{record.last_error}</Typography.Text>
               ) : null}
-              <Button
-                size="small"
-                loading={retry.isPending && retry.variables === record.id}
-                onClick={() => retry.mutate(record.id)}
-              >
-                {PUSH.retry}
-              </Button>
+              {record.channel_id ? (
+                <Button
+                  size="small"
+                  loading={retry.isPending && retry.variables === record.id}
+                  onClick={() => retry.mutate(record.id)}
+                >
+                  {PUSH.retry}
+                </Button>
+              ) : null}
             </Space>
           ))
         )}
