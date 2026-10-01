@@ -8,7 +8,14 @@ from sqlalchemy import select
 
 from app.config import Settings
 from app.db import SessionLocal
-from app.models import DingTalkBotLink, MonitorTask, NotificationChannel, ScanJob, Style
+from app.models import (
+    DingTalkBotLink,
+    MonitorTask,
+    NotificationChannel,
+    ScanJob,
+    ScanJobStore,
+    Style,
+)
 from app.services import dingtalk_bot
 
 from .helpers import make_store, make_style, make_tenant, make_user, store_credential
@@ -205,6 +212,17 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
     assert "还在排队或检查中" in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "重试失败 钉钉任务")) or ""
     )
+    # 失败门店：先造一家失败（消息截断到 40 字）
+    with SessionLocal() as db:
+        row = db.execute(
+            select(ScanJobStore).join(ScanJob, ScanJob.id == ScanJobStore.job_id)
+        ).scalars().first()
+        row.status = "FAILED"
+        row.error_code = "TRANSPORT_ERROR"
+        row.message = "上游连接超时"
+        db.commit()
+    failed = dingtalk_bot.handle_message(settings, _message("cid-group", "失败门店 钉钉任务")) or ""
+    assert "1 家失败" in failed and "QA900" in failed and "重试失败" in failed
     # 注销：两步确认
     assert "确认注销" in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "注销")) or ""

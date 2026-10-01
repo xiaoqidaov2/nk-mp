@@ -41,7 +41,9 @@ from app.models import (
     NotificationChannel,
     NotificationPlatform,
     ScanJob,
+    ScanJobStore,
     Store,
+    StoreJobStatus,
     Style,
     Tenant,
     UsageDaily,
@@ -68,6 +70,7 @@ HELP_TEXT = (
     "· 盯 <门店…> 到 <任务名>：改成只盯这几家；也可以：盯 全部门店 到 <任务名>\n"
     "· 通知 <任务名> [补货开/关 售罄开/关 变价开/关]：看/改提醒开关\n"
     "· 上次检查 [任务名]：看最近一次检查结果\n"
+    "· 失败门店 [任务名]：看上次失败的门店和原因\n"
     "· 重试失败 [任务名]：把上次失败的门店再跑一遍\n"
     "· 删除 <任务名>：删除任务（要写完整名字）\n"
     "· 额度：今天用掉的检查额度\n"
@@ -842,6 +845,43 @@ def _overview_reply(session: Session, owner_user_id) -> str:
     return "\n".join(lines)
 
 
+def _failed_stores_reply(session: Session, owner_user_id, name: str) -> str:
+    task, problem = _pick_task(session, owner_user_id, name)
+    if problem:
+        return problem
+    job = _latest_job(session, task.id)
+    if job is None:
+        return f"「{task.name}」还没有检查过。发「检查 {task.name}」马上跑一次。"
+    failed_statuses = [StoreJobStatus.FAILED.value, StoreJobStatus.UNKNOWN.value]
+    total = int(
+        session.execute(
+            select(func.count())
+            .select_from(ScanJobStore)
+            .where(ScanJobStore.job_id == job.id, ScanJobStore.status.in_(failed_statuses))
+        ).scalar_one()
+    )
+    if total == 0:
+        return f"「{task.name}」上次检查没有失败的门店。"
+    rows = (
+        session.execute(
+            select(ScanJobStore, Store)
+            .join(Store, Store.id == ScanJobStore.store_id)
+            .where(ScanJobStore.job_id == job.id, ScanJobStore.status.in_(failed_statuses))
+            .order_by(ScanJobStore.id)
+            .limit(10)
+        )
+        .all()
+    )
+    lines = [f"「{task.name}」上次检查有 {total} 家失败："]
+    for row, store in rows:
+        detail = (row.message or row.error_code or "未知原因")[:40]
+        lines.append(f"· {store.store_code}（{detail}）")
+    if total > len(rows):
+        lines.append(f"…另有 {total - len(rows)} 家")
+    lines.append(f"发「重试失败 {task.name}」可以把它们再跑一遍。")
+    return "\n".join(lines)
+
+
 def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text: str) -> str:
     """已绑定会话里的关键字路由（纯函数，方便单测）。"""
     command = text.strip()
@@ -896,6 +936,9 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
     arg = _command_arg(command, "重试失败")
     if arg is not None:
         return _retry_failed_reply(session, settings, link.owner_user_id, arg)
+    arg = _command_arg(command, "失败门店")
+    if arg is not None:
+        return _failed_stores_reply(session, link.owner_user_id, arg)
     arg = _command_arg(command, "删除")
     if arg is not None:
         return _delete_task(session, link.owner_user_id, arg)
