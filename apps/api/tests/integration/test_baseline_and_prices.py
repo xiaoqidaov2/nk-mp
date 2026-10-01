@@ -15,8 +15,9 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import ChangeEvent, Observation, ObservationLatest, Trust
+from app.models import ChangeEvent, GtinStructure, Observation, ObservationLatest, Store, Style, Trust
 from app.services.observations import persist_observations
+from app.services.probe import _ensure_structure_row
 
 from .helpers import make_store, make_style, make_tenant, make_user, store_credential
 
@@ -168,3 +169,24 @@ def test_missing_price_clears_stale_price_and_restores_without_false_change(worl
     assert summary.price_change == 0
     with SessionLocal() as db:
         assert db.execute(select(ObservationLatest)).scalar_one().total_price == 999.0
+
+
+def test_structure_row_creation_survives_a_concurrent_insert(world) -> None:
+    """两个 worker 同时抓同一 (owner, store, style) 时，后到的插入不能炸唯一约束。"""
+    with SessionLocal() as db:
+        store = db.get(Store, world["store_id"])
+        style = db.get(Style, world["style_id"])
+        first = _ensure_structure_row(db, store, style)
+        db.commit()
+        first_id = first.id
+
+    with SessionLocal() as db:
+        store = db.get(Store, world["store_id"])
+        style = db.get(Style, world["style_id"])
+        second = _ensure_structure_row(db, store, style)
+        db.commit()
+        assert second.id == first_id
+
+    with SessionLocal() as db:
+        rows = db.execute(select(GtinStructure)).scalars().all()
+        assert len(rows) == 1

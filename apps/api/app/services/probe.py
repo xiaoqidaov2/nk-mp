@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -35,6 +36,32 @@ def _hash_structure(structure: SizeStructure) -> str:
         [[entry.size_label, entry.gtin] for entry in structure.sizes], ensure_ascii=False
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _ensure_structure_row(session: Session, store: Store, style: Style) -> GtinStructure:
+    """Get the (owner, store, style) structure row, creating it if missing.
+
+    Two workers can probe the same store/style at the same time; the unique
+    constraint makes the losing insert a no-op instead of an IntegrityError.
+    """
+    session.execute(
+        pg_insert(GtinStructure)
+        .values(
+            owner_user_id=store.owner_user_id,
+            store_id=store.id,
+            style_id=style.id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["owner_user_id", "store_id", "style_id"]
+        )
+    )
+    return session.execute(
+        select(GtinStructure).where(
+            GtinStructure.owner_user_id == store.owner_user_id,
+            GtinStructure.store_id == store.id,
+            GtinStructure.style_id == style.id,
+        )
+    ).scalar_one()
 
 
 def get_or_fetch_structure(
@@ -75,10 +102,7 @@ def get_or_fetch_structure(
         changed = _hash_structure(structure) != cached.structure_hash
 
     if cached is None:
-        cached = GtinStructure(
-            owner_user_id=store.owner_user_id, store_id=store.id, style_id=style.id
-        )
-        session.add(cached)
+        cached = _ensure_structure_row(session, store, style)
     cached.status = structure.status
     cached.structure_hash = _hash_structure(structure)
     cached.sizes = [
