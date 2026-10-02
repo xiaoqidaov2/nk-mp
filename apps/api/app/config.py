@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     nike_sms_session_ttl_seconds: int = 300
     nike_sms_verify_limit: int = 5
     nike_sms_lock_seconds: int = 900
+
+    # 密码登录失败限速：连续失败达到次数后锁定一段时间。
+    login_max_attempts: int = 5
+    login_lock_seconds: int = 300
     nike_sms_operation_timeout_seconds: int = 60
     nike_sms_trusted_proxy_cidrs: list[str] = []
 

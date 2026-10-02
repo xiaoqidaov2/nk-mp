@@ -276,6 +276,14 @@ class NotificationChannelIn(BaseModel):
     name: str = Field(default="", max_length=64)
     fields: dict[str, str] = Field(default_factory=dict)
 
+    @field_validator("fields")
+    @classmethod
+    def _cap_field_values(cls, value: dict[str, str]) -> dict[str, str]:
+        for item in value.values():
+            if len(item) > 512:
+                raise ValueError("单个字段最多 512 个字符")
+        return value
+
 
 class NotificationChannelPatch(BaseModel):
     name: str | None = Field(default=None, max_length=64)

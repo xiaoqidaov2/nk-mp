@@ -271,8 +271,15 @@ def _reject_private_host(url: str, scheme: str, settings: Settings) -> None:
             )
 
 
+MAX_TARGET_LENGTH = 512
+
+
 def validate_target(url: str, settings: Settings) -> None:
     """Reject schemes we do not support, private hosts and unknown targets."""
+    if len(url) > MAX_TARGET_LENGTH:
+        raise PushTargetError(
+            PUSH_TARGET_INVALID, f"渠道地址太长（最多 {MAX_TARGET_LENGTH} 个字符）。"
+        )
     scheme = urlsplit(url).scheme.lower()
     if scheme not in ALLOWED_SCHEMES:
         raise PushTargetError(

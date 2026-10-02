@@ -46,7 +46,28 @@ def login(
     user = db.execute(
         select(User).where(User.email == payload.email.strip().lower())
     ).scalar_one_or_none()
+    now = datetime.now(UTC)
+    if user is not None and user.login_locked_until is not None and user.login_locked_until > now:
+        retry = int((user.login_locked_until - now).total_seconds()) + 1
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "登录尝试过多，请稍后再试",
+            headers={"Retry-After": str(retry)},
+        )
     if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
+        if user is not None:
+            # 只对已知账号计数：不存在的邮箱无从锁定，也不泄漏账号是否存在。
+            user.failed_login_attempts = int(user.failed_login_attempts or 0) + 1
+            if user.failed_login_attempts >= settings.login_max_attempts:
+                user.failed_login_attempts = 0
+                user.login_locked_until = now + timedelta(seconds=settings.login_lock_seconds)
+                db.commit()
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "登录尝试过多，请稍后再试",
+                    headers={"Retry-After": str(settings.login_lock_seconds)},
+                )
+            db.commit()
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "邮箱或密码不正确")
     tenant = db.execute(select(Tenant).where(Tenant.id == user.tenant_id)).scalar_one_or_none()
     if tenant is None or not tenant.is_active:
@@ -62,7 +83,9 @@ def login(
         expires_at=datetime.now(UTC) + timedelta(hours=settings.session_ttl_hours),
     )
     db.add(record)
-    user.last_login_at = datetime.now(UTC)
+    user.last_login_at = now
+    user.failed_login_attempts = 0
+    user.login_locked_until = None
     db.flush()
     # Commit before returning: the session row must be visible to the very
     # next request; teardown-time commits can land after the response.

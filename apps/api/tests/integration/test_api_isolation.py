@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy import select
 
 from app.api.deps import CSRF_COOKIE, SESSION_COOKIE
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import ChangeEvent, MonitorTask, Role
+from app.models import ChangeEvent, MonitorTask, Role, User
 from app.services.jobs import enqueue_job
 
 from .helpers import (
@@ -262,3 +265,75 @@ def test_scan_list_filters_by_task_id(client) -> None:
     all_ids = {row["id"] for row in client.get("/api/v1/scans").json()}
     assert {str(linked_id), str(manual_id)} <= all_ids
     assert client.get(f"/api/v1/scans?task_id={uuid.uuid4()}").json() == []
+
+
+def test_login_locks_after_repeated_failures(client) -> None:
+    """连续输错密码会触发短暂锁定；锁定期过后正确密码仍可登录。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        make_user(db, tenant, email="lock@example.com")
+        db.commit()
+
+    for _ in range(settings.login_max_attempts - 1):
+        response = client.post(
+            "/api/v1/auth/login", json={"email": "lock@example.com", "password": "wrong"}
+        )
+        assert response.status_code == 401
+
+    # 达到阈值的那一次直接进入锁定
+    response = client.post(
+        "/api/v1/auth/login", json={"email": "lock@example.com", "password": "wrong"}
+    )
+    assert response.status_code == 429
+    assert response.headers.get("Retry-After")
+    assert "尝试过多" in response.json()["detail"]
+
+    # 锁定期内即使密码正确也拒绝
+    response = client.post(
+        "/api/v1/auth/login", json={"email": "lock@example.com", "password": "test-password"}
+    )
+    assert response.status_code == 429
+
+    # 手动解除锁定后，正确密码登录会清零计数
+    with SessionLocal() as db:
+        user = db.execute(select(User).where(User.email == "lock@example.com")).scalar_one()
+        user.login_locked_until = datetime.now(UTC) - timedelta(seconds=1)
+        db.commit()
+    assert login(client, "lock@example.com") is not None
+
+    # 成功一次后再错一次，计数从新窗口开始（不应立即锁定）
+    response = client.post(
+        "/api/v1/auth/login", json={"email": "lock@example.com", "password": "wrong"}
+    )
+    assert response.status_code == 401
+
+
+def test_unknown_email_is_never_locked(client) -> None:
+    for _ in range(10):
+        response = client.post(
+            "/api/v1/auth/login", json={"email": "ghost@example.com", "password": "wrong"}
+        )
+        assert response.status_code == 401
+
+
+def test_oversized_channel_field_is_rejected(client) -> None:
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        make_user(db, tenant, email="cap@example.com")
+        db.commit()
+    csrf = login(client, "cap@example.com")
+    response = client.post(
+        "/api/v1/me/notification-channels",
+        json={"platform": "custom", "name": "too-long", "fields": {"url": "json://" + "a" * 600}},
+        headers=auth_headers(csrf),
+    )
+    assert response.status_code == 422
+
+
+def test_overlong_target_is_rejected_by_the_validator() -> None:
+    from app.services import push
+
+    with pytest.raises(push.PushTargetError) as excinfo:
+        push.validate_target("json://httpbin.org/post?x=" + "a" * 600, get_settings())
+    assert excinfo.value.code == push.PUSH_TARGET_INVALID
