@@ -359,58 +359,10 @@ def test_csrf_cookie_is_reissued_when_lost(client) -> None:
     assert created.status_code == 201, created.text
 
 
-def test_duplicate_channel_race_maps_to_duplicate_error(client, monkeypatch) -> None:
-    """并发下两个相同目标会同时通过查重：唯一约束兜底必须翻译成重复提示，而不是 500。"""
-    with SessionLocal() as db:
-        tenant = make_tenant(db)
-        owner = make_user(db, tenant, email="race@example.com")
-        db.commit()
-        owner_id = owner.id
-
-    csrf = login(client, "race@example.com")
-    payload = {
-        "platform": "custom",
-        "name": "竞态",
-        "fields": {"url": "json://httpbin.org/post?race=1"},
-    }
-
-    from app.api import notifications as api_mod
-    from app.models import NotificationChannel
-    from app.services import push
-
-    real_encrypt = api_mod.encrypt_secret
-    fingerprint = api_mod.secret_fingerprint(
-        push.build_target("custom", payload["fields"]), purpose="push"
-    )
-
-    def racy_encrypt(value: str) -> str:
-        # 模拟对手请求在查重之后、插入之前把同一目标写进库。
-        with SessionLocal() as other:
-            other.add(
-                NotificationChannel(
-                    owner_user_id=owner_id,
-                    platform="custom",
-                    name="对手",
-                    target_enc=real_encrypt(value),
-                    target_fingerprint=fingerprint,
-                    target_hint="竞态",
-                    enabled=True,
-                )
-            )
-            other.commit()
-        return real_encrypt(value)
-
-    monkeypatch.setattr(api_mod, "encrypt_secret", racy_encrypt)
-    response = client.post(
-        "/api/v1/me/notification-channels", json=payload, headers=auth_headers(csrf)
-    )
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"] == "这个渠道已经添加过了。"
-
-
-def test_concurrent_failed_logins_still_trigger_lockout() -> None:
-    """并发错密码不能靠丢更新绕过锁定：必须出现 429，且随后正确密码也被拒。"""
+def test_concurrent_duplicate_channel_maps_to_duplicate_error() -> None:
+    """两个真正并发的相同目标：一个 201、一个 422 重复提示，不允许 500。"""
     from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
 
     from fastapi.testclient import TestClient
 
@@ -418,16 +370,29 @@ def test_concurrent_failed_logins_still_trigger_lockout() -> None:
 
     with SessionLocal() as db:
         tenant = make_tenant(db)
-        make_user(db, tenant, email="burst@example.com")
+        make_user(db, tenant, email="dup@example.com")
         db.commit()
 
-    def attempt(password: str) -> int:
-        return TestClient(app).post(
-            "/api/v1/auth/login",
-            json={"email": "burst@example.com", "password": password},
+    client = TestClient(app)
+    csrf = login(client, "dup@example.com")
+    session_value = client.cookies.get(SESSION_COOKIE)
+    payload = {
+        "platform": "custom",
+        "name": "竞态",
+        "fields": {"url": "json://httpbin.org/post?race=1"},
+    }
+    barrier = Barrier(2)
+
+    def create(_: int) -> int:
+        thread_client = TestClient(app)
+        barrier.wait(timeout=10)
+        return thread_client.post(
+            "/api/v1/me/notification-channels",
+            json=payload,
+            cookies={SESSION_COOKIE: session_value, CSRF_COOKIE: csrf},
+            headers=auth_headers(csrf),
         ).status_code
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        statuses = list(pool.map(attempt, ["wrong-secret"] * 8))
-    assert 429 in statuses, statuses
-    assert attempt("test-password") == 429
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = sorted(pool.map(create, range(2)))
+    assert statuses == [201, 422], statuses

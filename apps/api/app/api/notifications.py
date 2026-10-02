@@ -112,6 +112,8 @@ def create_notification_channel(
         push.validate_target(target, settings)
     except push.PushTargetError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail) from exc
+    # 行锁把同一用户的并发创建串行化，否则"先查数量再插入"会突破渠道上限。
+    db.execute(select(User.id).where(User.id == user.id).with_for_update())
     total = db.execute(
         select(func.count())
         .select_from(NotificationChannel)

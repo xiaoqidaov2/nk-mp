@@ -95,6 +95,8 @@ UNLINKED_TEXT = "已解除本会话的绑定；提醒不会再发到这里。"
 
 def issue_code(session: Session, settings: Settings, user_id) -> DingTalkLinkCode:
     """生成/刷新该用户的一次性绑定码。"""
+    # 行锁串行化同一用户的并发发放：否则两个请求都会先查不到再插入，撞主键 500。
+    session.execute(select(User.id).where(User.id == user_id).with_for_update())
     ttl = timedelta(seconds=settings.dingtalk_link_code_ttl_seconds)
     active = {
         row.code

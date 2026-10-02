@@ -12,6 +12,7 @@ from app.db import SessionLocal
 from app.models import (
     ChangeEvent,
     DingTalkBotLink,
+    DingTalkLinkCode,
     MonitorTask,
     NotificationChannel,
     ScanJob,
@@ -358,3 +359,36 @@ def test_bot_links_a_single_chat_and_replies_to_the_same_person() -> None:
         assert channel.target_hint.startswith("钉钉单聊 · ding_bot")
         # 单聊目标按 userIds 发送：hint 里带的是钉钉用户 ID 尾号
         assert "7041" in channel.target_hint
+
+
+def test_concurrent_link_code_issuance_keeps_single_row() -> None:
+    """并发发放绑定码不能撞主键：串行化后始终只有一行。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    settings = _settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="code@example.com")
+        db.commit()
+        user_id = user.id
+
+    barrier = Barrier(6)
+
+    def issue(_: int) -> None:
+        barrier.wait(timeout=10)
+        with SessionLocal() as session:
+            dingtalk_bot.issue_code(session, settings, user_id)
+            session.commit()
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(issue, range(6)))
+
+    with SessionLocal() as db:
+        rows = (
+            db.execute(select(DingTalkLinkCode).where(DingTalkLinkCode.owner_user_id == user_id))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].expires_at > datetime.now(UTC)
