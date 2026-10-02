@@ -100,7 +100,6 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
   - `/__reset` 会清空 `pushes`，因此每次 smoke 都从空列表开始。
 
 ## smoke 断言（`qa/smoke.py`）
-
 1. ops/A/B 各自 `POST /me/nike-auth/sessions`（`consent=true`、uuid `request_id`）
    → 201/`CODE_SENT`，`verify {code:"123456"}` → 200 且 `ACTIVE`/`EXPIRING`。
 2. ops 执行 `/ops/stores/sync`；随后保留完整只读采集闭环：建任务 → 扫描 → 矩阵
@@ -122,6 +121,18 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
 因此 smoke 让 ops 用内置的 `+8613800000000`（default 身份，保留场景语义），A/B 用
 stub 登记的两个号码；smoke 中专门断言了「第二个账号绑定同一手机号被拒」，作为该
 约束的证据。
+
+## 浏览器测试电池（`qa/browser/`）
+
+把对抗性浏览器检查做成可复用脚本：对着任意部署（本地 / QA / 生产）都能一键跑，失败退出码 1。
+
+```bash
+cd qa/browser && npm install
+NKMP_BROWSER_URL=https://<目标> NKMP_BROWSER_EMAIL=<账号> NKMP_BROWSER_PASSWORD=<密码> npm run battery
+```
+
+覆盖：连点保存不重复、CSRF 丢失自愈、恶意渠道名转义、超长名称拒绝、非法深链空态、
+控制台/混合内容巡检、双标签页登出传播。用例 id、变量与约定见 `qa/browser/README.md`。
 
 ## 上游模式：默认真实 Nike，离线 smoke 显式叠加 stub
 

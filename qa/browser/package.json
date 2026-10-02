@@ -1,0 +1,12 @@
+{
+  "name": "nk-mp-browser-battery",
+  "private": true,
+  "type": "module",
+  "description": "参数化浏览器健壮性测试电池（开发/QA 用，不参与运行时）",
+  "scripts": {
+    "battery": "node battery.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}
