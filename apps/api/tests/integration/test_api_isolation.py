@@ -337,3 +337,23 @@ def test_overlong_target_is_rejected_by_the_validator() -> None:
     with pytest.raises(push.PushTargetError) as excinfo:
         push.validate_target("json://httpbin.org/post?x=" + "a" * 600, get_settings())
     assert excinfo.value.code == push.PUSH_TARGET_INVALID
+
+
+def test_csrf_cookie_is_reissued_when_lost(client) -> None:
+    """CSRF cookie 丢失后，任意一次带会话的请求都会补发，无需重新登录。"""
+    _seed_two_tenants()
+    login(client, "a@example.com")
+    client.cookies.delete(CSRF_COOKIE)
+    assert not client.cookies.get(CSRF_COOKIE)
+
+    response = client.get("/api/v1/auth/me")
+    assert response.status_code == 200
+    reissued = client.cookies.get(CSRF_COOKIE)
+    assert reissued
+
+    created = client.post(
+        "/api/v1/tasks",
+        json={"name": "补发后创建", "store_codes": ["S001"], "style_codes": ["DN3707-202"]},
+        headers={"X-CSRF-Token": reissued},
+    )
+    assert created.status_code == 201, created.text

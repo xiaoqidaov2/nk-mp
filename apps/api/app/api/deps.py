@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from fastapi import Cookie, Depends, Header, HTTPException, Request, status
+from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.db import SessionLocal
 from app.models import AuthSession, Role, Tenant, User
-from app.security import csrf_matches, token_fingerprint
+from app.security import csrf_matches, csrf_token_for, token_fingerprint
 
 SESSION_COOKIE = "nike_mp_session"
 CSRF_HEADER = "X-CSRF-Token"
@@ -34,8 +34,11 @@ def get_db() -> Session:
 
 
 def get_current_session(
+    request: Request,
+    response: Response,
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE),
     db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> tuple[User, AuthSession]:
     if not session_token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
@@ -49,6 +52,20 @@ def get_current_session(
     user = db.execute(select(User).where(User.id == record.user_id)).scalar_one_or_none()
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user disabled")
+    # CSRF cookie 丢失（浏览器清理/裁剪）时自动补发：会话仍然有效就恢复写入能力，
+    # 否则用户会一直吃 403，只能重新登录。
+    if not request.cookies.get(CSRF_COOKIE):
+        remaining = int((record.expires_at - datetime.now(UTC)).total_seconds())
+        if remaining > 0:
+            response.set_cookie(
+                CSRF_COOKIE,
+                csrf_token_for(session_token, record.csrf_secret),
+                httponly=False,
+                samesite="lax",
+                secure=settings.cookie_secure,
+                max_age=remaining,
+                path="/",
+            )
     return user, record
 
 
