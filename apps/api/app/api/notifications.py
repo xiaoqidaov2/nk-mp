@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.api.deps import get_current_session, get_db, require_self_write, settings_dep
 from app.config import Settings
@@ -170,7 +171,11 @@ def update_notification_channel(
         channel.name = body.name.strip()[:64]
     if body.enabled is not None:
         channel.enabled = body.enabled
-    db.commit()
+    try:
+        db.commit()
+    except StaleDataError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "没有找到这个渠道。") from exc
     return _channel_out(channel)
 
 
@@ -183,6 +188,7 @@ def delete_notification_channel(
     user, _ = payload
     channel = _load_channel(db, user, channel_id)
     db.delete(channel)
+    # 并发删除只会少删一行（SQLAlchemy 对 0 行 DELETE 仅告警），删除本身就是幂等的。
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

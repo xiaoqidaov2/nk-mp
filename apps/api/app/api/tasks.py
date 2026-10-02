@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.api.deps import get_current_session, get_db, require_write, settings_dep
 from app.api.http_errors import credential_error_response
@@ -168,6 +169,9 @@ def update_task(
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "同名任务已存在") from exc
+    except StaleDataError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在") from exc
     return _to_out(task)
 
 
@@ -180,4 +184,5 @@ def delete_task(
     task = _load(db, user, task_id)
     db.delete(task)
     # Commit before the 204: the row must already be gone for the next read.
+    # 并发删除只会少删一行（SQLAlchemy 对 0 行 DELETE 仅告警），删除本身就是幂等的。
     db.commit()

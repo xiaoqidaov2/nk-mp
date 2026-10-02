@@ -6,12 +6,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.api.deps import CSRF_COOKIE, SESSION_COOKIE
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import ChangeEvent, MonitorTask, Role, User
+from app.models import ChangeEvent, MonitorTask, NotificationChannel, Role, User
 from app.services.jobs import enqueue_job
 
 from .helpers import (
@@ -396,3 +396,137 @@ def test_concurrent_duplicate_channel_maps_to_duplicate_error() -> None:
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = sorted(pool.map(create, range(2)))
     assert statuses == [201, 422], statuses
+
+
+def test_task_update_after_concurrent_delete_is_404(client, monkeypatch) -> None:
+    """并发删除后的 PATCH 必须给 404，而不是 StaleDataError 500。"""
+    _seed_two_tenants()
+    csrf = login(client, "a@example.com")
+    created = client.post(
+        "/api/v1/tasks",
+        json={"name": "竞态更新", "store_codes": ["S001"], "style_codes": ["DN3707-202"]},
+        headers=auth_headers(csrf),
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    from app.api import tasks as api_mod
+
+    real_load = api_mod._load
+
+    def racy_load(db, user, task_uuid):
+        task = real_load(db, user, task_uuid)
+        with SessionLocal() as other:
+            other.execute(delete(MonitorTask).where(MonitorTask.id == task_uuid))
+            other.commit()
+        return task
+
+    monkeypatch.setattr(api_mod, "_load", racy_load)
+    response = client.patch(
+        f"/api/v1/tasks/{task_id}", json={"name": "改不到了"}, headers=auth_headers(csrf)
+    )
+    assert response.status_code == 404, response.text
+
+
+def test_task_delete_after_concurrent_delete_is_idempotent(client, monkeypatch) -> None:
+    """两个 DELETE 撞车：输家幂等返回 204，而不是 500。"""
+    _seed_two_tenants()
+    csrf = login(client, "a@example.com")
+    created = client.post(
+        "/api/v1/tasks",
+        json={"name": "竞态删除", "store_codes": ["S001"], "style_codes": ["DN3707-202"]},
+        headers=auth_headers(csrf),
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    from app.api import tasks as api_mod
+
+    real_load = api_mod._load
+
+    def racy_load(db, user, task_uuid):
+        task = real_load(db, user, task_uuid)
+        with SessionLocal() as other:
+            other.execute(delete(MonitorTask).where(MonitorTask.id == task_uuid))
+            other.commit()
+        return task
+
+    monkeypatch.setattr(api_mod, "_load", racy_load)
+    response = client.delete(f"/api/v1/tasks/{task_id}", headers=auth_headers(csrf))
+    # 行已被并发删掉时本次 DELETE 只是少删一行（ORM 仅告警）：幂等成功。
+    assert response.status_code == 204, response.text
+
+
+def test_channel_update_after_concurrent_delete_is_404(client, monkeypatch) -> None:
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        make_user(db, tenant, email="chan-race@example.com")
+        db.commit()
+    csrf = login(client, "chan-race@example.com")
+    created = client.post(
+        "/api/v1/me/notification-channels",
+        json={
+            "platform": "custom",
+            "name": "竞态渠道",
+            "fields": {"url": "json://httpbin.org/post?chan-race=1"},
+        },
+        headers=auth_headers(csrf),
+    )
+    assert created.status_code == 201, created.text
+    channel_id = created.json()["id"]
+
+    from app.api import notifications as api_mod
+
+    real_load = api_mod._load_channel
+
+    def racy_load(db, user, channel_uuid):
+        channel = real_load(db, user, channel_uuid)
+        with SessionLocal() as other:
+            other.execute(delete(NotificationChannel).where(NotificationChannel.id == channel_uuid))
+            other.commit()
+        return channel
+
+    monkeypatch.setattr(api_mod, "_load_channel", racy_load)
+    response = client.patch(
+        f"/api/v1/me/notification-channels/{channel_id}",
+        json={"name": "改不到了"},
+        headers=auth_headers(csrf),
+    )
+    assert response.status_code == 404, response.text
+
+
+def test_channel_delete_after_concurrent_delete_is_idempotent(client, monkeypatch) -> None:
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        make_user(db, tenant, email="chan-race2@example.com")
+        db.commit()
+    csrf = login(client, "chan-race2@example.com")
+    created = client.post(
+        "/api/v1/me/notification-channels",
+        json={
+            "platform": "custom",
+            "name": "竞态渠道二",
+            "fields": {"url": "json://httpbin.org/post?chan-race=2"},
+        },
+        headers=auth_headers(csrf),
+    )
+    assert created.status_code == 201, created.text
+    channel_id = created.json()["id"]
+
+    from app.api import notifications as api_mod
+
+    real_load = api_mod._load_channel
+
+    def racy_load(db, user, channel_uuid):
+        channel = real_load(db, user, channel_uuid)
+        with SessionLocal() as other:
+            other.execute(delete(NotificationChannel).where(NotificationChannel.id == channel_uuid))
+            other.commit()
+        return channel
+
+    monkeypatch.setattr(api_mod, "_load_channel", racy_load)
+    response = client.delete(
+        f"/api/v1/me/notification-channels/{channel_id}", headers=auth_headers(csrf)
+    )
+    # 行已被并发删掉时本次 DELETE 只是少删一行（ORM 仅告警）：幂等成功。
+    assert response.status_code == 204, response.text
