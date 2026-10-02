@@ -32,7 +32,9 @@ const TasksPage = lazy(() => import("./pages/TasksPage").then((m) => ({ default:
 function PageFallback() {
   return (
     <div style={{ display: "grid", placeItems: "center", padding: 48 }}>
-      <Spin tip="加载中" />
+      <Spin tip="加载中">
+        <div style={{ minHeight: 120, minWidth: 240 }} />
+      </Spin>
     </div>
   );
 }
@@ -43,7 +45,9 @@ export default function App() {
   if (loading) {
     return (
       <div style={{ display: "grid", placeItems: "center", height: "100vh" }}>
-        <Spin size="large" tip="正在校验会话" />
+        <Spin size="large" tip="正在校验会话">
+          <div style={{ minHeight: 120, minWidth: 240 }} />
+        </Spin>
       </div>
     );
   }
