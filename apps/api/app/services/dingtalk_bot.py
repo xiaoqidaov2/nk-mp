@@ -760,10 +760,13 @@ def _last_check_reply(session: Session, owner_user_id, name: str) -> str:
     stamp = when.astimezone(_CST).strftime("%m-%d %H:%M") if when else "—"
     lines = [
         f"「{task.name}」上次检查：{label}（{stamp}）。",
-        f"门店 {job.done_stores}/{job.total_stores} 完成，{job.failed_stores} 家失败。",
+        (
+            f"门店 {job.total_stores} 家：成功 {job.done_stores}、"
+            f"失败 {job.failed_stores}、没结果 {job.unknown_stores}。"
+        ),
     ]
-    if job.failed_stores and job.status not in {"QUEUED", "RUNNING"}:
-        lines.append(f"发「重试失败 {task.name}」可以把失败的再跑一遍。")
+    if (job.failed_stores or job.unknown_stores) and job.status not in {"QUEUED", "RUNNING"}:
+        lines.append(f"发「重试失败 {task.name}」可以把没结果的门店再跑一遍。")
     return "\n".join(lines)
 
 
@@ -786,7 +789,7 @@ def _retry_failed_reply(session: Session, settings: Settings, owner_user_id, nam
     if count == 0:
         return f"「{task.name}」上次没有失败的门店，不用重试。"
     session.commit()
-    return f"「{task.name}」已重试 {count} 家失败门店，结果会推到这里。"
+    return f"「{task.name}」已重试 {count} 家没结果或失败的门店，结果会推到这里。"
 
 
 def _disconnect_reply(session: Session, settings: Settings, owner_user_id, command: str) -> str | None:
@@ -876,12 +879,35 @@ def _failed_stores_reply(session: Session, owner_user_id, name: str) -> str:
     )
     lines = [f"「{task.name}」上次检查有 {total} 家失败："]
     for row, store in rows:
-        detail = (row.message or row.error_code or "未知原因")[:40]
-        lines.append(f"· {store.store_code}（{detail}）")
+        lines.append(f"· {store.store_code}（{_failure_text(row.error_code, row.message)}）")
     if total > len(rows):
         lines.append(f"…另有 {total - len(rows)} 家")
     lines.append(f"发「重试失败 {task.name}」可以把它们再跑一遍。")
     return "\n".join(lines)
+
+
+_FAILURE_LABEL = {
+    "EMPTY_COMPLETED": "门店没有返回有效数据",
+    "POLL_TIMEOUT": "等门店结果超时",
+    "WAF_CHALLENGE": "门店接口要求人机校验，稍后会自动再试",
+    "AUTH_REQUIRED": "Nike 连接需要重新验证",
+    "TRANSPORT_ERROR": "网络或上游超时",
+    "BATCH_SUSPECT": "返回的数据看起来不完整",
+    "ITEM_QUANTITY_LIMIT": "门店临时限流",
+    "STRUCTURE_MISSING": "这个货号在该店没有尺码数据",
+    "UNEXPECTED_STATUS": "门店返回了预期外的状态",
+    "UNKNOWN_ERROR_CODE": "上游返回未知原因",
+    "BUDGET_EXHAUSTED": "今日额度用完了",
+    "NIKE_CREDENTIAL_REQUIRED": "需要先连接 Nike 账号",
+    "NIKE_REAUTH_REQUIRED": "Nike 连接需要重新验证",
+}
+
+
+def _failure_text(code: str | None, message: str | None) -> str:
+    """失败原因优先用中文标签，未收录的代码才回落到原始信息。"""
+    if code and code in _FAILURE_LABEL:
+        return _FAILURE_LABEL[code]
+    return (message or code or "未知原因")[:40]
 
 
 _AVAILABILITY_LABEL = {

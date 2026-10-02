@@ -231,6 +231,19 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
         db.commit()
     failed = dingtalk_bot.handle_message(settings, _message("cid-group", "失败门店 钉钉任务")) or ""
     assert "1 家失败" in failed and "QA900" in failed and "重试失败" in failed
+    # 已知错误码显示中文标签，而不是原始英文
+    assert "网络或上游超时" in failed and "TRANSPORT_ERROR" not in failed
+    # 部分完成：没结果的门店要有独立计数，重试后清零
+    with SessionLocal() as db:
+        job_row = db.execute(select(ScanJob)).scalar_one()
+        job_row.status = "PARTIAL"
+        job_row.unknown_stores = 1
+        db.commit()
+    last = dingtalk_bot.handle_message(settings, _message("cid-group", "上次检查 钉钉任务")) or ""
+    assert "部分完成" in last and "没结果 1" in last
+    assert "已重试 1 家没结果或失败的门店" in (
+        dingtalk_bot.handle_message(settings, _message("cid-group", "重试失败 钉钉任务")) or ""
+    )
     # 注销：两步确认
     assert "确认注销" in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "注销")) or ""
