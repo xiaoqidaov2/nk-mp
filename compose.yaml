@@ -10,6 +10,8 @@ x-api-env: &api-env
   NIKE_MP_DINGTALK_BOT_CLIENT_ID: ${NIKE_MP_DINGTALK_BOT_CLIENT_ID:-}
   NIKE_MP_DINGTALK_BOT_CLIENT_SECRET: ${NIKE_MP_DINGTALK_BOT_CLIENT_SECRET:-}
   NIKE_MP_DINGTALK_LINK_CODE_TTL_SECONDS: ${NIKE_MP_DINGTALK_LINK_CODE_TTL_SECONDS:-900}
+  NIKE_MP_PUBLIC_BASE_URL: ${NIKE_MP_PUBLIC_BASE_URL:-http://127.0.0.1:15173}
+  NIKE_MP_COOKIE_SECURE: ${NIKE_MP_COOKIE_SECURE:-false}
   TZ: Asia/Shanghai
 
 services:
@@ -86,6 +88,9 @@ services:
   web:
     build:
       context: ./apps/web
+    environment:
+      VITE_ALLOWED_HOSTS: ${VITE_ALLOWED_HOSTS:-}
+      VITE_API_TARGET: ${VITE_API_TARGET:-http://api:8000}
     depends_on:
       api:
         condition: service_healthy
