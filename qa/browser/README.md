@@ -27,6 +27,7 @@ npm run battery
 | `NKMP_BROWSER_ONLY` | 空 | 逗号分隔的用例 id；不设则全跑 |
 | `NKMP_BROWSER_INSECURE` | `0` | `1` 接受自签证书（本地 QA 常用） |
 | `NKMP_BROWSER_HEADED` | `0` | `1` 显示浏览器窗口 |
+| `NKMP_BROWSER_DEBUG` | `0` | `1` 打印用例内的分步进度 |
 | `CHROME_PATH` | 自动探测 | Chromium/Chrome 可执行文件 |
 
 ## 用例

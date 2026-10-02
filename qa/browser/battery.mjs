@@ -43,6 +43,7 @@ const CFG = {
   password: process.env.NKMP_BROWSER_PASSWORD ?? "",
   insecure: process.env.NKMP_BROWSER_INSECURE === "1",
   headed: process.env.NKMP_BROWSER_HEADED === "1",
+  debug: process.env.NKMP_BROWSER_DEBUG === "1",
   chrome: defaultChrome(),
   only: (process.env.NKMP_BROWSER_ONLY ?? "")
     .split(",")
@@ -344,7 +345,9 @@ async function caseConsoleScan({ page, consoleErrors, pageErrors }) {
 
 /** 一个标签页退出后，另一个标签页的下一次请求应回到登录页。 */
 async function caseTwoTabLogout({ page, browser }) {
-  const mark = (m) => console.log(`      · ${m}`);
+  const mark = (m) => {
+    if (CFG.debug) console.log(`      · ${m}`);
+  };
   const second = await browser.newPage();
   try {
     await second.setViewport({ width: 1280, height: 900 });
