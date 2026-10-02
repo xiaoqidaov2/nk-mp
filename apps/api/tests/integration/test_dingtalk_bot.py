@@ -47,6 +47,7 @@ def _seed_user() -> tuple[str, str]:
         user = make_user(db, tenant)
         make_store(db, owner=user, code="QA900")
         make_style(db, owner=user, code="DN9999-001")
+        make_style(db, owner=user, code="DN3707-202")
         db.add(
             MonitorTask(
                 tenant_id=tenant.id,
@@ -205,6 +206,13 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
         assert toggled.notify_on_restock is False
         assert toggled.notify_on_sold_out is True
         assert toggled.notify_on_price_change is False
+    # 详情：列任务归属与门店覆盖 / 未收录的货号
+    detail = dingtalk_bot.handle_message(settings, _message("cid-group", "详情 DN3707-202")) or ""
+    assert "在监控任务：钉钉任务" in detail
+    assert "还没有门店检查记录" in detail
+    assert "没有找到货号" in (
+        dingtalk_bot.handle_message(settings, _message("cid-group", "详情 XX-999")) or ""
+    )
     # 上次检查 / 重试失败（钉钉任务此时还在队列里）
     assert "上次检查：排队中" in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "上次检查 钉钉任务")) or ""

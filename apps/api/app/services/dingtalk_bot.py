@@ -40,6 +40,7 @@ from app.models import (
     MonitorTask,
     NotificationChannel,
     NotificationPlatform,
+    ObservationLatest,
     ScanJob,
     ScanJobStore,
     Store,
@@ -75,6 +76,7 @@ HELP_TEXT = (
     "· 删除 <任务名>：删除任务（要写完整名字）\n"
     "· 额度：今天用掉的检查额度\n"
     "· 变化：最近 24 小时的补货、售罄、变价\n"
+    "· 详情 <货号>：某个货号的门店情况\n"
     "· 门店：已登记的门店\n"
     "· 货号：在监控的货号\n"
     "· 状态：Nike 连接状态\n"
@@ -882,6 +884,100 @@ def _failed_stores_reply(session: Session, owner_user_id, name: str) -> str:
     return "\n".join(lines)
 
 
+_AVAILABILITY_LABEL = {
+    "IN_STOCK": "有货",
+    "OUT_OF_STOCK": "无货",
+    "NOT_CARRIED": "未上架",
+}
+
+
+def _style_detail_reply(session: Session, owner_user_id, text: str) -> str:
+    code = text.strip().upper()
+    if not code:
+        return "格式：详情 <货号>，比如：详情 DN3707-202"
+    style = session.execute(
+        select(Style).where(Style.owner_user_id == owner_user_id, Style.style_code == code)
+    ).scalar_one_or_none()
+    if style is None:
+        return f"没有找到货号「{code}」。发「货号」看看在监控的清单。"
+    names = [
+        task.name
+        for task in session.execute(
+            select(MonitorTask).where(MonitorTask.created_by == owner_user_id)
+        ).scalars()
+        if code in [str(item).upper() for item in (task.style_codes or [])]
+    ]
+    rows = session.execute(
+        select(ObservationLatest, Store)
+        .join(Store, Store.id == ObservationLatest.store_id)
+        .where(
+            ObservationLatest.owner_user_id == owner_user_id,
+            ObservationLatest.style_id == style.id,
+        )
+        .order_by(ObservationLatest.checked_at.desc())
+        .limit(4000)
+    ).all()
+    stores: dict[str, dict] = {}
+    for latest, store in rows:
+        entry = stores.setdefault(store.store_code, {"status": "未知", "price": None})
+        if latest.availability == "IN_STOCK":
+            entry["status"] = "有货"
+            if latest.total_price is not None:
+                price = float(latest.total_price)
+                entry["price"] = price if entry["price"] is None else min(entry["price"], price)
+        elif entry["status"] != "有货" and latest.availability in _AVAILABILITY_LABEL:
+            entry["status"] = _AVAILABILITY_LABEL[latest.availability]
+    header = code if not style.title or style.title == code else f"{code}（{style.title}）"
+    lines = [header]
+    if names:
+        lines.append("在监控任务：" + "、".join(names[:5]))
+    else:
+        lines.append("还没有任务在监控它。")
+    if not stores:
+        lines.append("还没有门店检查记录。发「检查」跑一轮就有了。")
+        return "\n".join(lines)
+    counts: dict[str, int] = {}
+    for entry in stores.values():
+        counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+    order = ("有货", "无货", "未上架", "未知")
+    summary = "、".join(f"{label} {counts[label]}" for label in order if label in counts)
+    lines.append(f"门店 {len(stores)} 家检查过：{summary}。")
+    in_stock = sorted(
+        (code_, entry) for code_, entry in stores.items() if entry["status"] == "有货"
+    )
+    for store_code, entry in in_stock[:6]:
+        price = f"¥{entry['price']:g}" if entry["price"] is not None else "待补价"
+        lines.append(f"· {store_code} {price}")
+    if len(in_stock) > 6:
+        lines.append(f"…另有 {len(in_stock) - 6} 家有货")
+    events = (
+        session.execute(
+            select(ChangeEvent)
+            .where(
+                ChangeEvent.owner_user_id == owner_user_id,
+                ChangeEvent.style_id == style.id,
+            )
+            .order_by(ChangeEvent.detected_at.desc())
+            .limit(3)
+        )
+        .scalars()
+        .all()
+    )
+    if events:
+        labels = {
+            "RESTOCK": "补货",
+            "SOLD_OUT": "售罄",
+            "PRICE_CHANGE": "变价",
+            "NEW_ARRIVAL_AT_STORE": "新上架",
+        }
+        parts = [
+            f"{labels.get(event.event_type, event.event_type)} {event.size_label}"
+            for event in events
+        ]
+        lines.append("最近变化：" + "；".join(parts))
+    return "\n".join(lines)
+
+
 def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text: str) -> str:
     """已绑定会话里的关键字路由（纯函数，方便单测）。"""
     command = text.strip()
@@ -948,6 +1044,9 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
         return _stores_reply(session, link.owner_user_id)
     if "货号" in command:
         return _styles_reply(session, link.owner_user_id)
+    arg = _command_arg(command, "详情")
+    if arg is not None:
+        return _style_detail_reply(session, link.owner_user_id, arg)
     if "变化" in command:
         return _changes_reply(session, link.owner_user_id)
     if "状态" in command:
