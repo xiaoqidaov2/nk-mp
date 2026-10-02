@@ -406,3 +406,28 @@ def test_duplicate_channel_race_maps_to_duplicate_error(client, monkeypatch) -> 
     )
     assert response.status_code == 422, response.text
     assert response.json()["detail"] == "这个渠道已经添加过了。"
+
+
+def test_concurrent_failed_logins_still_trigger_lockout() -> None:
+    """并发错密码不能靠丢更新绕过锁定：必须出现 429，且随后正确密码也被拒。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        make_user(db, tenant, email="burst@example.com")
+        db.commit()
+
+    def attempt(password: str) -> int:
+        return TestClient(app).post(
+            "/api/v1/auth/login",
+            json={"email": "burst@example.com", "password": password},
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        statuses = list(pool.map(attempt, ["wrong-secret"] * 8))
+    assert 429 in statuses, statuses
+    assert attempt("test-password") == 429

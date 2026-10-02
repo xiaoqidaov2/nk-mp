@@ -44,7 +44,8 @@ def login(
     settings: Settings = Depends(get_settings),
 ) -> LoginResponse:
     user = db.execute(
-        select(User).where(User.email == payload.email.strip().lower())
+        # 行锁把同一账号的并发登录串行化：否则失败次数会丢更新，锁定形同虚设。
+        select(User).where(User.email == payload.email.strip().lower()).with_for_update()
     ).scalar_one_or_none()
     now = datetime.now(UTC)
     if user is not None and user.login_locked_until is not None and user.login_locked_until > now:
