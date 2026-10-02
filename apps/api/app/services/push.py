@@ -381,35 +381,49 @@ def _dingtalk_app_target(url: str) -> tuple[str, str, str, str, bool] | None:
 def build_bot_target(
     robot_code: str, robot_secret: str, *, conversation_id: str = "", user_id: str = ""
 ) -> str:
-    """平台机器人在一个已绑定会话里的推送目标：群会话或单聊（二选一）。"""
+    """企业机器人在一个已绑定会话里的推送目标：群会话或单聊（二选一）。"""
     base = f"dingtalkapp://{quote(robot_code, safe='')}?secret={quote(robot_secret, safe='')}"
     if conversation_id:
         return f"{base}&conversation={quote(conversation_id, safe='')}"
     return f"{base}&user={quote(user_id, safe='')}&dm=1"
 
 
-def _send_dingtalk_app(
-    target: str, title: str, body: str, settings: Settings
-) -> tuple[bool, str | None]:
-    """平台机器人：换 accessToken 后按会话类型调群消息/单聊接口（不走 Apprise）。"""
-    parsed = _dingtalk_app_target(target)
-    if parsed is None:
-        return False, PUSH_TARGET_INVALID
-    robot_code, robot_secret, conversation_id, user_id, is_dm = parsed
+#: 填错凭据时给用户看的固定文案；不透出上游返回的任何内容。
+DINGTALK_BAD_CREDENTIALS_TEXT = "AppKey 或 AppSecret 不对，请检查后重试。"
+DINGTALK_UNREACHABLE_TEXT = "暂时连不上钉钉，请稍后再试。"
+
+
+def fetch_dingtalk_token(robot_code: str, robot_secret: str, settings: Settings) -> str:
+    """用 AppKey/AppSecret 换 accessToken；凭据不对或连不上都抛 ``PushTargetError``。"""
     timeout = settings.push_timeout_seconds or DEFAULT_TIMEOUT_SECONDS
     try:
-        token_response = httpx.post(
+        response = httpx.post(
             DINGTALK_TOKEN_URL,
             json={"appKey": robot_code, "appSecret": robot_secret},
             timeout=timeout,
         )
-        token_response.raise_for_status()
-        access_token = str(token_response.json().get("accessToken") or "")
-    except Exception:  # noqa: BLE001 - 网络/凭证问题都按投递失败处理
-        logger.warning("dingtalk bot token request failed", exc_info=True)
-        return False, PUSH_DELIVERY_FAILED
-    if not access_token:
-        logger.warning("dingtalk bot token response carried no accessToken")
+    except Exception as exc:  # noqa: BLE001 - 网络问题按“连不上”处理
+        raise PushTargetError(PUSH_TARGET_INVALID, DINGTALK_UNREACHABLE_TEXT) from exc
+    if response.status_code >= 400:
+        raise PushTargetError(PUSH_TARGET_INVALID, DINGTALK_BAD_CREDENTIALS_TEXT)
+    token = str(response.json().get("accessToken") or "")
+    if not token:
+        raise PushTargetError(PUSH_TARGET_INVALID, DINGTALK_BAD_CREDENTIALS_TEXT)
+    return token
+
+
+def _send_dingtalk_app(
+    target: str, title: str, body: str, settings: Settings
+) -> tuple[bool, str | None]:
+    """企业机器人（客户自己的应用）：换 accessToken 后按会话类型调群消息/单聊接口（不走 Apprise）。"""
+    parsed = _dingtalk_app_target(target)
+    if parsed is None:
+        return False, PUSH_TARGET_INVALID
+    robot_code, robot_secret, conversation_id, user_id, is_dm = parsed
+    try:
+        access_token = fetch_dingtalk_token(robot_code, robot_secret, settings)
+    except PushTargetError:
+        logger.warning("dingtalk app token request failed", exc_info=True)
         return False, PUSH_DELIVERY_FAILED
     payload: dict[str, object] = {
         "robotCode": robot_code,
@@ -422,6 +436,7 @@ def _send_dingtalk_app(
     else:
         payload["openConversationId"] = conversation_id
         send_url = DINGTALK_GROUP_SEND_URL
+    timeout = settings.push_timeout_seconds or DEFAULT_TIMEOUT_SECONDS
     try:
         response = httpx.post(
             send_url,

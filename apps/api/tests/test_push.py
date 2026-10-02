@@ -227,6 +227,34 @@ def test_bot_target_needs_credentials_and_a_destination() -> None:
     assert excinfo.value.detail == "请填写AppSecret。"
 
 
+def test_fetch_dingtalk_token_maps_bad_credentials_and_network_errors(monkeypatch) -> None:
+    class _Response:
+        def __init__(self, status_code: int, payload: dict | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self) -> dict:
+            return self._payload
+
+    monkeypatch.setattr(
+        push.httpx, "post", lambda url, **kwargs: _Response(200, {"accessToken": "tok"})
+    )
+    assert push.fetch_dingtalk_token("k", "s", _settings()) == "tok"
+
+    monkeypatch.setattr(push.httpx, "post", lambda url, **kwargs: _Response(400, {}))
+    with pytest.raises(push.PushTargetError) as excinfo:
+        push.fetch_dingtalk_token("k", "s", _settings())
+    assert excinfo.value.detail == push.DINGTALK_BAD_CREDENTIALS_TEXT
+
+    def boom(url, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(push.httpx, "post", boom)
+    with pytest.raises(push.PushTargetError) as excinfo:
+        push.fetch_dingtalk_token("k", "s", _settings())
+    assert excinfo.value.detail == push.DINGTALK_UNREACHABLE_TEXT
+
+
 def test_enterprise_robot_send_mints_a_token_and_posts_the_group_message(monkeypatch) -> None:
     calls: list[dict] = []
 

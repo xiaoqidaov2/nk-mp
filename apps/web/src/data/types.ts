@@ -271,7 +271,13 @@ export interface NotificationDelivery {
   summary: string;
 }
 
-/** 平台机器人在钉钉里绑定的一个会话（群或单聊）。 */
+/** 客户自己填的钉钉企业机器人（AppKey/AppSecret）配置状态。 */
+export interface DingTalkRobot {
+  configured: boolean;
+  robot_code: string;
+}
+
+/** 钉钉机器人在钉钉里绑定的一个会话（群或单聊）。 */
 export interface DingTalkLink {
   id: string;
   conversation_title: string;

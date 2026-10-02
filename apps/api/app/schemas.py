@@ -319,11 +319,16 @@ class NotificationDeliveryOut(BaseModel):
     summary: str
 
 
-class DingTalkLinkCodeOut(BaseModel):
-    """一次性绑定码：在钉钉里发给平台机器人即完成账号↔会话绑定。"""
+class DingTalkRobotIn(BaseModel):
+    """客户在自己钉钉企业应用里拿到的两个值（AppKey/AppSecret）。"""
 
-    code: str
-    expires_at: datetime
+    robot_code: str = Field(min_length=1, max_length=64)
+    robot_secret: str = Field(min_length=1, max_length=256)
+
+
+class DingTalkRobotOut(BaseModel):
+    configured: bool
+    robot_code: str = ""
 
 
 class DingTalkLinkOut(BaseModel):

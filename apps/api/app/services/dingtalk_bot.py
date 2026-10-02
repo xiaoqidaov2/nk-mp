@@ -1,20 +1,21 @@
-"""平台钉钉机器人：账号↔会话绑定 + 关键字指令。
+"""钉钉机器人：客户自己的企业应用，会话自动绑定 + 关键字指令。
 
-平台自己持有一个钉钉企业内部应用机器人（AppKey/AppSecret）。用户在“账户与
-额度”里生成一次性验证码，在群里或单聊里把它发给机器人，平台就记住这个会话：
+AppKey/AppSecret 由客户在「账户与额度 → 消息推送 → 钉钉机器人」里自己填；
+API 进程按每个账号保存的凭据各连一条 Stream。客户在群里 @ 机器人或在单聊里
+发任意消息，这个会话就自动绑定到该账号：
 
 * 之后发关键字（任务/检查/暂停/启用/额度/变化/状态/解绑）时，用**绑定账号**的鉴权和数据回答；
 * 提醒也推进这个会话（自动生成一个钉钉渠道，走既有的 outbox 投递）。
 
-没有绑定请求时不会连出：连接只在配置了机器人凭据且进程存活期间保持。
+没有配置凭据的账号不会连出。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import re
+import threading
 from datetime import UTC, datetime, timedelta, timezone
 
 from dingtalk_stream import (
@@ -36,7 +37,7 @@ from app.models import (
     ChangeEvent,
     Credential,
     DingTalkBotLink,
-    DingTalkLinkCode,
+    DingTalkRobot,
     MonitorTask,
     NotificationChannel,
     NotificationPlatform,
@@ -50,7 +51,7 @@ from app.models import (
     UsageDaily,
     User,
 )
-from app.security import encrypt_secret, secret_fingerprint
+from app.security import decrypt_secret, encrypt_secret, secret_fingerprint
 from app.services import nike_auth, push
 from app.services.credentials import CredentialError, CredentialService
 from app.services.jobs import enqueue_job, requeue_failed_stores
@@ -86,61 +87,55 @@ HELP_TEXT = (
     "\n"
     "例子：添加监控 盯外套 DN3707-202 3402 3408"
 )
-NOT_LINKED_TEXT = (
-    "本会话还没有绑定账号。请到「账户与额度 → 消息推送 → 钉钉机器人」生成验证码，"
-    "然后发给我，例如：绑定 123456"
-)
 UNLINKED_TEXT = "已解除本会话的绑定；提醒不会再发到这里。"
 
 
-def issue_code(session: Session, settings: Settings, user_id) -> DingTalkLinkCode:
-    """生成/刷新该用户的一次性绑定码。"""
-    # 行锁串行化同一用户的并发发放：否则两个请求都会先查不到再插入，撞主键 500。
-    session.execute(select(User.id).where(User.id == user_id).with_for_update())
-    ttl = timedelta(seconds=settings.dingtalk_link_code_ttl_seconds)
-    active = {
-        row.code
-        for row in session.execute(
-            select(DingTalkLinkCode).where(DingTalkLinkCode.expires_at > datetime.now(UTC))
-        ).scalars()
-    }
-    code = ""
-    for _ in range(50):
-        candidate = f"{random.randint(0, 999999):06d}"
-        if candidate not in active:
-            code = candidate
-            break
-    if not code:
-        code = f"{random.randint(0, 999999):06d}"
-    row = session.get(DingTalkLinkCode, user_id)
-    if row is None:
-        row = DingTalkLinkCode(owner_user_id=user_id, code=code)
-        session.add(row)
-    row.code = code
-    row.expires_at = datetime.now(UTC) + ttl
+def get_robot(session: Session, owner_user_id) -> DingTalkRobot | None:
+    """该账号保存的钉钉机器人凭据；没填过就是 None。"""
+    return session.get(DingTalkRobot, owner_user_id)
+
+
+def save_robot(session: Session, user_id, robot_code: str, robot_secret: str) -> DingTalkRobot:
+    """保存/更新凭据（AppSecret 加密存储）；凭据可用性由调用方先校验。"""
+    robot = session.get(DingTalkRobot, user_id)
+    if robot is None:
+        robot = DingTalkRobot(owner_user_id=user_id)
+        session.add(robot)
+    robot.robot_code = robot_code
+    robot.robot_secret_enc = encrypt_secret(robot_secret)
     session.flush()
-    return row
+    return robot
 
 
-def find_code_owner(session: Session, text: str) -> tuple[DingTalkLinkCode, User] | None:
-    """消息里包含某个未过期的绑定码时返回它和主人。"""
-    for row in session.execute(
-        select(DingTalkLinkCode).where(DingTalkLinkCode.expires_at > datetime.now(UTC))
-    ).scalars():
-        if row.code and row.code in text:
-            user = session.get(User, row.owner_user_id)
-            if user is not None:
-                return row, user
-    return None
+def robot_secret(robot: DingTalkRobot) -> str:
+    """解出 AppSecret（Stream 连接和推送目标都要用）。"""
+    return decrypt_secret(robot.robot_secret_enc)
 
 
-def provision_channel(session: Session, settings: Settings, link: DingTalkBotLink) -> None:
-    """给一个已绑定会话配上推送渠道（平台机器人的凭据）。"""
-    if not (settings.dingtalk_bot_client_id and settings.dingtalk_bot_client_secret):
+def delete_robot(session: Session, owner_user_id) -> None:
+    """删除凭据：连同它自动建出的会话绑定和推送渠道一起清掉。"""
+    robot = session.get(DingTalkRobot, owner_user_id)
+    if robot is None:
         return
+    links = (
+        session.execute(
+            select(DingTalkBotLink).where(DingTalkBotLink.owner_user_id == owner_user_id)
+        )
+        .scalars()
+        .all()
+    )
+    for link in links:
+        drop_channel(session, link, robot)
+        session.delete(link)
+    session.delete(robot)
+    session.flush()
+
+
+def provision_channel(session: Session, link: DingTalkBotLink, robot: DingTalkRobot) -> None:
+    """给一个已绑定会话配上推送渠道（用该账号自己的机器人凭据）。"""
     target = push.build_bot_target(
-        settings.dingtalk_bot_client_id,
-        settings.dingtalk_bot_client_secret,
+        robot.robot_code,
+        robot_secret(robot),
         conversation_id="" if link.conversation_type == 1 else link.conversation_id,
         user_id=link.dingtalk_user_id if link.conversation_type == 1 else "",
     )
@@ -172,12 +167,10 @@ def provision_channel(session: Session, settings: Settings, link: DingTalkBotLin
     session.flush()
 
 
-def drop_channel(session: Session, settings: Settings, link: DingTalkBotLink) -> None:
-    if not (settings.dingtalk_bot_client_id and settings.dingtalk_bot_client_secret):
-        return
+def drop_channel(session: Session, link: DingTalkBotLink, robot: DingTalkRobot) -> None:
     target = push.build_bot_target(
-        settings.dingtalk_bot_client_id,
-        settings.dingtalk_bot_client_secret,
+        robot.robot_code,
+        robot_secret(robot),
         conversation_id="" if link.conversation_type == 1 else link.conversation_id,
         user_id=link.dingtalk_user_id if link.conversation_type == 1 else "",
     )
@@ -191,8 +184,38 @@ def drop_channel(session: Session, settings: Settings, link: DingTalkBotLink) ->
         session.delete(row)
 
 
+def refresh_channels(
+    session: Session, owner_user_id, previous: tuple[str, str] | None
+) -> None:
+    """凭据改动后重建该账号的钉钉渠道：只换凭据写出来的目标，手工渠道不动。"""
+    robot = session.get(DingTalkRobot, owner_user_id)
+    if robot is None:
+        return
+    for link in session.execute(
+        select(DingTalkBotLink).where(DingTalkBotLink.owner_user_id == owner_user_id)
+    ).scalars():
+        if previous is not None:
+            old_target = push.build_bot_target(
+                previous[0],
+                previous[1],
+                conversation_id="" if link.conversation_type == 1 else link.conversation_id,
+                user_id=link.dingtalk_user_id if link.conversation_type == 1 else "",
+            )
+            old_fingerprint = secret_fingerprint(old_target, purpose="push")
+            for row in session.execute(
+                select(NotificationChannel).where(
+                    NotificationChannel.owner_user_id == owner_user_id,
+                    NotificationChannel.platform == NotificationPlatform.DINGTALK_APP.value,
+                    NotificationChannel.target_fingerprint == old_fingerprint,
+                )
+            ).scalars():
+                session.delete(row)
+        provision_channel(session, link, robot)
+    session.flush()
+
+
 def link_conversation(
-    session: Session, settings: Settings, owner_user_id, data: dict
+    session: Session, owner_user_id, data: dict, robot: DingTalkRobot
 ) -> DingTalkBotLink:
     """把回调里的会话写成/更新成该账号的绑定，并自动配好推送渠道。"""
     conversation_id = str(data.get("conversationId") or "")
@@ -208,17 +231,19 @@ def link_conversation(
     link.conversation_type = int(data.get("conversationType") or 2)
     link.conversation_title = str(data.get("conversationTitle") or "")[:160]
     session.flush()
-    provision_channel(session, settings, link)
+    provision_channel(session, link, robot)
     return link
 
 
-def unlink_conversation(session: Session, settings: Settings, conversation_id: str) -> bool:
+def unlink_conversation(session: Session, conversation_id: str) -> bool:
     link = session.execute(
         select(DingTalkBotLink).where(DingTalkBotLink.conversation_id == conversation_id)
     ).scalar_one_or_none()
     if link is None:
         return False
-    drop_channel(session, settings, link)
+    robot = get_robot(session, link.owner_user_id)
+    if robot is not None:
+        drop_channel(session, link, robot)
     session.delete(link)
     session.flush()
     return True
@@ -1051,7 +1076,7 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
     """已绑定会话里的关键字路由（纯函数，方便单测）。"""
     command = text.strip()
     if "解绑" in command:
-        unlink_conversation(session, settings, link.conversation_id)
+        unlink_conversation(session, link.conversation_id)
         return UNLINKED_TEXT
     if command in {"帮助", "指令", "菜单", "说明", "help", "?", "？"}:
         return HELP_TEXT
@@ -1124,7 +1149,7 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
     return HELP_TEXT
 
 
-def handle_message(settings: Settings, data: dict) -> str | None:
+def handle_message(settings: Settings, owner_user_id, data: dict) -> str | None:
     """消息入口（同步）；返回要回给会话的文字，None 表示静默。"""
     text = str((data.get("text") or {}).get("content") or "")
     conversation_id = str(data.get("conversationId") or "")
@@ -1132,39 +1157,48 @@ def handle_message(settings: Settings, data: dict) -> str | None:
         return None
     logger.info("dingtalk message conversation=%s text=%r", conversation_id, text[:120])
     with SessionLocal() as session:
+        robot = get_robot(session, owner_user_id)
+        if robot is None:
+            return None
+        # 统一用库里的 UUID：调用方可能传字符串。
+        owner_user_id = robot.owner_user_id
         existing = session.execute(
             select(DingTalkBotLink).where(DingTalkBotLink.conversation_id == conversation_id)
         ).scalar_one_or_none()
-        explicit_bind = ("绑定" in text) or ("bind" in text.lower())
-        matched = find_code_owner(session, text)
-        if matched is not None and (explicit_bind or existing is None):
-            code_row, user = matched
-            if existing is not None and existing.owner_user_id != user.id:
-                # 已绑定的会话不能被另一个账号的验证码顶掉。
-                return "本会话已经绑定了其他账号。如需更换，请先在原账号里解绑。"
-            link = link_conversation(session, settings, user.id, data)
-            session.delete(code_row)
-            session.commit()
-            where = "单聊" if link.conversation_type == 1 else f"群「{link.conversation_title or '未命名'}」"
-            return f"绑定成功：{where} 已关联到 {user.email}，提醒会发到这里。\n\n{HELP_TEXT}"
+        if existing is not None and existing.owner_user_id != owner_user_id:
+            # 已绑定的会话不能被另一个账号的机器人顶掉。
+            return "本会话已经绑定了其他账号。如需更换，请先在原账号里解绑。"
         if existing is None:
-            return NOT_LINKED_TEXT
+            # 消息走的是本账号自己的机器人：这个会话就归它，直接绑定。
+            link = link_conversation(session, owner_user_id, data, robot)
+            session.commit()
+            user = session.get(User, owner_user_id)
+            where = (
+                "单聊"
+                if link.conversation_type == 1
+                else f"群「{link.conversation_title or '未命名'}」"
+            )
+            who = user.email if user is not None else "你的账号"
+            return f"绑定成功：{where} 已关联到 {who}，提醒会发到这里。\n\n{HELP_TEXT}"
         reply = reply_for(session, settings, existing, text)
         session.commit()
         return reply
 
 
 class BotHandler(CallbackHandler):
-    """Stream 回调：绑定码认领、关键字应答，全部按绑定账号的数据回答。"""
+    """Stream 回调：会话自动绑定 + 关键字应答，全部按绑定账号的数据回答。"""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, owner_user_id) -> None:
         super().__init__()
         self.settings = settings
+        self.owner_user_id = owner_user_id
 
     async def process(self, callback: CallbackMessage):  # type: ignore[override]
         data = dict(callback.data or {})
         try:
-            reply = await asyncio.to_thread(handle_message, self.settings, data)
+            reply = await asyncio.to_thread(
+                handle_message, self.settings, self.owner_user_id, data
+            )
         except Exception:  # noqa: BLE001 - 机器人不能因为一次异常退出
             logger.exception("dingtalk bot failed to handle a message")
             reply = None
@@ -1185,28 +1219,100 @@ def _reply(webhook: str, text: str) -> None:
         logger.warning("dingtalk bot reply failed", exc_info=True)
 
 
+class _Client:
+    """一个账号一条 Stream 连接；凭据变化时换一条新连接。"""
+
+    def __init__(
+        self, settings: Settings, owner_user_id, robot_code: str, secret: str
+    ) -> None:
+        self.settings = settings
+        self.owner_user_id = owner_user_id
+        self.robot_code = robot_code
+        self.secret = secret
+        self.secret_fingerprint = secret_fingerprint(secret, purpose="dingtalk-stream")
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.task: asyncio.Task | None = None
+        self.thread = threading.Thread(
+            target=self._serve, name=f"dingtalk-bot-{str(owner_user_id)[:8]}", daemon=True
+        )
+
+    def matches(self, robot_code: str, secret: str) -> bool:
+        return self.robot_code == robot_code and self.secret_fingerprint == secret_fingerprint(
+            secret, purpose="dingtalk-stream"
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _serve(self) -> None:
+        loop = asyncio.new_event_loop()
+        self.loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            self.task = loop.create_task(self._forever())
+            loop.run_until_complete(self.task)
+        finally:
+            loop.close()
+
+    async def _forever(self) -> None:
+        while True:
+            try:
+                client = DingTalkStreamClient(StreamCredential(self.robot_code, self.secret))
+                client.register_callback_handler(
+                    ChatbotMessage.TOPIC, BotHandler(self.settings, self.owner_user_id)
+                )
+                logger.info(
+                    "dingtalk bot listening as %s for %s",
+                    self.robot_code,
+                    self.owner_user_id,
+                )
+                await client.start()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 断线重连，不能拖垮进程
+                logger.exception("dingtalk bot connection failed; retrying")
+            await asyncio.sleep(3)
+
+    def stop(self) -> None:
+        loop, task = self.loop, self.task
+        if loop is not None and task is not None and loop.is_running():
+            loop.call_soon_threadsafe(task.cancel)
+
+
+_clients: dict[object, _Client] = {}
+
+
+def _sync_clients(settings: Settings) -> None:
+    """按库里的凭据对齐连接：新填的连上，改过或删掉的换掉。"""
+    with SessionLocal() as session:
+        robots = {
+            robot.owner_user_id: (robot.robot_code, robot_secret(robot))
+            for robot in session.execute(select(DingTalkRobot)).scalars()
+        }
+    for owner_user_id, (robot_code, secret) in robots.items():
+        handle = _clients.get(owner_user_id)
+        if handle is not None and handle.matches(robot_code, secret):
+            continue
+        if handle is not None:
+            handle.stop()
+        client = _Client(settings, owner_user_id, robot_code, secret)
+        client.start()
+        _clients[owner_user_id] = client
+    for owner_user_id in list(_clients):
+        if owner_user_id not in robots:
+            _clients.pop(owner_user_id).stop()
+
+
 async def run_forever(settings: Settings) -> None:
-    """保持平台机器人的 Stream 连接；没配置就什么都不做。"""
-    configured = (
-        settings.dingtalk_bot_enabled
-        and settings.dingtalk_bot_client_id
-        and settings.dingtalk_bot_client_secret
-    )
-    if not configured:
-        logger.info("dingtalk bot disabled or not configured")
+    """为每个填了凭据的账号各保持一条 Stream；没有就什么都不做。"""
+    if not settings.dingtalk_bot_enabled:
+        logger.info("dingtalk bot disabled")
         return
     while True:
         try:
-            client = DingTalkStreamClient(
-                StreamCredential(
-                    settings.dingtalk_bot_client_id, settings.dingtalk_bot_client_secret
-                )
-            )
-            client.register_callback_handler(ChatbotMessage.TOPIC, BotHandler(settings))
-            logger.info("dingtalk bot listening as %s", settings.dingtalk_bot_client_id)
-            await client.start()
+            await asyncio.to_thread(_sync_clients, settings)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - 断线重连，不能拖垮进程
-            logger.exception("dingtalk bot connection failed; retrying")
-        await asyncio.sleep(3)
+        except Exception:  # noqa: BLE001 - 巡检失败不能拖垮进程
+            logger.exception("dingtalk bot sync failed")
+        await asyncio.sleep(5)

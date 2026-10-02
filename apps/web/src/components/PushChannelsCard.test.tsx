@@ -19,6 +19,11 @@ vi.mock("@/data/api", () => ({
     testChannel: vi.fn(),
     deliveries: vi.fn(),
     retryDelivery: vi.fn(),
+    dingtalkRobot: vi.fn(),
+    saveDingTalkRobot: vi.fn(),
+    removeDingTalkRobot: vi.fn(),
+    dingtalkLinks: vi.fn(),
+    removeDingTalkLink: vi.fn(),
   },
 }));
 
@@ -33,6 +38,11 @@ const removeMock = vi.mocked(notificationApi.removeChannel);
 const testMock = vi.mocked(notificationApi.testChannel);
 const deliveriesMock = vi.mocked(notificationApi.deliveries);
 const retryMock = vi.mocked(notificationApi.retryDelivery);
+const robotMock = vi.mocked(notificationApi.dingtalkRobot);
+const saveRobotMock = vi.mocked(notificationApi.saveDingTalkRobot);
+const removeRobotMock = vi.mocked(notificationApi.removeDingTalkRobot);
+const linksMock = vi.mocked(notificationApi.dingtalkLinks);
+const removeLinkMock = vi.mocked(notificationApi.removeDingTalkLink);
 
 const FAIL_TEXT = "发送失败：平台没有接受这条消息（可在渠道里点“发送测试”复查）。";
 
@@ -131,6 +141,11 @@ describe("PushChannelsCard", () => {
     removeMock.mockResolvedValue(undefined);
     testMock.mockResolvedValue({ ok: true, error: null });
     retryMock.mockResolvedValue({ ok: true });
+    robotMock.mockResolvedValue({ configured: false, robot_code: "" });
+    saveRobotMock.mockResolvedValue({ configured: true, robot_code: "ding_app_key" });
+    removeRobotMock.mockResolvedValue(undefined);
+    linksMock.mockResolvedValue([]);
+    removeLinkMock.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -232,6 +247,54 @@ describe("PushChannelsCard", () => {
     expect(removeMock).not.toHaveBeenCalled();
     await clickModalConfirm(PUSH.removeConfirmOk);
     await waitFor(() => expect(removeMock).toHaveBeenCalledWith("ch-1"));
+  });
+
+  it("saves the dingtalk robot credentials the customer fills in", async () => {
+    renderCard();
+    await screen.findByText(PUSH.dingtalkNote);
+    fireEvent.change(screen.getByPlaceholderText(PUSH.dingtalkKey), {
+      target: { value: "ding_app_key" },
+    });
+    fireEvent.change(screen.getByPlaceholderText(PUSH.dingtalkSecret), {
+      target: { value: "secret-value" },
+    });
+    await click(PUSH.dingtalkSave);
+    await waitFor(() =>
+      expect(saveRobotMock).toHaveBeenCalledWith({
+        robot_code: "ding_app_key",
+        robot_secret: "secret-value",
+      }),
+    );
+    expect(await screen.findByText(PUSH.dingtalkSaved("ding_app_key"))).toBeTruthy();
+  });
+
+  it("lists bound conversations and unbinds only after confirmation", async () => {
+    robotMock.mockResolvedValue({ configured: true, robot_code: "ding_app_key" });
+    linksMock.mockResolvedValue([
+      {
+        id: "l-1",
+        conversation_title: "测试群",
+        conversation_type: 2,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+    renderCard();
+    expect(await screen.findByText("测试群")).toBeTruthy();
+    expect(screen.getByText(PUSH.dingtalkSaved("ding_app_key"))).toBeTruthy();
+    await click(PUSH.dingtalkUnbind);
+    expect(removeLinkMock).not.toHaveBeenCalled();
+    await clickModalConfirm(PUSH.dingtalkUnbindConfirmOk);
+    await waitFor(() => expect(removeLinkMock).toHaveBeenCalledWith("l-1"));
+  });
+
+  it("deletes the robot credentials only after confirmation", async () => {
+    robotMock.mockResolvedValue({ configured: true, robot_code: "ding_app_key" });
+    renderCard();
+    await screen.findByText(PUSH.dingtalkSaved("ding_app_key"));
+    await click(PUSH.dingtalkRemove);
+    expect(removeRobotMock).not.toHaveBeenCalled();
+    await clickModalConfirm(PUSH.dingtalkRemoveConfirmOk);
+    await waitFor(() => expect(removeRobotMock).toHaveBeenCalled());
   });
 
   it("explains an empty push history", async () => {

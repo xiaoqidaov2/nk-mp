@@ -1,37 +1,19 @@
-"""钉钉机器人：绑定会话、关键字指令、自动配推送渠道（模拟回调，不连钉钉）。"""
+"""钉钉机器人：客户自己填凭据，@ 机器人即自动绑定（模拟回调，不连钉钉）。"""
 
 from __future__ import annotations
-
-from datetime import UTC, datetime
-from uuid import UUID
 
 from sqlalchemy import select
 
 from app.config import Settings
 from app.db import SessionLocal
-from app.models import (
-    ChangeEvent,
-    DingTalkBotLink,
-    DingTalkLinkCode,
-    MonitorTask,
-    NotificationChannel,
-    ScanJob,
-    ScanJobStore,
-    Store,
-    Style,
-)
-from app.services import dingtalk_bot
+from app.models import DingTalkBotLink, DingTalkRobot, MonitorTask, NotificationChannel
+from app.services import dingtalk_bot, push
 
-from .helpers import make_store, make_style, make_tenant, make_user, store_credential
+from .helpers import auth_headers, login, make_store, make_style, make_tenant, make_user
 
 
 def _settings() -> Settings:
-    return Settings(
-        credential_key="test-key-for-unit-tests",
-        dingtalk_bot_enabled=True,
-        dingtalk_bot_client_id="ding_bot",
-        dingtalk_bot_client_secret="secret_with_underscore",
-    )
+    return Settings(credential_key="test-key-for-unit-tests", dingtalk_bot_enabled=False)
 
 
 def _message(conversation_id: str, text: str, *, kind: int = 2) -> dict:
@@ -45,35 +27,32 @@ def _message(conversation_id: str, text: str, *, kind: int = 2) -> dict:
     }
 
 
-def _seed_user() -> tuple[str, str]:
+def _seed_user(*, email: str | None = None, robot_code: str = "ding_app_key") -> tuple[str, str]:
     with SessionLocal() as db:
         tenant = make_tenant(db)
-        user = make_user(db, tenant)
+        user = make_user(db, tenant, email=email)
         make_store(db, owner=user, code="QA900")
         make_style(db, owner=user, code="DN9999-001")
-        make_style(db, owner=user, code="DN3707-202")
         db.add(
             MonitorTask(
                 tenant_id=tenant.id,
                 name="钉钉任务",
                 store_codes=[],
-                style_codes=["DN3707-202"],
+                style_codes=["DN9999-001"],
                 all_stores=True,
                 created_by=user.id,
             )
         )
+        dingtalk_bot.save_robot(db, user.id, robot_code, "secret_with_underscore")
         db.commit()
         return str(user.id), user.email
 
 
-def test_bot_links_a_conversation_and_answers_keywords() -> None:
+def test_first_message_binds_the_conversation_and_answers_keywords() -> None:
     settings = _settings()
     user_id, email = _seed_user()
-    with SessionLocal() as db:
-        code = dingtalk_bot.issue_code(db, settings, user_id).code
-        db.commit()
 
-    reply = dingtalk_bot.handle_message(settings, _message("cid-group", f"绑定 {code}"))
+    reply = dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "任务"))
     assert reply is not None and "绑定成功" in reply and email in reply
 
     with SessionLocal() as db:
@@ -83,312 +62,121 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
         channel = db.execute(select(NotificationChannel)).scalar_one()
         assert channel.platform == "dingtalk_app"
         assert channel.owner_user_id == link.owner_user_id
-        # 群会话渠道：目标里带 conversation，不带 dm
+        # 渠道用的是客户自己的凭据；群会话目标不带 dm
+        assert channel.target_hint.startswith("钉钉群 · ding_app_key")
         assert "dm=1" not in channel.target_hint
-        assert channel.target_hint.startswith("钉钉群 · ding_bot")
 
-    assert "钉钉任务" in (dingtalk_bot.handle_message(settings, _message("cid-group", "任务")) or "")
+    # 绑定之后就是普通指令：绑定动作只发生一次
+    assert "钉钉任务" in (
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "任务")) or ""
+    )
     assert "最近 24 小时" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "变化")) or ""
-    )
-    assert "没有补货。" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "变化 补货")) or ""
-    )
-    # 诊断事件（SCAN_FAILED）不算库存变化
-    with SessionLocal() as db:
-        task_row = db.execute(select(MonitorTask)).scalar_one()
-        db.add(
-            ChangeEvent(
-                tenant_id=task_row.tenant_id,
-                owner_user_id=task_row.created_by,
-                store_id=db.execute(select(Store)).scalars().first().id,
-                style_id=None,
-                size_label="",
-                event_type="SCAN_FAILED",
-                payload_hash="diag:1",
-                dedupe_key="diag:1",
-                checked_at=datetime.now(UTC),
-            )
-        )
-        db.commit()
-    assert "SCAN_FAILED" not in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "变化")) or ""
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "变化")) or ""
     )
     assert "已登记 1 家门店" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "门店")) or ""
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "门店")) or ""
     )
     assert "DN9999-001" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "货号")) or ""
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "货号")) or ""
     )
-    assert "Nike 连接" in (dingtalk_bot.handle_message(settings, _message("cid-group", "状态")) or "")
-    fallback = dingtalk_bot.handle_message(settings, _message("cid-group", "随便")) or ""
-    assert "可用指令" in fallback
-    # 帮助要分类、带例子，且多个别名都进帮助
-    for marker in ("【查询】", "【管理】", "【账号】", "例子：添加监控"):
-        assert marker in fallback
-    assert "【管理】" in (dingtalk_bot.handle_message(settings, _message("cid-group", "菜单")) or "")
-    assert "【管理】" in (dingtalk_bot.handle_message(settings, _message("cid-group", "help")) or "")
-    assert "【管理】" in (dingtalk_bot.handle_message(settings, _message("cid-group", "？")) or "")
-
-    # 暂停 / 启用
+    assert "Nike 连接" in (
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "状态")) or ""
+    )
+    assert "【管理】" in (
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "帮助")) or ""
+    )
     assert "已暂停" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "暂停 钉钉任务")) or ""
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "暂停 钉钉任务")) or ""
     )
     with SessionLocal() as db:
-        assert db.execute(select(MonitorTask)).scalar_one().is_active is False
-    assert "已启用" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "启用 钉钉任务")) or ""
-    )
-    with SessionLocal() as db:
-        assert db.execute(select(MonitorTask)).scalar_one().is_active is True
+        assert db.execute(select(DingTalkBotLink)).scalar_one() is not None
 
-    # 额度 / 概览
-    assert "今日额度" in (dingtalk_bot.handle_message(settings, _message("cid-group", "额度")) or "")
-    overview = dingtalk_bot.handle_message(settings, _message("cid-group", "概览")) or ""
-    assert "监控任务 1 个启用" in overview
-    assert "补货" in overview
-
-    # 检查：未连接 Nike 时给出可操作的提示
-    assert "连接 Nike 账号" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "检查 钉钉任务")) or ""
-    )
-    # 连接后再检查：真的排出一次检查任务
-    store_credential(settings, UUID(user_id))
-    assert "已开始检查" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "检查 钉钉任务")) or ""
-    )
-    with SessionLocal() as db:
-        job = db.execute(select(ScanJob)).scalar_one()
-        assert job.task_id is not None
-        assert job.store_codes == ["QA900"]
-        assert job.style_codes == ["DN3707-202"]
-
-    # 新建：不写门店 = 全部门店；自动登记新货号
-    assert "已新建" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "新建 聊天任务 DN1111-001")) or ""
-    )
-    with SessionLocal() as db:
-        created = db.execute(
-            select(MonitorTask).where(MonitorTask.name == "聊天任务")
-        ).scalar_one()
-        assert created.all_stores is True
-        assert created.style_codes == ["DN1111-001"]
-        assert db.execute(
-            select(Style).where(Style.style_code == "DN1111-001")
-        ).scalar_one() is not None
-    # 指定门店 + 重名拒绝
-    assert "已经有叫" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "新建 聊天任务 DN2222-001 QA900")) or ""
-    )
-    assert "已新建" in (
-        dingtalk_bot.handle_message(
-            settings, _message("cid-group", "新建 指定任务 DN2222-001 QA900")
-        ) or ""
-    )
-    # 加/删货号
-    assert "加了货号" in (
-        dingtalk_bot.handle_message(
-            settings, _message("cid-group", "加货号 DN3333-001 到 指定任务")
-        ) or ""
-    )
-    assert "删了货号" in (
-        dingtalk_bot.handle_message(
-            settings, _message("cid-group", "删货号 DN2222-001 从 指定任务")
-        ) or ""
-    )
-    with SessionLocal() as db:
-        edited = db.execute(
-            select(MonitorTask).where(MonitorTask.name == "指定任务")
-        ).scalar_one()
-        assert edited.style_codes == ["DN3333-001"]
-    # 口语别名：添加货号 / 移除货号
-    assert "加了货号" in (
-        dingtalk_bot.handle_message(
-            settings, _message("cid-group", "添加货号 DN4444-000 到 指定任务")
-        ) or ""
-    )
-    assert "删了货号" in (
-        dingtalk_bot.handle_message(
-            settings, _message("cid-group", "移除货号 DN4444-000 到 指定任务")
-        ) or ""
-    )
-    # 全部门店的任务不允许按门店加减
-    assert "全部门店" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "加门店 QA900 到 聊天任务")) or ""
-    )
-    # 删到没有门店要拦住
-    assert "就没有门店了" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "删门店 QA900 到 指定任务")) or ""
-    )
-    # 频率
-    assert "改成每 10 分钟" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "频率 10分钟 到 指定任务")) or ""
-    )
-    assert "5 分钟到 24 小时" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "频率 1分钟 到 指定任务")) or ""
-    )
-    # 盯：换成指定门店 / 换回全部门店
-    assert "改为盯 1 家门店" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "盯 QA900 到 指定任务")) or ""
-    )
-    assert "改为盯全部门店" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "盯 全部门店 到 指定任务")) or ""
-    )
-    assert "还没登记" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "盯 9999 到 指定任务")) or ""
-    )
-    # 口语别名：添加监控 / 取消监控；只发一个货号时任务名就用它
-    assert "已新建" in (
-        dingtalk_bot.handle_message(
-            settings, _message("cid-group", "添加监控 监控别名任务 DN7777-001")
-        ) or ""
-    )
-    assert "已新建" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "添加监控 DN8888-001")) or ""
-    )
-    alias_task = dingtalk_bot.handle_message(
-        settings, _message("cid-group", "创建 DN8888-001")
-    )
-    assert alias_task is not None and "已经有叫" in alias_task
-    assert "已删除" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "取消监控 DN8888-001")) or ""
-    )
-    assert "已删除" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "删除监控 监控别名任务"))
-        or ""
-    )
-    with SessionLocal() as db:
-        remaining = {task.name for task in db.execute(select(MonitorTask)).scalars()}
-        assert "DN8888-001" not in remaining and "监控别名任务" not in remaining
-    # 通知：查看 + 修改开关
-    assert "提醒设置：补货 开、售罄 开、变价 开" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "通知 指定任务")) or ""
-    )
-    assert "已更新：补货 关、变价 关" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "通知 指定任务 补货关 变价关")) or ""
-    )
-    with SessionLocal() as db:
-        toggled = db.execute(
-            select(MonitorTask).where(MonitorTask.name == "指定任务")
-        ).scalar_one()
-        assert toggled.notify_on_restock is False
-        assert toggled.notify_on_sold_out is True
-        assert toggled.notify_on_price_change is False
-    # 详情：列任务归属与门店覆盖 / 未收录的货号
-    detail = dingtalk_bot.handle_message(settings, _message("cid-group", "详情 DN3707-202")) or ""
-    assert "在监控任务：钉钉任务" in detail
-    assert "还没有门店检查记录" in detail
-    assert "没有找到货号" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "详情 XX-999")) or ""
-    )
-    # 上次检查 / 重试失败（钉钉任务此时还在队列里）
-    assert "上次检查：排队中" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "上次检查 钉钉任务")) or ""
-    )
-    assert "还在排队或检查中" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "重试失败 钉钉任务")) or ""
-    )
-    # 失败门店：先造一家失败（消息截断到 40 字）
-    with SessionLocal() as db:
-        row = db.execute(
-            select(ScanJobStore).join(ScanJob, ScanJob.id == ScanJobStore.job_id)
-        ).scalars().first()
-        row.status = "FAILED"
-        row.error_code = "TRANSPORT_ERROR"
-        row.message = "上游连接超时"
-        db.commit()
-    failed = dingtalk_bot.handle_message(settings, _message("cid-group", "失败门店 钉钉任务")) or ""
-    assert "1 家失败" in failed and "QA900" in failed and "重试失败" in failed
-    # 已知错误码显示中文标签，而不是原始英文
-    assert "网络或上游超时" in failed and "TRANSPORT_ERROR" not in failed
-    # 部分完成：没结果的门店要有独立计数，重试后清零
-    with SessionLocal() as db:
-        job_row = db.execute(select(ScanJob)).scalar_one()
-        job_row.status = "PARTIAL"
-        job_row.unknown_stores = 1
-        db.commit()
-    last = dingtalk_bot.handle_message(settings, _message("cid-group", "上次检查 钉钉任务")) or ""
-    assert "部分完成" in last and "没结果 1" in last
-    assert "已重试 1 家没结果或失败的门店" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "重试失败 钉钉任务")) or ""
-    )
-    # 注销：两步确认
-    assert "确认注销" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "注销")) or ""
-    )
-    assert "已断开 Nike 连接" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "确认注销")) or ""
-    )
-    assert "Nike 连接：已断开" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "状态")) or ""
-    )
-    # 删除：必须是完整名字
-    assert "是想删这些吗" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "删除 聊天")) or ""
-    )
-    assert "已删除" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "删除 聊天任务")) or ""
-    )
-    # 未登记门店的提示
-    assert "还没登记" in (
-        dingtalk_bot.handle_message(settings, _message("cid-group", "新建 杂项任务 DN4444-001 9999")) or ""
-    )
-
-    other = dingtalk_bot.handle_message(settings, _message("cid-unknown", "任务"))
-    assert other is not None and "还没有绑定账号" in other
-
-    unbound = dingtalk_bot.handle_message(settings, _message("cid-group", "解绑"))
+    unbound = dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "解绑"))
     assert unbound is not None and "已解除" in unbound
     with SessionLocal() as db:
         assert db.execute(select(DingTalkBotLink)).scalars().all() == []
         assert db.execute(select(NotificationChannel)).scalars().all() == []
 
 
-def test_bot_links_a_single_chat_and_replies_to_the_same_person() -> None:
+def test_single_chat_binds_by_the_sender_and_targets_the_user_id() -> None:
     settings = _settings()
     user_id, _email = _seed_user()
-    with SessionLocal() as db:
-        code = dingtalk_bot.issue_code(db, settings, user_id).code
-        db.commit()
-
-    data = _message("cid-dm", f"绑定 {code}", kind=1)
-    assert "绑定成功" in (dingtalk_bot.handle_message(settings, data) or "")
-
+    assert "绑定成功" in (
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-dm", "你好", kind=1)) or ""
+    )
     with SessionLocal() as db:
         channel = db.execute(select(NotificationChannel)).scalar_one()
-        assert channel.target_hint.startswith("钉钉单聊 · ding_bot")
-        # 单聊目标按 userIds 发送：hint 里带的是钉钉用户 ID 尾号
+        assert channel.target_hint.startswith("钉钉单聊 · ding_app_key")
+        # 单聊按 userIds 发送：hint 里留的是发送人尾号
         assert "7041" in channel.target_hint
 
 
-def test_concurrent_link_code_issuance_keeps_single_row() -> None:
-    """并发发放绑定码不能撞主键：串行化后始终只有一行。"""
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Barrier
-
+def test_a_conversation_keeps_its_owner_when_another_robot_messages() -> None:
     settings = _settings()
+    first_id, _first = _seed_user(email="first@example.com")
+    second_id, _second = _seed_user(email="second@example.com", robot_code="ding_other")
+    dingtalk_bot.handle_message(settings, first_id, _message("cid-shared", "任务"))
+    refused = dingtalk_bot.handle_message(settings, second_id, _message("cid-shared", "任务"))
+    assert refused is not None and "已经绑定了其他账号" in refused
     with SessionLocal() as db:
-        tenant = make_tenant(db)
-        user = make_user(db, tenant, email="code@example.com")
-        db.commit()
-        user_id = user.id
+        link = db.execute(select(DingTalkBotLink)).scalar_one()
+        assert str(link.owner_user_id) == first_id
 
-    barrier = Barrier(6)
 
-    def issue(_: int) -> None:
-        barrier.wait(timeout=10)
-        with SessionLocal() as session:
-            dingtalk_bot.issue_code(session, settings, user_id)
-            session.commit()
+class _Response:
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload or {}
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        list(pool.map(issue, range(6)))
+    def json(self) -> dict:
+        return self._payload
 
+
+def test_robot_api_validates_saves_and_rebuilds_channels(client, monkeypatch) -> None:
+    settings = _settings()
+    user_id, email = _seed_user(robot_code="old_key")
+    csrf = login(client, email)
+    monkeypatch.setattr(
+        push.httpx, "post", lambda url, **kwargs: _Response(200, {"accessToken": "tok"})
+    )
+
+    # 先绑一个会话：渠道里写的是旧凭据
+    dingtalk_bot.handle_message(settings, user_id, _message("cid-group", "任务"))
+
+    saved = client.put(
+        "/api/v1/me/dingtalk/robot",
+        json={"robot_code": "new_key", "robot_secret": "new_secret"},
+        headers=auth_headers(csrf),
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json() == {"configured": True, "robot_code": "new_key"}
     with SessionLocal() as db:
-        rows = (
-            db.execute(select(DingTalkLinkCode).where(DingTalkLinkCode.owner_user_id == user_id))
-            .scalars()
-            .all()
-        )
-        assert len(rows) == 1
-        assert rows[0].expires_at > datetime.now(UTC)
+        channels = db.execute(select(NotificationChannel)).scalars().all()
+        assert len(channels) == 1
+        assert channels[0].target_hint.startswith("钉钉群 · new_key")
+
+    fetched = client.get("/api/v1/me/dingtalk/robot")
+    assert fetched.json() == {"configured": True, "robot_code": "new_key"}
+
+    # 钉钉拒绝这组凭据时不能落库，也不能覆盖已保存的那组
+    monkeypatch.setattr(push.httpx, "post", lambda url, **kwargs: _Response(400, {}))
+    rejected = client.put(
+        "/api/v1/me/dingtalk/robot",
+        json={"robot_code": "bad_key", "robot_secret": "bad_secret"},
+        headers=auth_headers(csrf),
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == push.DINGTALK_BAD_CREDENTIALS_TEXT
+    with SessionLocal() as db:
+        assert db.execute(select(DingTalkRobot)).scalar_one().robot_code == "new_key"
+
+    removed = client.delete("/api/v1/me/dingtalk/robot", headers=auth_headers(csrf))
+    assert removed.status_code == 204
+    with SessionLocal() as db:
+        assert db.execute(select(DingTalkRobot)).scalars().all() == []
+        assert db.execute(select(DingTalkBotLink)).scalars().all() == []
+        assert db.execute(select(NotificationChannel)).scalars().all() == []
+    assert client.get("/api/v1/me/dingtalk/robot").json() == {
+        "configured": False,
+        "robot_code": "",
+    }

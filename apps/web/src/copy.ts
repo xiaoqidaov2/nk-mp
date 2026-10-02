@@ -354,10 +354,16 @@ export const PUSH = {
   recentEmpty: "还没有推送记录。",
   dingtalkTitle: "钉钉机器人",
   dingtalkNote:
-    "让机器人把提醒发到群里或单聊：在钉钉里把验证码发给机器人即可完成绑定；绑定后也能在钉钉里发关键字查询。",
-  dingtalkBind: "生成验证码",
-  dingtalkBindTip: (code: string) => `在钉钉里把「${code}」发给机器人（群里 @ 它或直接单聊）即可完成绑定。`,
-  dingtalkLinksTitle: "已绑定的钉钉会话",
+    "填上你自己钉钉企业应用的 AppKey 与 AppSecret；保存后在钉钉里 @ 机器人（或单聊它）就能完成绑定。",
+  dingtalkKey: "AppKey（robotCode）",
+  dingtalkSecret: "AppSecret",
+  dingtalkSave: "保存",
+  dingtalkSaved: (code: string) => `已保存：${code}`,
+  dingtalkChange: "更换",
+  dingtalkRemove: "删除凭据",
+  dingtalkRemoveConfirmTitle: "删除这个钉钉机器人？",
+  dingtalkRemoveConfirmBody: "删除后已绑定的会话和自动建出的推送渠道也会一起清掉。",
+  dingtalkRemoveConfirmOk: "删除",
   dingtalkLinksEmpty: "还没有绑定钉钉会话。",
   dingtalkLinkGroup: "群",
   dingtalkLinkDm: "单聊",
@@ -390,7 +396,7 @@ export const PUSH = {
   platforms: {
     dingtalk_app: {
       label: "钉钉机器人",
-      hint: "由「钉钉机器人」区块自动创建，不用手填。",
+      hint: "绑定钉钉会话后自动创建，不用手填。",
     },
     dingtalk: {
       label: "钉钉群机器人",

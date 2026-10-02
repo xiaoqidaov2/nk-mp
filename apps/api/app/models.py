@@ -677,17 +677,20 @@ class NotificationDelivery(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-class DingTalkLinkCode(Base):
-    """一次性绑定码：用户在钉钉里把它发给平台机器人即完成账号↔会话绑定。"""
+class DingTalkRobot(Base):
+    """客户自己填的钉钉企业机器人：AppKey/AppSecret（密钥加密保存）。"""
 
-    __tablename__ = "dingtalk_link_code"
+    __tablename__ = "dingtalk_robot"
 
     owner_user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("app_user.id", ondelete="CASCADE"), primary_key=True
     )
-    code: Mapped[str] = mapped_column(String(12))
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    robot_code: Mapped[str] = mapped_column(String(64))
+    robot_secret_enc: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class DingTalkBotLink(Base):

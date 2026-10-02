@@ -29,8 +29,9 @@ from app.models import (
     User,
 )
 from app.schemas import (
-    DingTalkLinkCodeOut,
     DingTalkLinkOut,
+    DingTalkRobotIn,
+    DingTalkRobotOut,
     NotificationChannelIn,
     NotificationChannelOut,
     NotificationChannelPatch,
@@ -282,21 +283,55 @@ def retry_notification(
     return {"ok": True}
 
 
-@router.post("/dingtalk/link-code", response_model=DingTalkLinkCodeOut)
-def create_dingtalk_link_code(
+@router.get("/dingtalk/robot", response_model=DingTalkRobotOut)
+def get_dingtalk_robot(
+    db: Session = Depends(get_db),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
+) -> DingTalkRobotOut:
+    """看这个账号有没有填过钉钉机器人凭据。"""
+    user = payload[0]
+    robot = dingtalk_bot.get_robot(db, user.id)
+    return DingTalkRobotOut(
+        configured=robot is not None,
+        robot_code=robot.robot_code if robot is not None else "",
+    )
+
+
+@router.put("/dingtalk/robot", response_model=DingTalkRobotOut)
+def save_dingtalk_robot(
+    body: DingTalkRobotIn,
     db: Session = Depends(get_db),
     settings: Settings = Depends(settings_dep),
     payload: tuple[User, AuthSession] = Depends(require_self_write),
-) -> DingTalkLinkCodeOut:
-    """生成一次性验证码：在钉钉里把它发给平台机器人，即完成本账号的会话绑定。"""
+) -> DingTalkRobotOut:
+    """保存客户自己填的 AppKey/AppSecret；先用钉钉验一次能不能换到 token。"""
     user, _ = payload
-    if not (settings.dingtalk_bot_enabled and settings.dingtalk_bot_client_id):
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "钉钉机器人还没有配置，请联系管理员。"
-        )
-    row = dingtalk_bot.issue_code(db, settings, user.id)
+    robot_code = body.robot_code.strip()
+    robot_secret = body.robot_secret.strip()
+    try:
+        push.fetch_dingtalk_token(robot_code, robot_secret, settings)
+    except push.PushTargetError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, exc.detail) from exc
+    previous = dingtalk_bot.get_robot(db, user.id)
+    previous_credentials = (
+        (previous.robot_code, dingtalk_bot.robot_secret(previous)) if previous is not None else None
+    )
+    dingtalk_bot.save_robot(db, user.id, robot_code, robot_secret)
+    dingtalk_bot.refresh_channels(db, user.id, previous_credentials)
     db.commit()
-    return DingTalkLinkCodeOut(code=row.code, expires_at=row.expires_at)
+    return DingTalkRobotOut(configured=True, robot_code=robot_code)
+
+
+@router.delete("/dingtalk/robot", status_code=status.HTTP_204_NO_CONTENT)
+def delete_dingtalk_robot(
+    db: Session = Depends(get_db),
+    payload: tuple[User, AuthSession] = Depends(require_self_write),
+) -> Response:
+    """删除凭据：机器人和它自动建出的会话绑定、推送渠道一起清掉。"""
+    user, _ = payload
+    dingtalk_bot.delete_robot(db, user.id)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/dingtalk/links", response_model=list[DingTalkLinkOut])
@@ -329,7 +364,6 @@ def list_dingtalk_links(
 def delete_dingtalk_link(
     link_id: uuid.UUID,
     db: Session = Depends(get_db),
-    settings: Settings = Depends(settings_dep),
     payload: tuple[User, AuthSession] = Depends(require_self_write),
 ) -> Response:
     user, _ = payload
@@ -340,7 +374,6 @@ def delete_dingtalk_link(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "没有找到这个绑定。")
-    dingtalk_bot.drop_channel(db, settings, row)
-    db.delete(row)
+    dingtalk_bot.unlink_conversation(db, row.conversation_id)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

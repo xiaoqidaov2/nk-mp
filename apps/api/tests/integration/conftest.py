@@ -13,6 +13,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+#: 集成测试里不连钉钉：机器人巡检线程会为库里每份凭据开 Stream。
+os.environ.setdefault("NIKE_MP_DINGTALK_BOT_ENABLED", "false")
+
 TEST_DB_URL = os.environ.get("NIKE_MP_TEST_DATABASE_URL", "")
 
 

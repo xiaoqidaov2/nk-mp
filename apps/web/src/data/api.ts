@@ -9,6 +9,7 @@ import type {
   NikeBootstrapOut,
   NikeCredentialOut,
   DingTalkLink,
+  DingTalkRobot,
   NotificationChannel,
   NotificationDelivery,
   NotificationPlatform,
@@ -129,8 +130,10 @@ export const notificationApi = {
   deliveries: (limit = 10) =>
     api.get<NotificationDelivery[]>(`/me/notifications?limit=${limit}`),
   retryDelivery: (id: number) => api.post<{ ok: boolean }>(`/me/notifications/${id}/retry`),
-  dingtalkLinkCode: () =>
-    api.post<{ code: string; expires_at: string }>("/me/dingtalk/link-code"),
+  dingtalkRobot: () => api.get<DingTalkRobot>("/me/dingtalk/robot"),
+  saveDingTalkRobot: (payload: { robot_code: string; robot_secret: string }) =>
+    api.put<DingTalkRobot>("/me/dingtalk/robot", payload),
+  removeDingTalkRobot: () => api.delete<void>("/me/dingtalk/robot"),
   dingtalkLinks: () => api.get<DingTalkLink[]>("/me/dingtalk/links"),
   removeDingTalkLink: (id: string) => api.delete<void>(`/me/dingtalk/links/${id}`),
 };

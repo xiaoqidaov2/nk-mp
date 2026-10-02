@@ -7,6 +7,7 @@ import { ApiError } from "@/data/client";
 import { notificationApi } from "@/data/api";
 import type {
   DingTalkLink,
+  DingTalkRobot,
   NotificationChannel,
   NotificationDelivery,
   NotificationPlatform,
@@ -83,7 +84,13 @@ export function PushChannelsCard() {
     queryKey: ["notification-channels"],
     queryFn: () => notificationApi.channels(),
   });
-  const [linkCode, setLinkCode] = useState("");
+  const [robotKey, setRobotKey] = useState("");
+  const [robotSecret, setRobotSecret] = useState("");
+  const [editingRobot, setEditingRobot] = useState(false);
+  const robot = useQuery<DingTalkRobot>({
+    queryKey: ["dingtalk-robot"],
+    queryFn: () => notificationApi.dingtalkRobot(),
+  });
   const links = useQuery<DingTalkLink[]>({
     queryKey: ["dingtalk-links"],
     queryFn: () => notificationApi.dingtalkLinks(),
@@ -143,9 +150,32 @@ export function PushChannelsCard() {
     onError: (error) => message.error(errorText(error)),
   });
 
-  const bindCode = useMutation({
-    mutationFn: () => notificationApi.dingtalkLinkCode(),
-    onSuccess: (result) => setLinkCode(result.code),
+  const saveRobot = useMutation({
+    mutationFn: () =>
+      notificationApi.saveDingTalkRobot({
+        robot_code: robotKey.trim(),
+        robot_secret: robotSecret.trim(),
+      }),
+    onSuccess: (result) => {
+      setRobotKey("");
+      setRobotSecret("");
+      setEditingRobot(false);
+      void queryClient.invalidateQueries({ queryKey: ["dingtalk-robot"] });
+      void queryClient.invalidateQueries({ queryKey: ["dingtalk-links"] });
+      invalidateChannels();
+      message.success(PUSH.dingtalkSaved(result.robot_code));
+    },
+    onError: (error) => message.error(errorText(error)),
+  });
+
+  const removeRobot = useMutation({
+    mutationFn: () => notificationApi.removeDingTalkRobot(),
+    onSuccess: () => {
+      setEditingRobot(false);
+      void queryClient.invalidateQueries({ queryKey: ["dingtalk-robot"] });
+      void queryClient.invalidateQueries({ queryKey: ["dingtalk-links"] });
+      invalidateChannels();
+    },
     onError: (error) => message.error(errorText(error)),
   });
 
@@ -157,6 +187,17 @@ export function PushChannelsCard() {
     },
     onError: (error) => message.error(errorText(error)),
   });
+
+  const confirmRemoveRobot = () => {
+    modal.confirm({
+      title: PUSH.dingtalkRemoveConfirmTitle,
+      content: PUSH.dingtalkRemoveConfirmBody,
+      okText: PUSH.dingtalkRemoveConfirmOk,
+      cancelText: BTN.cancel,
+      okButtonProps: { danger: true },
+      onOk: () => removeRobot.mutateAsync(),
+    });
+  };
 
   const confirmUnbind = (link: DingTalkLink) => {
     modal.confirm({
@@ -254,14 +295,43 @@ export function PushChannelsCard() {
           {PUSH.dingtalkTitle}
         </Typography.Title>
         <Typography.Text type="secondary">{PUSH.dingtalkNote}</Typography.Text>
-        <Space wrap size={8} align="center">
-          <Button size="small" loading={bindCode.isPending} onClick={() => bindCode.mutate()}>
-            {PUSH.dingtalkBind}
-          </Button>
-          {linkCode ? (
-            <Typography.Text>{PUSH.dingtalkBindTip(linkCode)}</Typography.Text>
-          ) : null}
-        </Space>
+        {robot.data?.configured && !editingRobot ? (
+          <Space wrap size={8} align="center">
+            <Typography.Text>{PUSH.dingtalkSaved(robot.data.robot_code)}</Typography.Text>
+            <Button size="small" onClick={() => setEditingRobot(true)}>
+              {PUSH.dingtalkChange}
+            </Button>
+            <Button size="small" danger onClick={confirmRemoveRobot}>
+              {PUSH.dingtalkRemove}
+            </Button>
+          </Space>
+        ) : (
+          <Space wrap size={8} align="center">
+            <Input
+              style={{ width: 200 }}
+              placeholder={PUSH.dingtalkKey}
+              value={robotKey}
+              autoComplete="off"
+              onChange={(event) => setRobotKey(event.target.value)}
+            />
+            <Input
+              style={{ width: 240 }}
+              placeholder={PUSH.dingtalkSecret}
+              value={robotSecret}
+              autoComplete="off"
+              onChange={(event) => setRobotSecret(event.target.value)}
+            />
+            <Button
+              size="small"
+              type="primary"
+              disabled={!robotKey.trim() || !robotSecret.trim()}
+              loading={saveRobot.isPending}
+              onClick={() => saveRobot.mutate()}
+            >
+              {PUSH.dingtalkSave}
+            </Button>
+          </Space>
+        )}
         <Typography.Text type="secondary">{PUSH.dingtalkKeywords}</Typography.Text>
         {(links.data ?? []).length === 0 ? (
           <Typography.Text type="secondary">{PUSH.dingtalkLinksEmpty}</Typography.Text>
