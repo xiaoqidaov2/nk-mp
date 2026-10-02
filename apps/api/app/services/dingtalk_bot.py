@@ -75,7 +75,7 @@ HELP_TEXT = (
     "· 重试失败 [任务名]：把上次失败的门店再跑一遍\n"
     "· 删除 <任务名>：删除任务（要写完整名字）\n"
     "· 额度：今天用掉的检查额度\n"
-    "· 变化：最近 24 小时的补货、售罄、变价\n"
+    "· 变化 [补货/售罄/变价]：最近 24 小时的变化\n"
     "· 详情 <货号>：某个货号的门店情况\n"
     "· 门店：已登记的门店\n"
     "· 货号：在监控的货号\n"
@@ -245,22 +245,34 @@ def _tasks_reply(session: Session, owner_user_id) -> str:
     return "\n".join(lines)
 
 
-def _changes_reply(session: Session, owner_user_id) -> str:
+_CHANGE_KINDS = {
+    "补货": "RESTOCK",
+    "售罄": "SOLD_OUT",
+    "变价": "PRICE_CHANGE",
+    "新上架": "NEW_ARRIVAL_AT_STORE",
+}
+
+
+def _changes_reply(session: Session, owner_user_id, kind: str = "") -> str:
     since = datetime.now(UTC) - timedelta(hours=24)
+    wanted = _CHANGE_KINDS.get(kind.strip(), "")
+    stmt = select(ChangeEvent).where(
+        ChangeEvent.owner_user_id == owner_user_id,
+        ChangeEvent.detected_at >= since,
+        # 只列库存/价格结论；诊断事件（SCAN_FAILED / STRUCTURE_CHANGED）不算变化。
+        ChangeEvent.event_type.in_(list(_CHANGE_KINDS.values())),
+    )
+    if wanted:
+        stmt = stmt.where(ChangeEvent.event_type == wanted)
     rows = (
-        session.execute(
-            select(ChangeEvent)
-            .where(ChangeEvent.owner_user_id == owner_user_id, ChangeEvent.detected_at >= since)
-            .order_by(ChangeEvent.detected_at.desc())
-            .limit(5)
-        )
-        .scalars()
-        .all()
+        session.execute(stmt.order_by(ChangeEvent.detected_at.desc()).limit(5)).scalars().all()
     )
     if not rows:
+        if wanted:
+            return f"最近 24 小时没有{kind.strip()}。"
         return "最近 24 小时没有补货、售罄或变价。"
     label = {"RESTOCK": "补货", "SOLD_OUT": "售罄", "PRICE_CHANGE": "变价"}
-    lines = ["最近 24 小时的变化："]
+    lines = [f"最近 24 小时的{kind.strip()}：" if wanted else "最近 24 小时的变化："]
     for row in rows:
         code = row.style.style_code if row.style is not None else "—"
         store = row.store.store_code if row.store is not None else "—"
@@ -982,6 +994,7 @@ def _style_detail_reply(session: Session, owner_user_id, text: str) -> str:
             .where(
                 ChangeEvent.owner_user_id == owner_user_id,
                 ChangeEvent.style_id == style.id,
+                ChangeEvent.event_type.in_(list(_CHANGE_KINDS.values())),
             )
             .order_by(ChangeEvent.detected_at.desc())
             .limit(3)
@@ -1073,8 +1086,9 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
     arg = _command_arg(command, "详情")
     if arg is not None:
         return _style_detail_reply(session, link.owner_user_id, arg)
-    if "变化" in command:
-        return _changes_reply(session, link.owner_user_id)
+    arg = _command_arg(command, "变化")
+    if arg is not None:
+        return _changes_reply(session, link.owner_user_id, arg)
     if "状态" in command:
         return _status_reply(session, link.owner_user_id)
     return HELP_TEXT

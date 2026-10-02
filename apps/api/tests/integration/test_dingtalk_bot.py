@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import select
@@ -9,11 +10,13 @@ from sqlalchemy import select
 from app.config import Settings
 from app.db import SessionLocal
 from app.models import (
+    ChangeEvent,
     DingTalkBotLink,
     MonitorTask,
     NotificationChannel,
     ScanJob,
     ScanJobStore,
+    Store,
     Style,
 )
 from app.services import dingtalk_bot
@@ -85,6 +88,29 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
 
     assert "钉钉任务" in (dingtalk_bot.handle_message(settings, _message("cid-group", "任务")) or "")
     assert "最近 24 小时" in (
+        dingtalk_bot.handle_message(settings, _message("cid-group", "变化")) or ""
+    )
+    assert "没有补货。" in (
+        dingtalk_bot.handle_message(settings, _message("cid-group", "变化 补货")) or ""
+    )
+    # 诊断事件（SCAN_FAILED）不算库存变化
+    with SessionLocal() as db:
+        task_row = db.execute(select(MonitorTask)).scalar_one()
+        db.add(
+            ChangeEvent(
+                tenant_id=task_row.tenant_id,
+                owner_user_id=task_row.created_by,
+                store_id=db.execute(select(Store)).scalars().first().id,
+                style_id=None,
+                size_label="",
+                event_type="SCAN_FAILED",
+                payload_hash="diag:1",
+                dedupe_key="diag:1",
+                checked_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+    assert "SCAN_FAILED" not in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "变化")) or ""
     )
     assert "已登记 1 家门店" in (
