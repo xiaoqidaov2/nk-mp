@@ -314,7 +314,7 @@ export function NikeConnectModal({
         // 弹窗自身的自动聚焦在动画后才会落到容器上，这里把焦点交给手机号输入框。
         if (opened) phoneRef.current?.focus();
       }}
-      destroyOnClose
+      destroyOnHidden
       maskClosable={false}
       width={480}
     >
