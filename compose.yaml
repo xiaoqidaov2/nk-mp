@@ -51,7 +51,8 @@ services:
       migrate:
         condition: service_completed_successfully
     ports:
-      - "8000:8000"
+      # 只绑本机：对外统一由反向代理（HTTPS）进入，避免绕过 TLS/安全头。
+      - "127.0.0.1:8000:8000"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/v1/health || exit 1"]
       interval: 10s
@@ -95,7 +96,8 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "5173:5173"
+      # 只绑本机：对外统一由反向代理（HTTPS）进入，避免绕过 TLS/安全头。
+      - "127.0.0.1:5173:5173"
     restart: unless-stopped
 
 volumes:
