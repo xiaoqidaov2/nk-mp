@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_session, get_db, require_self_write, settings_dep
@@ -140,7 +141,17 @@ def create_notification_channel(
         enabled=True,
     )
     db.add(channel)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # 并发下两次相同目标都可能通过上面的查重；唯一约束兜底翻译成重复提示。
+        db.rollback()
+        detail = str(getattr(exc, "orig", exc))
+        if "uq_notification_channel_target" in detail or "notification_channel.owner_user_id" in detail:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "这个渠道已经添加过了。"
+            ) from exc
+        raise
     return _channel_out(channel)
 
 
