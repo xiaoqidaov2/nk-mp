@@ -64,16 +64,16 @@ HELP_TEXT = (
     "· 任务：查看我的监控任务\n"
     "· 检查 [任务名]：马上检查一次\n"
     "· 暂停 <任务名> / 启用 <任务名>：停止或恢复自动检查\n"
-    "· 新建 <任务名> <货号…> [门店…]：建监控任务（不写门店就是全部门店）\n"
-    "· 加货号 <货号…> 到 <任务名> / 删货号 <货号…> 到 <任务名>\n"
-    "· 加门店 <门店…> 到 <任务名> / 删门店 <门店…> 到 <任务名>\n"
+    "· 新建/添加监控 <任务名> <货号…> [门店…]：建监控任务（不写门店就是全部门店）\n"
+    "· 加货号/删货号 <货号…> 到 <任务名>（也可以说 添加货号/移除货号）\n"
+    "· 加门店/删门店 <门店…> 到 <任务名>（也可以说 添加门店/移除门店）\n"
     "· 频率 <时间> 到 <任务名>：改检查节奏，如 频率 30分钟 到 钉钉测试任务\n"
     "· 盯 <门店…> 到 <任务名>：改成只盯这几家；也可以：盯 全部门店 到 <任务名>\n"
     "· 通知 <任务名> [补货开/关 售罄开/关 变价开/关]：看/改提醒开关\n"
     "· 上次检查 [任务名]：看最近一次检查结果\n"
     "· 失败门店 [任务名]：看上次失败的门店和原因\n"
     "· 重试失败 [任务名]：把上次失败的门店再跑一遍\n"
-    "· 删除 <任务名>：删除任务（要写完整名字）\n"
+    "· 删除/取消监控 <任务名>：删除任务（要写完整名字）\n"
     "· 额度：今天用掉的检查额度\n"
     "· 变化 [补货/售罄/变价]：最近 24 小时的变化\n"
     "· 详情 <货号>：某个货号的门店情况\n"
@@ -460,6 +460,19 @@ def _command_arg(command: str, *keywords: str) -> str | None:
     return None
 
 
+#: 动词后面的口语填充词：添加「监控」X / 删除「任务」Y 都按同一件事处理。
+_FILLER_WORDS = ("监控任务", "监控", "任务")
+
+
+def _strip_filler(text: str) -> str:
+    out = text.strip()
+    for _ in range(2):
+        for word in _FILLER_WORDS:
+            if out.startswith(word):
+                out = out[len(word):].strip(" ：:，,。.！!").strip()
+    return out
+
+
 _TOKEN_SPLIT = re.compile(r"[\s,，、;；]+")
 _STORE_LIKE = re.compile(r"\d{3,6}")
 
@@ -520,10 +533,18 @@ def _split_target(body: str) -> tuple[str, str] | None:
 
 
 def _create_task(session: Session, owner_user_id, body: str) -> str:
+    body = _strip_filler(body)
     parts = _tokens(body)
-    if len(parts) < 2:
+    if not parts:
         return "格式：新建 <任务名> <货号…> [门店…]。比如：新建 盯紧外套 DN3707-202 3402 3408"
-    name, code_tokens = parts[0], parts[1:]
+    if len(parts) == 1:
+        only = parts[0]
+        if not re.search(r"\d", only):
+            return f"还要给我一个货号，比如：添加监控 {only} DN3707-202"
+        # 「添加监控 DN3707-202」：任务名就用这个货号。
+        name, code_tokens = only, [only]
+    else:
+        name, code_tokens = parts[0], parts[1:]
     rows = (
         session.execute(
             select(MonitorTask).where(MonitorTask.created_by == owner_user_id)
@@ -666,9 +687,13 @@ def _delete_task(session: Session, owner_user_id, name: str) -> str:
             select(MonitorTask).where(MonitorTask.created_by == owner_user_id)
         ).scalars().all()
     )
-    exact = [task for task in rows if task.name.lower() == key.lower()]
+    candidates = [key, _strip_filler(key)]
+    exact = [
+        task for task in rows if any(task.name.lower() == item.lower() for item in candidates if item)
+    ]
     if not exact:
-        near = [task for task in rows if key.lower() in task.name.lower()][:5]
+        probe = candidates[-1] or key
+        near = [task for task in rows if probe.lower() in task.name.lower()][:5]
         if near:
             return "没找到完全同名的任务。是想删这些吗：" + "、".join(t.name for t in near) + "。发完整名字。"
         return f"没找到叫「{key}」的任务。发「任务」看看列表。"
@@ -1041,21 +1066,21 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
         return _quota_reply(session, link.owner_user_id)
     if "概览" in command:
         return _overview_reply(session, link.owner_user_id)
-    arg = _command_arg(command, "新建")
-    if arg is not None:
-        return _create_task(session, link.owner_user_id, arg)
-    arg = _command_arg(command, "加货号")
+    arg = _command_arg(command, "加货号", "添加货号", "增加货号")
     if arg is not None:
         return _edit_codes(session, link.owner_user_id, arg, styles=True, add=True)
-    arg = _command_arg(command, "删货号")
+    arg = _command_arg(command, "删货号", "删除货号", "移除货号")
     if arg is not None:
         return _edit_codes(session, link.owner_user_id, arg, styles=True, add=False)
-    arg = _command_arg(command, "加门店")
+    arg = _command_arg(command, "加门店", "添加门店", "增加门店")
     if arg is not None:
         return _edit_codes(session, link.owner_user_id, arg, styles=False, add=True)
-    arg = _command_arg(command, "删门店")
+    arg = _command_arg(command, "删门店", "删除门店", "移除门店")
     if arg is not None:
         return _edit_codes(session, link.owner_user_id, arg, styles=False, add=False)
+    arg = _command_arg(command, "新建", "添加", "创建", "增加")
+    if arg is not None:
+        return _create_task(session, link.owner_user_id, arg)
     arg = _command_arg(command, "频率")
     if arg is not None:
         return _set_cadence(session, link.owner_user_id, arg)
@@ -1074,7 +1099,7 @@ def reply_for(session: Session, settings: Settings, link: DingTalkBotLink, text:
     arg = _command_arg(command, "失败门店")
     if arg is not None:
         return _failed_stores_reply(session, link.owner_user_id, arg)
-    arg = _command_arg(command, "删除")
+    arg = _command_arg(command, "删除", "删掉", "移除", "取消")
     if arg is not None:
         return _delete_task(session, link.owner_user_id, arg)
     if "任务" in command:
@@ -1100,6 +1125,7 @@ def handle_message(settings: Settings, data: dict) -> str | None:
     conversation_id = str(data.get("conversationId") or "")
     if not (text and conversation_id):
         return None
+    logger.info("dingtalk message conversation=%s text=%r", conversation_id, text[:120])
     with SessionLocal() as session:
         existing = session.execute(
             select(DingTalkBotLink).where(DingTalkBotLink.conversation_id == conversation_id)

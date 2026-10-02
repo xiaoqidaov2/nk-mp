@@ -193,6 +193,17 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
             select(MonitorTask).where(MonitorTask.name == "指定任务")
         ).scalar_one()
         assert edited.style_codes == ["DN3333-001"]
+    # 口语别名：添加货号 / 移除货号
+    assert "加了货号" in (
+        dingtalk_bot.handle_message(
+            settings, _message("cid-group", "添加货号 DN4444-000 到 指定任务")
+        ) or ""
+    )
+    assert "删了货号" in (
+        dingtalk_bot.handle_message(
+            settings, _message("cid-group", "移除货号 DN4444-000 到 指定任务")
+        ) or ""
+    )
     # 全部门店的任务不允许按门店加减
     assert "全部门店" in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "加门店 QA900 到 聊天任务")) or ""
@@ -218,6 +229,29 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
     assert "还没登记" in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "盯 9999 到 指定任务")) or ""
     )
+    # 口语别名：添加监控 / 取消监控；只发一个货号时任务名就用它
+    assert "已新建" in (
+        dingtalk_bot.handle_message(
+            settings, _message("cid-group", "添加监控 监控别名任务 DN7777-001")
+        ) or ""
+    )
+    assert "已新建" in (
+        dingtalk_bot.handle_message(settings, _message("cid-group", "添加监控 DN8888-001")) or ""
+    )
+    alias_task = dingtalk_bot.handle_message(
+        settings, _message("cid-group", "创建 DN8888-001")
+    )
+    assert alias_task is not None and "已经有叫" in alias_task
+    assert "已删除" in (
+        dingtalk_bot.handle_message(settings, _message("cid-group", "取消监控 DN8888-001")) or ""
+    )
+    assert "已删除" in (
+        dingtalk_bot.handle_message(settings, _message("cid-group", "删除监控 监控别名任务"))
+        or ""
+    )
+    with SessionLocal() as db:
+        remaining = {task.name for task in db.execute(select(MonitorTask)).scalars()}
+        assert "DN8888-001" not in remaining and "监控别名任务" not in remaining
     # 通知：查看 + 修改开关
     assert "提醒设置：补货 开、售罄 开、变价 开" in (
         dingtalk_bot.handle_message(settings, _message("cid-group", "通知 指定任务")) or ""
