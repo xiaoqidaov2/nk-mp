@@ -120,7 +120,14 @@ def test_bot_links_a_conversation_and_answers_keywords() -> None:
         dingtalk_bot.handle_message(settings, _message("cid-group", "货号")) or ""
     )
     assert "Nike 连接" in (dingtalk_bot.handle_message(settings, _message("cid-group", "状态")) or "")
-    assert "可用指令" in (dingtalk_bot.handle_message(settings, _message("cid-group", "随便")) or "")
+    fallback = dingtalk_bot.handle_message(settings, _message("cid-group", "随便")) or ""
+    assert "可用指令" in fallback
+    # 帮助要分类、带例子，且多个别名都进帮助
+    for marker in ("【查询】", "【管理】", "【账号】", "例子：添加监控"):
+        assert marker in fallback
+    assert "【管理】" in (dingtalk_bot.handle_message(settings, _message("cid-group", "菜单")) or "")
+    assert "【管理】" in (dingtalk_bot.handle_message(settings, _message("cid-group", "help")) or "")
+    assert "【管理】" in (dingtalk_bot.handle_message(settings, _message("cid-group", "？")) or "")
 
     # 暂停 / 启用
     assert "已暂停" in (
