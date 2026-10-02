@@ -1,7 +1,7 @@
 import type { Mock } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { apiRequest, setCsrfToken } from "./client";
+import { apiRequest, setCsrfToken, setUnauthorizedHandler } from "./client";
 
 function jsonResponse(status: number, body: string): Response {
   return {
@@ -23,6 +23,7 @@ describe("apiRequest CSRF handling", () => {
   });
 
   afterEach(() => {
+    setUnauthorizedHandler(null);
     vi.unstubAllGlobals();
   });
 
@@ -55,5 +56,31 @@ describe("apiRequest CSRF handling", () => {
     await apiRequest("/tasks");
 
     expect(headerOf(fetchMock, "X-CSRF-Token")).toBeNull();
+  });
+
+  it("notifies the app when the session is gone", async () => {
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse(401, '{"detail":"not authenticated"}')),
+    );
+
+    await expect(apiRequest("/tasks")).rejects.toThrow();
+
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a failed login local to the login page", async () => {
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse(401, '{"detail":"邮箱或密码不正确"}')),
+    );
+
+    await expect(apiRequest("/auth/login", { method: "POST", body: "{}" })).rejects.toThrow();
+
+    expect(onUnauthorized).not.toHaveBeenCalled();
   });
 });

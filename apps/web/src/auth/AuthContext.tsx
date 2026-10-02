@@ -3,7 +3,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import type { ReactNode } from "react";
 
 import { authApi } from "@/data/api";
-import { setCsrfToken } from "@/data/client";
+import { setCsrfToken, setUnauthorizedHandler } from "@/data/client";
 import { clearAllNikeAttemptIds } from "@/data/nikeAttempt";
 import type { CurrentUser } from "@/data/types";
 
@@ -40,6 +40,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    // 别的标签页退出登录或会话过期后，任意一个 401 都会把这里拉回登录页，
+    // 而不是留着一个点什么都失败的假登录界面。
+    setUnauthorizedHandler(() => {
+      setCsrfToken("");
+      queryClient.clear();
+      setUser(null);
+    });
+    return () => setUnauthorizedHandler(null);
+  }, [queryClient]);
 
   const login = useCallback(
     async (email: string, password: string) => {

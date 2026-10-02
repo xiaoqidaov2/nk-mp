@@ -8,9 +8,15 @@ const MUTATING: Record<string, true> = {
 };
 
 let csrfToken = "";
+let unauthorizedHandler: (() => void) | null = null;
 
 export function setCsrfToken(token: string): void {
   csrfToken = token;
+}
+
+/** 会话失效（任意请求返回 401）时的全局回调，由 AuthProvider 注入。 */
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
 }
 
 function readCsrfCookie(): string {
@@ -103,6 +109,11 @@ export async function apiRequest<T>(
     headers,
     credentials: "same-origin",
   });
+
+  if (response.status === 401 && !path.startsWith("/auth/login")) {
+    // 会话在别处退出或过期：让全局状态立刻回到登录页，而不是留着假登录界面。
+    unauthorizedHandler?.();
+  }
 
   if (response.status === 204) return undefined as T;
 
