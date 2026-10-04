@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { useAuth } from "@/auth/AuthContext";
 import { CardRow, ResponsiveList } from "@/components/MobileCardList";
+import { DingTalkRobotCard } from "@/components/DingTalkRobotCard";
 import { NikeCredentialCard } from "@/components/NikeCredentialCard";
 import { PageHeader } from "@/components/PageHeader";
 import { PushChannelsCard } from "@/components/PushChannelsCard";
@@ -99,6 +100,8 @@ export function AccountPage() {
       <NikeCredentialCard />
 
       <PushChannelsCard />
+
+      <DingTalkRobotCard />
 
       <SectionCard title={ACCOUNT.quotaTitle}>
         <Space direction="vertical" size={8} style={{ width: "100%" }}>

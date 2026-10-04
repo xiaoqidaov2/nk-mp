@@ -358,7 +358,7 @@ export const PUSH = {
   dingtalkOptionalTag: "只收提醒可跳过",
   dingtalkConfiguredTag: "已配置",
   dingtalkNote:
-    "只接收补货/售罄/变价提醒的话，用上面的「钉钉群机器人」渠道就够了，本节可以跳过。这里用于在钉钉里直接给平台发指令（如「检查」「额度」「暂停」）：填上企业应用的 AppKey 与 AppSecret，保存后在钉钉里 @ 机器人或单聊它完成绑定。",
+    "只接收补货/售罄/变价提醒的话，用「消息推送」里的「钉钉群机器人」渠道就够了，这一块可以跳过。填上企业应用的 AppKey 与 AppSecret，就能在钉钉里直接给平台发指令（如「检查」「额度」「暂停」）：保存后在钉钉里 @ 机器人或单聊它完成绑定。",
   dingtalkKey: "AppKey（robotCode）",
   dingtalkSecret: "AppSecret",
   dingtalkSave: "保存",

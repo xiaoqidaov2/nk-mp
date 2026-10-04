@@ -1,21 +1,15 @@
-import { App as AntdApp, Button, Collapse, Divider, Form, Input, Modal, Select, Space, Switch, Tag, Typography } from "antd";
+import { App as AntdApp, Button, Divider, Form, Input, Modal, Select, Space, Switch, Tag, Typography } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { BTN, ERR, PUSH, TASK_LIST, formatDate } from "@/copy";
 import { ApiError } from "@/data/client";
 import { notificationApi } from "@/data/api";
-import type {
-  DingTalkLink,
-  DingTalkRobot,
-  NotificationChannel,
-  NotificationDelivery,
-  NotificationPlatform,
-} from "@/data/types";
+import type { NotificationChannel, NotificationDelivery, NotificationPlatform } from "@/data/types";
 
 import { SectionCard } from "./SectionCard";
 
-//: dingtalk_app 由「钉钉机器人」绑定自动创建，不放进手填列表。
+//: dingtalk_app 由「钉钉企业内部机器人」绑定自动创建，不放进手填列表。
 const PLATFORM_KEYS = (Object.keys(PUSH.platforms) as NotificationPlatform[]).filter(
   (key) => key !== "dingtalk_app",
 );
@@ -84,17 +78,6 @@ export function PushChannelsCard() {
     queryKey: ["notification-channels"],
     queryFn: () => notificationApi.channels(),
   });
-  const [robotKey, setRobotKey] = useState("");
-  const [robotSecret, setRobotSecret] = useState("");
-  const [editingRobot, setEditingRobot] = useState(false);
-  const robot = useQuery<DingTalkRobot>({
-    queryKey: ["dingtalk-robot"],
-    queryFn: () => notificationApi.dingtalkRobot(),
-  });
-  const links = useQuery<DingTalkLink[]>({
-    queryKey: ["dingtalk-links"],
-    queryFn: () => notificationApi.dingtalkLinks(),
-  });
   const deliveries = useQuery<NotificationDelivery[]>({
     queryKey: ["notification-deliveries"],
     queryFn: () => notificationApi.deliveries(10),
@@ -149,66 +132,6 @@ export function PushChannelsCard() {
     },
     onError: (error) => message.error(errorText(error)),
   });
-
-  const saveRobot = useMutation({
-    mutationFn: () =>
-      notificationApi.saveDingTalkRobot({
-        robot_code: robotKey.trim(),
-        robot_secret: robotSecret.trim(),
-      }),
-    onSuccess: (result) => {
-      setRobotKey("");
-      setRobotSecret("");
-      setEditingRobot(false);
-      void queryClient.invalidateQueries({ queryKey: ["dingtalk-robot"] });
-      void queryClient.invalidateQueries({ queryKey: ["dingtalk-links"] });
-      invalidateChannels();
-      message.success(PUSH.dingtalkSaved(result.robot_code));
-    },
-    onError: (error) => message.error(errorText(error)),
-  });
-
-  const removeRobot = useMutation({
-    mutationFn: () => notificationApi.removeDingTalkRobot(),
-    onSuccess: () => {
-      setEditingRobot(false);
-      void queryClient.invalidateQueries({ queryKey: ["dingtalk-robot"] });
-      void queryClient.invalidateQueries({ queryKey: ["dingtalk-links"] });
-      invalidateChannels();
-    },
-    onError: (error) => message.error(errorText(error)),
-  });
-
-  const unbind = useMutation({
-    mutationFn: (id: string) => notificationApi.removeDingTalkLink(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["dingtalk-links"] });
-      invalidateChannels();
-    },
-    onError: (error) => message.error(errorText(error)),
-  });
-
-  const confirmRemoveRobot = () => {
-    modal.confirm({
-      title: PUSH.dingtalkRemoveConfirmTitle,
-      content: PUSH.dingtalkRemoveConfirmBody,
-      okText: PUSH.dingtalkRemoveConfirmOk,
-      cancelText: BTN.cancel,
-      okButtonProps: { danger: true },
-      onOk: () => removeRobot.mutateAsync(),
-    });
-  };
-
-  const confirmUnbind = (link: DingTalkLink) => {
-    modal.confirm({
-      title: PUSH.dingtalkUnbindConfirmTitle,
-      content: PUSH.dingtalkUnbindConfirmBody,
-      okText: PUSH.dingtalkUnbindConfirmOk,
-      cancelText: BTN.cancel,
-      okButtonProps: { danger: true },
-      onOk: () => unbind.mutateAsync(link.id),
-    });
-  };
 
   const confirmRemove = (channel: NotificationChannel) => {
     modal.confirm({
@@ -288,85 +211,6 @@ export function PushChannelsCard() {
               </Space>
             </Space>
           ))
-        )}
-
-        <Divider style={{ margin: "8px 0" }} />
-        {robot.isLoading ? null : (
-          <Collapse
-            ghost
-            defaultActiveKey={robot.data?.configured ? ["robot"] : []}
-            items={[
-              {
-                key: "robot",
-                label: (
-                  <Space size={8} align="center">
-                    <span>{PUSH.dingtalkTitle}</span>
-                    <Tag color={robot.data?.configured ? "blue" : "default"}>
-                      {robot.data?.configured ? PUSH.dingtalkConfiguredTag : PUSH.dingtalkOptionalTag}
-                    </Tag>
-                  </Space>
-                ),
-                children: (
-                  <Space direction="vertical" size={8} style={{ width: "100%" }}>
-                    <Typography.Text type="secondary">{PUSH.dingtalkNote}</Typography.Text>
-                    {robot.data?.configured && !editingRobot ? (
-                      <Space wrap size={8} align="center">
-                        <Typography.Text>{PUSH.dingtalkSaved(robot.data.robot_code)}</Typography.Text>
-                        <Button size="small" onClick={() => setEditingRobot(true)}>
-                          {PUSH.dingtalkChange}
-                        </Button>
-                        <Button size="small" danger onClick={confirmRemoveRobot}>
-                          {PUSH.dingtalkRemove}
-                        </Button>
-                      </Space>
-                    ) : (
-                      <Space wrap size={8} align="center">
-                        <Input
-                          style={{ width: 200 }}
-                          placeholder={PUSH.dingtalkKey}
-                          value={robotKey}
-                          autoComplete="off"
-                          onChange={(event) => setRobotKey(event.target.value)}
-                        />
-                        <Input
-                          style={{ width: 240 }}
-                          placeholder={PUSH.dingtalkSecret}
-                          value={robotSecret}
-                          autoComplete="off"
-                          onChange={(event) => setRobotSecret(event.target.value)}
-                        />
-                        <Button
-                          size="small"
-                          type="primary"
-                          disabled={!robotKey.trim() || !robotSecret.trim()}
-                          loading={saveRobot.isPending}
-                          onClick={() => saveRobot.mutate()}
-                        >
-                          {PUSH.dingtalkSave}
-                        </Button>
-                      </Space>
-                    )}
-                    <Typography.Text type="secondary">{PUSH.dingtalkKeywords}</Typography.Text>
-                    {(links.data ?? []).length === 0 ? (
-                      <Typography.Text type="secondary">{PUSH.dingtalkLinksEmpty}</Typography.Text>
-                    ) : (
-                      (links.data ?? []).map((link) => (
-                        <Space key={link.id} wrap size={8} align="center">
-                          <Tag>
-                            {link.conversation_type === 1 ? PUSH.dingtalkLinkDm : PUSH.dingtalkLinkGroup}
-                          </Tag>
-                          <Typography.Text>{link.conversation_title || PUSH.dingtalkLinkDm}</Typography.Text>
-                          <Button size="small" danger onClick={() => confirmUnbind(link)}>
-                            {PUSH.dingtalkUnbind}
-                          </Button>
-                        </Space>
-                      ))
-                    )}
-                  </Space>
-                ),
-              },
-            ]}
-          />
         )}
 
         <Divider style={{ margin: "8px 0" }} />
