@@ -296,6 +296,8 @@ export const WIZARD = {
   storePlaceholder: "选择门店，不选＝全部已登记门店",
   taskNameLabel: "任务名称",
   frequencyLabel: "检查频率",
+  frequencyNote:
+    "按所选间隔开始新一轮检查；门店越多一轮耗时越长，实际间隔会顺延（上一轮结束前不会叠加）。",
   notifyRestock: "补货提醒",
   notifySoldOut: "售罄提醒",
   notifyPriceChange: "变价提醒",
@@ -352,9 +354,11 @@ export const PUSH = {
   lastOk: (time: string) => `最近发送 ${time}`,
   recentTitle: "最近推送",
   recentEmpty: "还没有推送记录。",
-  dingtalkTitle: "钉钉机器人",
+  dingtalkTitle: "钉钉企业内部机器人（可选）",
+  dingtalkOptionalTag: "只收提醒可跳过",
+  dingtalkConfiguredTag: "已配置",
   dingtalkNote:
-    "填上你自己钉钉企业应用的 AppKey 与 AppSecret；保存后在钉钉里 @ 机器人（或单聊它）就能完成绑定。",
+    "只接收补货/售罄/变价提醒的话，用上面的「钉钉群机器人」渠道就够了，本节可以跳过。这里用于在钉钉里直接给平台发指令（如「检查」「额度」「暂停」）：填上企业应用的 AppKey 与 AppSecret，保存后在钉钉里 @ 机器人或单聊它完成绑定。",
   dingtalkKey: "AppKey（robotCode）",
   dingtalkSecret: "AppSecret",
   dingtalkSave: "保存",
@@ -375,12 +379,12 @@ export const PUSH = {
   noChannelHint: "提醒只会发送到已配置的推送渠道。",
   noChannelLink: "去配置推送渠道",
   fields: {
-    access_token: "Webhook access_token",
+    access_token: "Webhook 地址或 access_token",
     secret: "加签密钥（可留空）",
     robot_code: "AppKey（robotCode）",
     robot_secret: "AppSecret",
     conversation_id: "群会话 openConversationId",
-    token: "机器人 token",
+    token: "Webhook 地址或 token",
     key_or_url: "Webhook 地址或 key",
     sendkey: "SendKey",
     device_key: "Device Key",
@@ -400,11 +404,11 @@ export const PUSH = {
     },
     dingtalk: {
       label: "钉钉群机器人",
-      hint: "在钉钉群 → 群设置 → 机器人 → 添加自定义机器人，复制 Webhook 里的 access_token；如已开启加签，把加签密钥填到下一项。",
+      hint: "在钉钉群 → 群设置 → 机器人 → 添加自定义机器人，把生成的 Webhook 地址整段粘贴即可（会自动识别 access_token）；只收提醒配这一个渠道就够了。如已开启加签，把加签密钥填到下一项。",
     },
     feishu: {
       label: "飞书机器人",
-      hint: "在飞书群 → 设置 → 群机器人 → 添加自定义机器人，复制 Webhook 地址末尾的 token。",
+      hint: "在飞书群 → 设置 → 群机器人 → 添加自定义机器人，把 Webhook 地址整段粘贴即可（会自动识别 token）。",
     },
     wecombot: {
       label: "企业微信机器人",

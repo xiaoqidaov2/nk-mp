@@ -261,6 +261,7 @@ export function TaskCreatePage() {
                   }))}
                 />
               </Form.Item>
+              <Typography.Text type="secondary">{WIZARD.frequencyNote}</Typography.Text>
               <Space direction="vertical" size={8}>
                 <Form.Item name="notify_on_restock" valuePropName="checked" noStyle>
                   <Switch /> <span>{WIZARD.notifyRestock}</span>

@@ -249,8 +249,18 @@ describe("PushChannelsCard", () => {
     await waitFor(() => expect(removeMock).toHaveBeenCalledWith("ch-1"));
   });
 
+  it("marks the enterprise robot section as optional", async () => {
+    renderCard();
+    expect(await screen.findByText(PUSH.dingtalkTitle)).toBeTruthy();
+    expect(screen.getByText(PUSH.dingtalkOptionalTag)).toBeTruthy();
+  });
+
   it("saves the dingtalk robot credentials the customer fills in", async () => {
     renderCard();
+    const header = await screen.findByText(PUSH.dingtalkTitle);
+    await act(async () => {
+      fireEvent.click(header);
+    });
     await screen.findByText(PUSH.dingtalkNote);
     fireEvent.change(screen.getByPlaceholderText(PUSH.dingtalkKey), {
       target: { value: "ding_app_key" },

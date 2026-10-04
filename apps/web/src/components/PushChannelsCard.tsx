@@ -1,4 +1,4 @@
-import { App as AntdApp, Button, Divider, Form, Input, Modal, Select, Space, Switch, Tag, Typography } from "antd";
+import { App as AntdApp, Button, Collapse, Divider, Form, Input, Modal, Select, Space, Switch, Tag, Typography } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
@@ -291,60 +291,82 @@ export function PushChannelsCard() {
         )}
 
         <Divider style={{ margin: "8px 0" }} />
-        <Typography.Title level={5} style={{ margin: 0 }}>
-          {PUSH.dingtalkTitle}
-        </Typography.Title>
-        <Typography.Text type="secondary">{PUSH.dingtalkNote}</Typography.Text>
-        {robot.data?.configured && !editingRobot ? (
-          <Space wrap size={8} align="center">
-            <Typography.Text>{PUSH.dingtalkSaved(robot.data.robot_code)}</Typography.Text>
-            <Button size="small" onClick={() => setEditingRobot(true)}>
-              {PUSH.dingtalkChange}
-            </Button>
-            <Button size="small" danger onClick={confirmRemoveRobot}>
-              {PUSH.dingtalkRemove}
-            </Button>
-          </Space>
-        ) : (
-          <Space wrap size={8} align="center">
-            <Input
-              style={{ width: 200 }}
-              placeholder={PUSH.dingtalkKey}
-              value={robotKey}
-              autoComplete="off"
-              onChange={(event) => setRobotKey(event.target.value)}
-            />
-            <Input
-              style={{ width: 240 }}
-              placeholder={PUSH.dingtalkSecret}
-              value={robotSecret}
-              autoComplete="off"
-              onChange={(event) => setRobotSecret(event.target.value)}
-            />
-            <Button
-              size="small"
-              type="primary"
-              disabled={!robotKey.trim() || !robotSecret.trim()}
-              loading={saveRobot.isPending}
-              onClick={() => saveRobot.mutate()}
-            >
-              {PUSH.dingtalkSave}
-            </Button>
-          </Space>
-        )}
-        <Typography.Text type="secondary">{PUSH.dingtalkKeywords}</Typography.Text>
-        {(links.data ?? []).length === 0 ? (
-          <Typography.Text type="secondary">{PUSH.dingtalkLinksEmpty}</Typography.Text>
-        ) : (
-          (links.data ?? []).map((link) => (
-            <Space key={link.id} wrap size={8} align="center">
-              <Tag>{link.conversation_type === 1 ? PUSH.dingtalkLinkDm : PUSH.dingtalkLinkGroup}</Tag>
-              <Typography.Text>{link.conversation_title || PUSH.dingtalkLinkDm}</Typography.Text>
-              <Button size="small" danger onClick={() => confirmUnbind(link)}>
-                {PUSH.dingtalkUnbind}
-              </Button>
-            </Space>
-          ))
+        {robot.isLoading ? null : (
+          <Collapse
+            ghost
+            defaultActiveKey={robot.data?.configured ? ["robot"] : []}
+            items={[
+              {
+                key: "robot",
+                label: (
+                  <Space size={8} align="center">
+                    <span>{PUSH.dingtalkTitle}</span>
+                    <Tag color={robot.data?.configured ? "blue" : "default"}>
+                      {robot.data?.configured ? PUSH.dingtalkConfiguredTag : PUSH.dingtalkOptionalTag}
+                    </Tag>
+                  </Space>
+                ),
+                children: (
+                  <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                    <Typography.Text type="secondary">{PUSH.dingtalkNote}</Typography.Text>
+                    {robot.data?.configured && !editingRobot ? (
+                      <Space wrap size={8} align="center">
+                        <Typography.Text>{PUSH.dingtalkSaved(robot.data.robot_code)}</Typography.Text>
+                        <Button size="small" onClick={() => setEditingRobot(true)}>
+                          {PUSH.dingtalkChange}
+                        </Button>
+                        <Button size="small" danger onClick={confirmRemoveRobot}>
+                          {PUSH.dingtalkRemove}
+                        </Button>
+                      </Space>
+                    ) : (
+                      <Space wrap size={8} align="center">
+                        <Input
+                          style={{ width: 200 }}
+                          placeholder={PUSH.dingtalkKey}
+                          value={robotKey}
+                          autoComplete="off"
+                          onChange={(event) => setRobotKey(event.target.value)}
+                        />
+                        <Input
+                          style={{ width: 240 }}
+                          placeholder={PUSH.dingtalkSecret}
+                          value={robotSecret}
+                          autoComplete="off"
+                          onChange={(event) => setRobotSecret(event.target.value)}
+                        />
+                        <Button
+                          size="small"
+                          type="primary"
+                          disabled={!robotKey.trim() || !robotSecret.trim()}
+                          loading={saveRobot.isPending}
+                          onClick={() => saveRobot.mutate()}
+                        >
+                          {PUSH.dingtalkSave}
+                        </Button>
+                      </Space>
+                    )}
+                    <Typography.Text type="secondary">{PUSH.dingtalkKeywords}</Typography.Text>
+                    {(links.data ?? []).length === 0 ? (
+                      <Typography.Text type="secondary">{PUSH.dingtalkLinksEmpty}</Typography.Text>
+                    ) : (
+                      (links.data ?? []).map((link) => (
+                        <Space key={link.id} wrap size={8} align="center">
+                          <Tag>
+                            {link.conversation_type === 1 ? PUSH.dingtalkLinkDm : PUSH.dingtalkLinkGroup}
+                          </Tag>
+                          <Typography.Text>{link.conversation_title || PUSH.dingtalkLinkDm}</Typography.Text>
+                          <Button size="small" danger onClick={() => confirmUnbind(link)}>
+                            {PUSH.dingtalkUnbind}
+                          </Button>
+                        </Space>
+                      ))
+                    )}
+                  </Space>
+                ),
+              },
+            ]}
+          />
         )}
 
         <Divider style={{ margin: "8px 0" }} />
