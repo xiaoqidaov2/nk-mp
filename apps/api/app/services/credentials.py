@@ -197,7 +197,9 @@ class CredentialService:
             expires_at = record.access_expires_at
             if status == CredentialStatus.ACTIVE.value and expires_at is not None:
                 remaining = (expires_at - datetime.now(UTC)).total_seconds()
-                if remaining < 0:
+                if remaining < 0 and not record.refresh_token_enc:
+                    # Only an expired token without a refresh token genuinely
+                    # needs the user; a renewable one is renewed automatically.
                     status = CredentialStatus.NEEDS_AUTHORIZATION.value
                 elif remaining < 3600:
                     status = CredentialStatus.EXPIRING.value
@@ -522,3 +524,43 @@ class CredentialService:
         if record.status == CredentialStatus.UNASSIGNED.value:
             return CredentialRequired("Nike 账号尚未连接")
         return CredentialUnavailable(message)
+
+
+def refresh_expiring(settings: Settings, *, limit: int = 50) -> int:
+    """Scheduler hook: renew credentials near to expiry without user action.
+
+    A renewable credential must never age into the "needs re-verify" look just
+    because nobody used it for an hour; idle accounts stay warm so the account
+    card keeps showing a live connection and scans never start on a dead token.
+    """
+    threshold = datetime.now(UTC) + timedelta(seconds=REFRESH_MARGIN_SECONDS)
+    with SessionLocal() as session:
+        owners = list(
+            session.execute(
+                select(Credential.owner_user_id)
+                .where(
+                    Credential.owner_user_id.is_not(None),
+                    Credential.status.in_(
+                        [
+                            CredentialStatus.ACTIVE.value,
+                            CredentialStatus.EXPIRING.value,
+                        ]
+                    ),
+                    Credential.refresh_token_enc != "",
+                    Credential.access_expires_at.is_not(None),
+                    Credential.access_expires_at <= threshold,
+                )
+                .order_by(Credential.access_expires_at)
+                .limit(limit)
+            ).scalars()
+        )
+    renewed = 0
+    for owner_user_id in owners:
+        try:
+            if CredentialService(settings, owner_user_id).try_refresh():
+                renewed += 1
+        except CredentialError:
+            # A transient upstream problem is retried on the next tick; a
+            # permanent rejection is recorded on the row by the refresh itself.
+            continue
+    return renewed

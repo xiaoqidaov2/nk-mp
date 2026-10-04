@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.services import nike_auth
 from app.services.bootstrap import enqueue_due
+from app.services.credentials import refresh_expiring
 from app.services.scheduler import dispatch_due_tasks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -41,6 +42,9 @@ def main() -> None:
             if refreshed:
                 session.commit()
                 logger.info("enqueued %s catalogue refresh plan(s)", refreshed)
+            renewed = refresh_expiring(settings)
+            if renewed:
+                logger.info("renewed %s credential(s)", renewed)
         except Exception:  # noqa: BLE001 - keep the scheduler alive
             session.rollback()
             logger.exception("scheduler tick failed")

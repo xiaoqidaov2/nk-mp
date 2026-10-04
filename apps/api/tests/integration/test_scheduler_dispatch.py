@@ -6,13 +6,15 @@ usable Nike binding, so the scheduler never falls back to a shared account.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+import httpx
+from sqlalchemy import select, update
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import JobStatus, MonitorTask, ScanJob, ScanJobStore, Store
+from app.models import Credential, CredentialStatus, JobStatus, MonitorTask, ScanJob, ScanJobStore, Store
+from app.services.credentials import CredentialService, refresh_expiring
 from app.services.scheduler import dispatch_due_tasks
 
 from .helpers import make_store, make_style, make_tenant, make_user, store_credential
@@ -162,3 +164,75 @@ def test_stale_catalogue_is_refreshed_with_the_owners_own_binding() -> None:
         assert db.get(OwnerBootstrap, unbound_id) is None
         # 已经在排队的不会重复登记。
         assert enqueue_due(db, settings) == 0
+
+
+def test_expiring_credential_is_renewed_without_user_action(monkeypatch) -> None:
+    """调度器续期：到期/临近到期的连接自动换新，不再让用户重新验证。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="idle@example.com")
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id, access_token="old-access", refresh_token="old-refresh")
+
+    with SessionLocal() as db:
+        db.execute(
+            update(Credential)
+            .where(Credential.owner_user_id == user_id)
+            .values(access_expires_at=datetime.now(UTC) - timedelta(minutes=1))
+        )
+        db.commit()
+
+    calls: dict[str, object] = {}
+
+    class _TokenResponse:
+        status_code = 200
+
+        def json(self):  # noqa: ANN201 - duck-typed for the test
+            return {"access_token": "new-access", "refresh_token": "new-refresh"}
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        calls["url"] = url
+        calls["data"] = kwargs.get("data")
+        return _TokenResponse()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    assert refresh_expiring(settings) == 1
+    assert str(calls["url"]).endswith("/token/v1")
+    data = calls["data"]
+    assert isinstance(data, dict) and data.get("grant_type") == "refresh_token"
+
+    service = CredentialService(settings, user_id)
+    assert service.access_token() == "new-access"
+    info = service.status()
+    assert info is not None
+    assert info.status == CredentialStatus.ACTIVE.value
+    # 续期完成后同一个连接不会再次发请求。
+    assert refresh_expiring(settings) == 0
+
+
+def test_expired_credential_without_refresh_token_stays_for_the_user() -> None:
+    """没有续期凭据的过期连接保持“需要重新验证”，调度器不会碰它。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="norefresh@example.com")
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id, access_token="old-access", refresh_token=None)
+
+    with SessionLocal() as db:
+        db.execute(
+            update(Credential)
+            .where(Credential.owner_user_id == user_id)
+            .values(access_expires_at=datetime.now(UTC) - timedelta(minutes=1))
+        )
+        db.commit()
+
+    assert refresh_expiring(settings) == 0
+
+    info = CredentialService(settings, user_id).status()
+    assert info is not None
+    assert info.status == CredentialStatus.NEEDS_AUTHORIZATION.value

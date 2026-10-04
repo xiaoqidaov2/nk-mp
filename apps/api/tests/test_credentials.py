@@ -9,7 +9,8 @@ What remains genuinely unit-testable is pure logic:
 
 * :func:`_decode_expiry` — token claim decoding and its fallback to ``None``;
 * the stable ``NIKE_*`` ``.code`` on the credential exception hierarchy;
-* the ``status()`` derivation (ACTIVE -> EXPIRING / NEEDS_AUTHORIZATION)
+* the ``status()`` derivation (ACTIVE -> EXPIRING while renewable or near
+  expiry; NEEDS_AUTHORIZATION only when an expired row cannot renew)
   against a single lightweight credential row.
 """
 
@@ -179,7 +180,18 @@ def test_status_derives_expiring_within_the_refresh_margin(settings) -> None:
     assert info.status == CredentialStatus.EXPIRING.value
 
 
-def test_status_derives_needs_authorization_when_expired(settings) -> None:
+def test_status_derives_expiring_when_expired_but_renewable(settings) -> None:
+    """An expired access token with a refresh token still renews on its own."""
+    record = _credential(
+        access_expires_at=datetime.now(UTC) - timedelta(seconds=60),
+        refresh_token_enc="enc:refresh",
+    )
+    info = _service(settings, record).status()
+    assert info is not None
+    assert info.status == CredentialStatus.EXPIRING.value
+
+
+def test_status_derives_needs_authorization_when_expired_without_refresh_token(settings) -> None:
     record = _credential(access_expires_at=datetime.now(UTC) - timedelta(seconds=60))
     info = _service(settings, record).status()
     assert info is not None

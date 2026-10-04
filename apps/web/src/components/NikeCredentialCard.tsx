@@ -1,4 +1,4 @@
-import { Alert, App as AntdApp, Button, Descriptions, Space, Tag } from "antd";
+import { Alert, App as AntdApp, Button, Descriptions, Space, Tag, Typography } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient } from "@tanstack/react-query";
 import { useState } from "react";
@@ -18,6 +18,7 @@ import { StatusPill } from "./StatusPill";
 const CARD_SUBTITLE = "独立第三方，非 Nike 官方";
 const CARD_DECLARATION =
   "本平台不是 Nike 官方页面，也不会要求你输入 Nike 密码。只通过短信验证码获得只读授权，并加密保存续期凭证。";
+const CARD_RENEWAL_NOTE = "登录状态到期前会自动续期，无需重新验证。";
 
 /** ACTIVE/EXPIRING are the only states that authorise personal collection. */
 export function isCredentialActive(status: NikeCredentialStatus | undefined): boolean {
@@ -148,6 +149,7 @@ export function NikeCredentialCard() {
                   : "—"}
               </Descriptions.Item>
             </Descriptions>
+            <Typography.Text type="secondary">{CARD_RENEWAL_NOTE}</Typography.Text>
             <Alert type="warning" showIcon message={MODALS.changeAccount().content} />
             <Space wrap>
               <Button
