@@ -105,12 +105,12 @@ HOST_SCHEMES = {
 
 #: 平台表单字段的中文名；缺失字段的报错文案用它拼装。
 FIELD_LABELS = {
-    "access_token": "Webhook access_token",
+    "access_token": "Webhook 地址或 access_token",
     "secret": "加签密钥",
     "robot_code": "AppKey（robotCode）",
     "robot_secret": "AppSecret",
     "conversation_id": "群会话 openConversationId",
-    "token": "机器人 token",
+    "token": "Webhook 地址或 token",
     "key_or_url": "Webhook 地址或 key",
     "sendkey": "SendKey",
     "device_key": "Device Key",
@@ -138,6 +138,9 @@ PLATFORM_LABELS = {
 
 _DEFAULT_BARK_SERVER = "https://api.day.app"
 _WECOMBOT_KEY = re.compile(r"[?&]key=([A-Za-z0-9_-]+)")
+#: 客户常把整段 Webhook 地址粘进来：从中还原所需 token，免得让人手工截取。
+_DINGTALK_TOKEN = re.compile(r"access_token=([A-Za-z0-9_-]+)")
+_FEISHU_HOOK = re.compile(r"/hook/([A-Za-z0-9_-]+)")
 
 #: 钉钉企业内部应用机器人（新版接口）：AppKey/AppSecret 换 token 后发消息。
 DINGTALK_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
@@ -169,6 +172,32 @@ def _require(fields: dict[str, str], name: str) -> str:
     return value
 
 
+def _extract_dingtalk_token(raw: str) -> str:
+    """整段 Webhook 地址或裸 access_token 都接受；地址里没有 token 时给出提示。"""
+    found = _DINGTALK_TOKEN.search(raw)
+    if found:
+        return found.group(1)
+    if "://" in raw or "/robot/send" in raw:
+        raise PushTargetError(
+            PUSH_TARGET_INVALID,
+            "地址里没有识别出 access_token；请整段粘贴钉钉机器人的 Webhook 地址，或只填写 access_token。",
+        )
+    return raw
+
+
+def _extract_feishu_token(raw: str) -> str:
+    """同样接受整段 Webhook 地址：取 /hook/ 后面的 token。"""
+    found = _FEISHU_HOOK.search(raw)
+    if found:
+        return found.group(1)
+    if "://" in raw:
+        raise PushTargetError(
+            PUSH_TARGET_INVALID,
+            "地址里没有识别出 token；请整段粘贴飞书机器人的 Webhook 地址，或只填写 token。",
+        )
+    return raw
+
+
 def build_target(platform: str, fields: dict[str, str]) -> str:
     """Turn the per-platform form fields into the target we store."""
     if platform == NotificationPlatform.DINGTALK_APP.value:
@@ -181,13 +210,13 @@ def build_target(platform: str, fields: dict[str, str]) -> str:
             f"&conversation={quote(conversation_id, safe='')}"
         )
     if platform == NotificationPlatform.DINGTALK.value:
-        access_token = _require(fields, "access_token")
+        access_token = _extract_dingtalk_token(_require(fields, "access_token"))
         secret = str(fields.get("secret") or "").strip()
         if secret:
             return f"dingtalk://{secret}@{access_token}/?format=markdown"
         return f"dingtalk://{access_token}/?format=markdown"
     if platform == NotificationPlatform.FEISHU.value:
-        return f"feishu://{_require(fields, 'token')}"
+        return f"feishu://{_extract_feishu_token(_require(fields, 'token'))}"
     if platform == NotificationPlatform.WECOMBOT.value:
         raw = _require(fields, "key_or_url")
         found = _WECOMBOT_KEY.search(raw)
@@ -238,6 +267,9 @@ def target_hint(platform: str, url: str) -> str:
         robot, _secret, conversation, user_id, is_dm = parsed
         tail = (user_id or conversation)[-4:]
         return f"{'钉钉单聊' if is_dm else '钉钉群'} · {robot[:20]} → ••••{tail}"
+    if platform == NotificationPlatform.DINGTALK.value:
+        token = urlsplit(url).netloc.rsplit("@", 1)[-1]
+        return "••••" + token[-4:] if token else "••••"
     return "••••" + url[-4:]
 
 

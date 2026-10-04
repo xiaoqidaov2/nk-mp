@@ -27,7 +27,15 @@ from app.models import (
 from app.security import encrypt_secret, secret_fingerprint
 from app.services import push
 
-from .helpers import make_store, make_style, make_tenant, make_user
+from .helpers import (
+    csrf_headers,
+    login_session,
+    make_store,
+    make_style,
+    make_tenant,
+    make_user,
+    session_cookies,
+)
 
 TARGET = "json://127.0.0.1:19100/__push"
 
@@ -290,3 +298,31 @@ def test_delivery_for_a_removed_channel_fails_instead_of_looping() -> None:
         assert row.last_error_code == push.CHANNEL_REMOVED
         assert row.last_error == push.CHANNEL_REMOVED_TEXT
         assert row.lease_until is None
+
+
+def test_a_pasted_dingtalk_webhook_address_is_accepted_by_the_api(client) -> None:
+    """端到端：客户把整段 Webhook 地址填进渠道表单，API 自动还原出 token。"""
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email=f"webhook-{uuid4().hex[:8]}@example.com")
+        db.commit()
+        email = user.email
+    session = login_session(client, email)
+
+    response = client.post(
+        "/api/v1/me/notification-channels",
+        json={
+            "platform": "dingtalk",
+            "name": "",
+            "fields": {
+                "access_token": "https://oapi.dingtalk.com/robot/send?access_token=abcdef123456"
+            },
+        },
+        headers=csrf_headers(session["csrf"]),
+        cookies=session_cookies(session["session"]),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["platform"] == "dingtalk"
+    # 提示是真实 token 的尾 4 位，而不是 Apprise URL 的 “down”。
+    assert body["target_hint"] == "••••3456"

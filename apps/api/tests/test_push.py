@@ -92,10 +92,51 @@ def test_build_target_names_the_missing_field() -> None:
     with pytest.raises(push.PushTargetError) as excinfo:
         push.build_target("dingtalk", {})
     assert excinfo.value.code == push.PUSH_TARGET_INVALID
-    assert excinfo.value.detail == "请填写Webhook access_token。"
+    assert excinfo.value.detail == "请填写Webhook 地址或 access_token。"
     with pytest.raises(push.PushTargetError) as excinfo:
         push.build_target("mailto", {"smtp_host": "smtp.example.com"})
     assert excinfo.value.detail == "请填写邮箱账号。"
+
+
+def test_build_target_accepts_a_pasted_dingtalk_webhook_address() -> None:
+    """客户把整段 Webhook 地址粘进来时自动取 access_token。"""
+    assert (
+        push.build_target(
+            "dingtalk",
+            {"access_token": "https://oapi.dingtalk.com/robot/send?access_token=abc123XYZ"},
+        )
+        == "dingtalk://abc123XYZ/?format=markdown"
+    )
+    assert (
+        push.build_target(
+            "dingtalk",
+            {
+                "access_token": "  https://oapi.dingtalk.com/robot/send?access_token=abc123XYZ  ",
+                "secret": "sec",
+            },
+        )
+        == "dingtalk://sec@abc123XYZ/?format=markdown"
+    )
+
+
+def test_build_target_rejects_a_dingtalk_address_without_a_token() -> None:
+    with pytest.raises(push.PushTargetError) as excinfo:
+        push.build_target("dingtalk", {"access_token": "https://oapi.dingtalk.com/robot/send"})
+    assert excinfo.value.code == push.PUSH_TARGET_INVALID
+    assert "access_token" in excinfo.value.detail
+
+
+def test_build_target_accepts_a_pasted_feishu_webhook_address() -> None:
+    assert (
+        push.build_target(
+            "feishu",
+            {"token": "https://open.feishu.cn/open-apis/bot/v2/hook/feishu-token-1"},
+        )
+        == "feishu://feishu-token-1"
+    )
+    with pytest.raises(push.PushTargetError) as excinfo:
+        push.build_target("feishu", {"token": "https://open.feishu.cn/open-apis/bot/v2/hook/"})
+    assert excinfo.value.code == push.PUSH_TARGET_INVALID
 
 
 def test_target_hint_keeps_a_short_reminder_only() -> None:
@@ -104,6 +145,12 @@ def test_target_hint_keeps_a_short_reminder_only() -> None:
         == "a@y.com"
     )
     assert push.target_hint("custom", "json://127.0.0.1:19100/__push") == "••••push"
+    # 钉钉渠道提示用 token 结尾，而不是 Apprise URL 的固定后缀。
+    assert push.target_hint("dingtalk", "dingtalk://abcdef123456/?format=markdown") == "••••3456"
+    assert (
+        push.target_hint("dingtalk", "dingtalk://sec@abcdef123456/?format=markdown")
+        == "••••3456"
+    )
 
 
 def test_validate_target_rejects_unknown_schemes() -> None:
