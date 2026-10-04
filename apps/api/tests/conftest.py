@@ -9,6 +9,10 @@ import time
 # any application module is imported.
 os.environ.setdefault("NIKE_MP_CREDENTIAL_KEY", "test-key-for-unit-tests")
 
+# The test client only ever speaks plain http: a Secure session cookie would
+# silently never be sent back, so the suite must run with insecure cookies.
+os.environ["NIKE_MP_COOKIE_SECURE"] = "false"
+
 # Integration tests only run against an explicitly provided scratch database.
 # The runtime database URL is never silently reused for tests.
 if os.environ.get("NIKE_MP_TEST_DATABASE_URL"):

@@ -10,9 +10,10 @@ with a new revision that ``alembic check`` verifies against the metadata.
 """
 from __future__ import annotations
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = '0001_initial'
 down_revision = None
@@ -220,7 +221,12 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['style_id'], ['style.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index('ix_observation_store_style_checked', 'observation', ['store_id', 'style_id', 'checked_at'], unique=False)
+    op.create_index(
+        'ix_observation_store_style_checked',
+        'observation',
+        ['store_id', 'style_id', 'checked_at'],
+        unique=False,
+    )
     op.create_table('scan_job_store',
     sa.Column('id', sa.BigInteger(), autoincrement=True, nullable=False),
     sa.Column('job_id', sa.UUID(), nullable=False),
@@ -265,7 +271,12 @@ def upgrade() -> None:
     sa.UniqueConstraint('dedupe_key', name='uq_change_event_dedupe')
     )
     op.create_index('ix_change_event_detected', 'change_event', ['detected_at'], unique=False)
-    op.create_index('ix_change_event_tenant_detected', 'change_event', ['tenant_id', 'detected_at'], unique=False)
+    op.create_index(
+        'ix_change_event_tenant_detected',
+        'change_event',
+        ['tenant_id', 'detected_at'],
+        unique=False,
+    )
     op.create_table('observation_latest',
     sa.Column('store_id', sa.UUID(), nullable=False),
     sa.Column('style_id', sa.UUID(), nullable=False),
