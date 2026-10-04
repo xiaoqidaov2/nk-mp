@@ -138,11 +138,6 @@ export function NikeCredentialCard() {
               <Descriptions.Item label="已连接手机号">
                 {credential.data?.phone_masked || "—"}
               </Descriptions.Item>
-              <Descriptions.Item label="有效期至">
-                {credential.data?.access_expires_at
-                  ? formatDateTimeSeconds(credential.data.access_expires_at)
-                  : "—"}
-              </Descriptions.Item>
               <Descriptions.Item label="最近续期">
                 {credential.data?.last_refreshed_at
                   ? formatDateTimeSeconds(credential.data.last_refreshed_at)

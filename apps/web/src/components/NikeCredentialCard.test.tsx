@@ -422,6 +422,9 @@ describe("NikeCredentialCard", () => {
 
     renderCard();
     expect(await screen.findByText("已连接（自动续期）")).toBeInTheDocument();
+    // 自动续期下不展示到期时间：只保留“最近续期”，避免误导。
+    expect(screen.queryByText("有效期至")).not.toBeInTheDocument();
+    expect(screen.getByText("最近续期")).toBeInTheDocument();
 
     await click("断开连接");
     // Destructive actions require the §2.2 confirmation dialog.

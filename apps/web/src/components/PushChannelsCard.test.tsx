@@ -234,6 +234,14 @@ describe("PushChannelsCard", () => {
     await waitFor(() => expect(removeMock).toHaveBeenCalledWith("ch-1"));
   });
 
+  it("labels a system notice without a scan task", async () => {
+    deliveriesMock.mockResolvedValue([
+      delivery({ job_id: null, task_name: null, title: "【Nike 连接】需要重新验证" }),
+    ]);
+    renderCard();
+    expect(await screen.findByText(/系统通知/)).toBeTruthy();
+  });
+
   it("explains an empty push history", async () => {
     renderCard();
     expect(await screen.findByText(PUSH.recentEmpty)).toBeTruthy();

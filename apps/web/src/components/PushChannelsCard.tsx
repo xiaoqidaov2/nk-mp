@@ -223,7 +223,7 @@ export function PushChannelsCard() {
           records.map((record) => (
             <Space key={record.id} wrap size={8} align="center">
               <Typography.Text type="secondary">
-                {`${formatDate(record.created_at)} · ${record.task_name ?? TASK_LIST.manualCheck} · ${record.channel_name ?? PUSH.channelRemoved}`}
+                {`${formatDate(record.created_at)} · ${record.job_id ? (record.task_name ?? TASK_LIST.manualCheck) : PUSH.systemNotice} · ${record.channel_name ?? PUSH.channelRemoved}`}
               </Typography.Text>
               <Tag color={STATE_COLOR[record.state]}>{STATE_LABEL[record.state]}</Tag>
               {record.last_error ? (

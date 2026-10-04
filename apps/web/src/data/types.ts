@@ -257,7 +257,7 @@ export type NotificationDeliveryState = "PENDING" | "SENT" | "FAILED";
 /** 一次检查聚合出来的单条推送及其投递状态。 */
 export interface NotificationDelivery {
   id: number;
-  job_id: string;
+  job_id: string | null;
   task_name: string | null;
   channel_id: string | null;
   channel_name: string | null;

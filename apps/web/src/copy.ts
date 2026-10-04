@@ -354,6 +354,7 @@ export const PUSH = {
   lastOk: (time: string) => `最近发送 ${time}`,
   recentTitle: "最近推送",
   recentEmpty: "还没有推送记录。",
+  systemNotice: "系统通知",
   dingtalkTitle: "钉钉企业内部机器人（可选）",
   dingtalkOptionalTag: "只收提醒可跳过",
   dingtalkConfiguredTag: "已配置",
