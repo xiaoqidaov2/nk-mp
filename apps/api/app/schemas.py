@@ -305,7 +305,7 @@ class NotificationChannelOut(BaseModel):
 
 class NotificationDeliveryOut(BaseModel):
     id: int
-    job_id: uuid.UUID
+    job_id: uuid.UUID | None
     task_name: str | None
     channel_id: uuid.UUID | None
     channel_name: str | None

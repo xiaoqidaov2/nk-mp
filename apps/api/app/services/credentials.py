@@ -33,6 +33,7 @@ from app.config import Settings
 from app.db import SessionLocal
 from app.models import Credential, CredentialStatus, Tenant, User
 from app.security import decrypt_secret, encrypt_secret
+from app.services import push
 
 REFRESH_MARGIN_SECONDS = 300
 
@@ -199,10 +200,9 @@ class CredentialService:
                 remaining = (expires_at - datetime.now(UTC)).total_seconds()
                 if remaining < 0 and not record.refresh_token_enc:
                     # Only an expired token without a refresh token genuinely
-                    # needs the user; a renewable one is renewed automatically.
+                    # needs the user; a renewable one is renewed automatically
+                    # and never reads as "expiring".
                     status = CredentialStatus.NEEDS_AUTHORIZATION.value
-                elif remaining < 3600:
-                    status = CredentialStatus.EXPIRING.value
             return CredentialStatusInfo(
                 status=status,
                 phone_masked=record.phone_masked,
@@ -416,6 +416,8 @@ class CredentialService:
             # A previously revoked grant stays revoked until the user re-binds.
             return False
         if not record.refresh_token_enc:
+            if record.status != CredentialStatus.NEEDS_AUTHORIZATION.value:
+                self._notify_reauth_required(session, record)
             self._mark_error(record, CredentialStatus.NEEDS_AUTHORIZATION.value, "NIKE_REAUTH_REQUIRED")
             session.commit()
             return False
@@ -484,6 +486,8 @@ class CredentialService:
             ):
                 # Verified permanent rejection: the grant was revoked or the
                 # client registration changed; only the user can re-authorize.
+                if record.status != CredentialStatus.NEEDS_AUTHORIZATION.value:
+                    self._notify_reauth_required(session, record)
                 self._mark_error(record, CredentialStatus.NEEDS_AUTHORIZATION.value, "NIKE_REAUTH_REQUIRED")
                 session.commit()
                 return False
@@ -514,6 +518,17 @@ class CredentialService:
         record.last_error_code = code
         record.updated_at = datetime.now(UTC)
         logger.info("credential refresh outcome owner=%s code=%s", self.owner_user_id, code)
+
+    def _notify_reauth_required(self, session: Session, record: Credential) -> None:
+        """入队一条系统通知：自动续期已停止，只能由用户重新验证。"""
+        link = f"{self.settings.public_base_url.rstrip('/')}/account"
+        push.enqueue_system_notification(
+            session,
+            self.settings,
+            owner_user_id=record.owner_user_id,
+            title=push.REAUTH_REQUIRED_TITLE,
+            body=f"{push.REAUTH_REQUIRED_BODY}\n{link}",
+        )
 
     def _auth_failure(self, record: Credential, message: str) -> CredentialError:
         """Map the current credential state onto the stable error contract."""

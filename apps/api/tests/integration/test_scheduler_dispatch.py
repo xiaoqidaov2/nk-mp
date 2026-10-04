@@ -13,7 +13,19 @@ from sqlalchemy import select, update
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Credential, CredentialStatus, JobStatus, MonitorTask, ScanJob, ScanJobStore, Store
+from app.models import (
+    Credential,
+    CredentialStatus,
+    JobStatus,
+    MonitorTask,
+    NotificationChannel,
+    NotificationDelivery,
+    ScanJob,
+    ScanJobStore,
+    Store,
+)
+from app.security import encrypt_secret, secret_fingerprint
+from app.services import push
 from app.services.credentials import CredentialService, refresh_expiring
 from app.services.scheduler import dispatch_due_tasks
 
@@ -236,3 +248,62 @@ def test_expired_credential_without_refresh_token_stays_for_the_user() -> None:
     info = CredentialService(settings, user_id).status()
     assert info is not None
     assert info.status == CredentialStatus.NEEDS_AUTHORIZATION.value
+
+
+def test_permanent_rejection_queues_a_reauth_notice(monkeypatch) -> None:
+    """续期被永久拒绝：标记需要重新验证，并给用户入队一条系统通知（只发一次）。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="reauth@example.com")
+        db.add(
+            NotificationChannel(
+                owner_user_id=user.id,
+                platform="custom",
+                name="测试渠道",
+                target_enc=encrypt_secret("json://127.0.0.1:19100/__push"),
+                target_fingerprint=secret_fingerprint(
+                    "json://127.0.0.1:19100/__push", purpose="push"
+                ),
+                target_hint="••••push",
+                enabled=True,
+            )
+        )
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id, access_token="old-access", refresh_token="old-refresh")
+
+    with SessionLocal() as db:
+        db.execute(
+            update(Credential)
+            .where(Credential.owner_user_id == user_id)
+            .values(access_expires_at=datetime.now(UTC) - timedelta(minutes=1))
+        )
+        db.commit()
+
+    class _Reject:
+        status_code = 400
+
+        def json(self):  # noqa: ANN201 - duck-typed for the test
+            return {"error": "invalid_grant"}
+
+    monkeypatch.setattr(httpx, "post", lambda url, **kwargs: _Reject())
+
+    assert CredentialService(settings, user_id).try_refresh(force=True) is False
+
+    with SessionLocal() as db:
+        notice = db.execute(select(NotificationDelivery)).scalar_one()
+        assert notice.job_id is None
+        assert notice.task_id is None
+        assert notice.title == push.REAUTH_REQUIRED_TITLE
+        assert push.REAUTH_REQUIRED_BODY in notice.body
+        assert notice.state == "PENDING"
+        credential = db.execute(
+            select(Credential).where(Credential.owner_user_id == user_id)
+        ).scalar_one()
+        assert credential.status == CredentialStatus.NEEDS_AUTHORIZATION.value
+
+    # 状态守卫（以及冷却期）阻止重复通知。
+    assert CredentialService(settings, user_id).try_refresh(force=True) is False
+    with SessionLocal() as db:
+        assert len(db.execute(select(NotificationDelivery)).scalars().all()) == 1

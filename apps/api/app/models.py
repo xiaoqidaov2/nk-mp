@@ -650,7 +650,11 @@ class NotificationChannel(Base):
 
 
 class NotificationDelivery(Base):
-    """Outbox row: one aggregated message per (job, channel)."""
+    """Outbox row: one aggregated message per (job, channel).
+
+    System notices (e.g. a credential that truly needs re-verification) carry
+    no scan job; ``job_id`` is NULL for them.
+    """
 
     __tablename__ = "notification_delivery"
     __table_args__ = (
@@ -663,7 +667,7 @@ class NotificationDelivery(Base):
     channel_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("notification_channel.id", ondelete="SET NULL")
     )
-    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scan_job.id", ondelete="CASCADE"))
+    job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("scan_job.id", ondelete="CASCADE"))
     task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("monitor_task.id", ondelete="SET NULL"))
     title: Mapped[str] = mapped_column(String(200), default="")
     body: Mapped[str] = mapped_column(Text, default="")

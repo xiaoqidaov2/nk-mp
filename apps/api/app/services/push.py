@@ -55,6 +55,10 @@ DELIVERY_FAILED_TEXT = "发送失败：平台没有接受这条消息（可在�
 #: 渠道被删除后残留的投递记录：历史保留，但不再尝试发送。
 CHANNEL_REMOVED_TEXT = "这条提醒的渠道已被删除，没有发送。"
 
+#: 自动续期真的无法继续时发给用户的系统通知（由凭据服务入队）。
+REAUTH_REQUIRED_TITLE = "【Nike 连接】需要重新验证"
+REAUTH_REQUIRED_BODY = "你的 Nike 账号自动续期已停止，检查不会更新数据；请打开「账户与额度」页重新验证。"
+
 #: 测试消息（渠道详情页的“发送测试”）。
 TEST_TITLE = "【测试】门店监控台"
 TEST_BODY = "这是一条测试消息。收到即表示该渠道可用。"
@@ -603,6 +607,65 @@ def enqueue_for_job(session: Session, settings: Settings, job: ScanJob) -> int:
     if created:
         session.flush()
     return created
+
+
+def enqueue_system_notification(
+    session: Session,
+    settings: Settings,
+    *,
+    owner_user_id,
+    title: str,
+    body: str,
+) -> int:
+    """Queue one account-level notice to every enabled channel of an owner.
+
+    Used when a credential truly needs re-verification: the notice reuses the
+    same outbox (no scan job) so it retries and shows up in the delivery
+    history; the caller owns the transaction.
+    """
+    if not settings.push_enabled:
+        return 0
+    channels = (
+        session.execute(
+            select(NotificationChannel).where(
+                NotificationChannel.owner_user_id == owner_user_id,
+                NotificationChannel.enabled.is_(True),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not channels:
+        return 0
+    since = datetime.now(UTC) - timedelta(days=1)
+    recent = session.execute(
+        select(func.count())
+        .select_from(NotificationDelivery)
+        .where(
+            NotificationDelivery.owner_user_id == owner_user_id,
+            NotificationDelivery.created_at >= since,
+        )
+    ).scalar_one()
+    if recent >= settings.push_max_per_day:
+        logger.warning(
+            "push daily cap reached for owner %s; system notice not queued",
+            owner_user_id,
+        )
+        return 0
+    for channel in channels:
+        session.add(
+            NotificationDelivery(
+                owner_user_id=owner_user_id,
+                channel_id=channel.id,
+                job_id=None,
+                task_id=None,
+                title=title,
+                body=body,
+                state=NotificationDeliveryState.PENDING.value,
+            )
+        )
+    session.flush()
+    return len(channels)
 
 
 def _backoff_seconds(settings: Settings) -> list[int]:
