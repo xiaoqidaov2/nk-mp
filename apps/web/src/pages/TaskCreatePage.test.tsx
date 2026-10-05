@@ -4,6 +4,7 @@ import { App as AntdApp } from "antd";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ApiError } from "@/data/client";
 import { catalogApi, nikeCredentialApi, scanApi, taskApi } from "@/data/api";
 import type { MonitorTask, NikeCredentialOut, ScanJob } from "@/data/types";
 
@@ -11,7 +12,7 @@ import { TaskCreatePage } from "./TaskCreatePage";
 
 vi.mock("@/data/api", () => ({
   catalogApi: { stores: vi.fn(), styles: vi.fn() },
-  taskApi: { create: vi.fn() },
+  taskApi: { create: vi.fn(), list: vi.fn() },
   scanApi: { create: vi.fn() },
   nikeCredentialApi: { status: vi.fn() },
 }));
@@ -23,6 +24,7 @@ vi.mock("@/auth/AuthContext", () => ({
 const storesMock = vi.mocked(catalogApi.stores);
 const stylesMock = vi.mocked(catalogApi.styles);
 const createTaskMock = vi.mocked(taskApi.create);
+const listTasksMock = vi.mocked(taskApi.list);
 const createScanMock = vi.mocked(scanApi.create);
 const credentialMock = vi.mocked(nikeCredentialApi.status);
 
@@ -69,11 +71,27 @@ async function clickButton(name: string) {
   });
 }
 
+async function clickModalConfirm(name: string) {
+  await waitFor(() => expect(document.querySelector(".ant-modal-confirm-btns")).toBeTruthy());
+  const buttons = Array.from(
+    document.querySelectorAll<HTMLElement>(".ant-modal-confirm-btns .ant-btn"),
+  );
+  const target = name.replace(/\s+/g, "");
+  const match =
+    buttons.find((button) => (button.textContent ?? "").replace(/\s+/g, "") === target) ??
+    buttons[buttons.length - 1];
+  await act(async () => {
+    fireEvent.click(match);
+  });
+}
+
 describe("TaskCreatePage wizard", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     storesMock.mockResolvedValue([]);
     stylesMock.mockResolvedValue([]);
     createTaskMock.mockResolvedValue({ id: "task-1" } as MonitorTask);
+    listTasksMock.mockResolvedValue([]);
     createScanMock.mockResolvedValue({ id: "job-1" } as ScanJob);
     credentialMock.mockResolvedValue(activeCredential());
   });
@@ -138,5 +156,41 @@ describe("TaskCreatePage wizard", () => {
     await clickButton("添加");
     expect(next).toBeEnabled();
     expect(screen.getByText("共 2 个货号。")).toBeInTheDocument();
+  });
+
+  it("offers a one-click rename when the task name already exists", async () => {
+    createTaskMock.mockRejectedValueOnce(
+      new ApiError(409, "已存在同名任务，请换一个名称", {
+        detail: "已存在同名任务，请换一个名称",
+        error_code: "TASK_NAME_CONFLICT",
+        retry_after_seconds: null,
+      }),
+    );
+    listTasksMock.mockResolvedValue([{ id: "t-1", name: "重复任务" } as MonitorTask]);
+
+    renderPage();
+    fireEvent.change(screen.getByPlaceholderText(/粘贴货号/), {
+      target: { value: "DN3707-202" },
+    });
+    await clickButton("添加");
+    const nameInput = document.getElementById("name") as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: "重复任务" } });
+    await clickButton("下一步");
+    await clickButton("创建任务");
+
+    // 第一次创建：同名冲突 → 出现改名引导，而不是无提示的失败。
+    await waitFor(() => expect(createTaskMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(document.querySelector(".ant-modal-confirm-title")?.textContent).toBe(
+        "已存在同名任务",
+      ),
+    );
+    expect(screen.getByText(/改用「重复任务 2」/)).toBeInTheDocument();
+
+    await clickModalConfirm("用新名称重试");
+    await waitFor(() => expect(createTaskMock).toHaveBeenCalledTimes(2));
+    expect(createTaskMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: "重复任务 2" }),
+    );
   });
 });

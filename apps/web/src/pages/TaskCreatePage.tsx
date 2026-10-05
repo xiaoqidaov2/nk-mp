@@ -23,6 +23,7 @@ import { useHasEnabledChannel } from "@/components/PushChannelsCard";
 import { SectionCard } from "@/components/SectionCard";
 import { useAuth } from "@/auth/AuthContext";
 import { BTN, CADENCE_OPTIONS, CATALOG, EMPTY, ERR, MSG, PUSH, WIZARD, formatCadence } from "@/copy";
+import { ApiError } from "@/data/client";
 import { catalogApi, scanApi, taskApi } from "@/data/api";
 import type { StoreOut, StyleOut } from "@/data/types";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -46,7 +47,7 @@ function parseCodes(input: string): string[] {
 export function TaskCreatePage() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
-  const { message } = AntdApp.useApp();
+  const { message, modal } = AntdApp.useApp();
   const { canWrite } = useAuth();
   const credential = useNikeCredentialQuery();
   const bound = isCredentialActive(credential.data?.status);
@@ -84,7 +85,41 @@ export function TaskCreatePage() {
         navigate("/tasks");
       }
     },
+    onError: (error, payload) => {
+      if (error instanceof ApiError && error.errorCode === "TASK_NAME_CONFLICT") {
+        void offerNameRetry(payload);
+        return;
+      }
+      message.error(error instanceof ApiError ? error.message : ERR.commonFailure);
+    },
   });
+
+  const offerNameRetry = async (payload: TaskDraft) => {
+    const base = payload.name.trim();
+    let suggestion = `${base} 2`;
+    try {
+      const tasks = await taskApi.list();
+      if (!tasks.some((task) => task.name === base)) {
+        suggestion = base;
+      } else {
+        let index = 2;
+        while (index < 100 && tasks.some((task) => task.name === `${base} ${index}`)) index += 1;
+        suggestion = `${base} ${index}`;
+      }
+    } catch {
+      // 列表暂时拿不到就退回固定后缀；若再冲突用户可以再试一次。
+    }
+    modal.confirm({
+      title: WIZARD.nameConflictTitle,
+      content: WIZARD.nameConflictBody(base, suggestion),
+      okText: WIZARD.nameConflictRetry,
+      cancelText: BTN.cancel,
+      onOk: () => {
+        form.setFieldsValue({ name: suggestion });
+        create.mutate({ ...payload, name: suggestion });
+      },
+    });
+  };
 
   const storeOptions = useMemo(
     () =>

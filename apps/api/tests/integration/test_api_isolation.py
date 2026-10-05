@@ -73,6 +73,45 @@ def test_cross_tenant_task_access_is_denied(client) -> None:
     assert all(task["id"] != task_id for task in client.get("/api/v1/tasks").json())
 
 
+def test_duplicate_task_name_returns_a_stable_conflict(client) -> None:
+    """同名创建失败必须带固定 error_code，前端才能引导改名重试。"""
+    _seed_two_tenants()
+    csrf = login(client, "a@example.com")
+    payload = {"name": "重复任务", "store_codes": ["S001"], "style_codes": ["DN3707-202"]}
+    first = client.post("/api/v1/tasks", json=payload, headers=auth_headers(csrf))
+    assert first.status_code == 201, first.text
+
+    second = client.post("/api/v1/tasks", json=payload, headers=auth_headers(csrf))
+    assert second.status_code == 409
+    body = second.json()
+    assert body["error_code"] == "TASK_NAME_CONFLICT"
+    assert body["detail"] == "已存在同名任务，请换一个名称"
+    assert body["retry_after_seconds"] is None
+
+
+def test_duplicate_task_rename_returns_a_stable_conflict(client) -> None:
+    _seed_two_tenants()
+    csrf = login(client, "a@example.com")
+    headers = auth_headers(csrf)
+    first = client.post(
+        "/api/v1/tasks",
+        json={"name": "一号", "store_codes": ["S001"], "style_codes": ["DN3707-202"]},
+        headers=headers,
+    )
+    second = client.post(
+        "/api/v1/tasks",
+        json={"name": "二号", "store_codes": ["S001"], "style_codes": ["DN3707-202"]},
+        headers=headers,
+    )
+    assert first.status_code == 201 and second.status_code == 201, second.text
+
+    renamed = client.patch(
+        f"/api/v1/tasks/{second.json()['id']}", json={"name": "一号"}, headers=headers
+    )
+    assert renamed.status_code == 409
+    assert renamed.json()["error_code"] == "TASK_NAME_CONFLICT"
+
+
 def test_cross_tenant_scan_access_is_denied(client) -> None:
     seed = _seed_two_tenants()
     with SessionLocal() as db:

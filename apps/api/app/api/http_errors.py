@@ -30,3 +30,15 @@ def credential_required_response() -> JSONResponse:
 
 def binding_changed_response() -> JSONResponse:
     return credential_error_response(CredentialChanged("绑定已变更，请发起新的扫描"))
+
+
+def task_name_conflict_response() -> JSONResponse:
+    """A monitor task name must be unique per owner; the UI recovers from this."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "已存在同名任务，请换一个名称",
+            "error_code": "TASK_NAME_CONFLICT",
+            "retry_after_seconds": None,
+        },
+    )

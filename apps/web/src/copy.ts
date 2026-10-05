@@ -298,6 +298,10 @@ export const WIZARD = {
   frequencyLabel: "检查频率",
   frequencyNote:
     "按所选间隔开始新一轮检查；门店越多一轮耗时越长，实际间隔会顺延（上一轮结束前不会叠加）。",
+  nameConflictTitle: "已存在同名任务",
+  nameConflictBody: (base: string, suggested: string) =>
+    `「${base}」已被使用。改用「${suggested}」重新创建？`,
+  nameConflictRetry: "用新名称重试",
   notifyRestock: "补货提醒",
   notifySoldOut: "售罄提醒",
   notifyPriceChange: "变价提醒",

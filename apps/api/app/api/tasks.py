@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
 from app.api.deps import get_current_session, get_db, require_write, settings_dep
-from app.api.http_errors import credential_error_response
+from app.api.http_errors import credential_error_response, task_name_conflict_response
 from app.config import Settings
 from app.models import AuthSession, MonitorTask, Store, Style, User
 from app.schemas import TaskIn, TaskOut, TaskUpdate
@@ -123,7 +123,10 @@ def create_task(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, "同名任务已存在") from exc
+        detail = str(getattr(exc, "orig", exc))
+        if "uq_monitor_task_owner_name" in detail or "monitor_task.created_by" in detail:
+            return task_name_conflict_response()
+        raise
     return _to_out(task)
 
 
@@ -168,7 +171,10 @@ def update_task(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, "同名任务已存在") from exc
+        detail = str(getattr(exc, "orig", exc))
+        if "uq_monitor_task_owner_name" in detail or "monitor_task.created_by" in detail:
+            return task_name_conflict_response()
+        raise
     except StaleDataError as exc:
         db.rollback()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在") from exc
