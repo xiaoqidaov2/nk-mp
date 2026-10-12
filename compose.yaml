@@ -3,6 +3,23 @@ name: nike-mp
 x-api-env: &api-env
   NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@db:5432/nike_mp
   NIKE_MP_CREDENTIAL_KEY: ${NIKE_MP_CREDENTIAL_KEY:-}
+  # 405 挑战风暴熔断：一轮里 3 家门店被挑战打满重试即整轮冷却并补跑（0=关闭）。
+  NIKE_MP_WAF_STORM_STORE_LIMIT: ${NIKE_MP_WAF_STORM_STORE_LIMIT:-3}
+  # 门店级并发：被 WAF 拦掉的尝试互相重叠，墙钟不再按"被拦次数×退避"线性累加。
+  NIKE_MP_STORE_CONCURRENCY: ${NIKE_MP_STORE_CONCURRENCY:-4}
+  # 405 挑战的独立重试预算（只影响被拦的请求，正常请求不受影响）。
+  NIKE_MP_WAF_RETRY_LIMIT: ${NIKE_MP_WAF_RETRY_LIMIT:-12}
+  # 405 挑战的近即时重试间隔（实测退避不提高通过率、只加时延：0.43s vs 1.00s）。
+  NIKE_MP_WAF_RETRY_DELAY_SECONDS: ${NIKE_MP_WAF_RETRY_DELAY_SECONDS:-0.2}
+  # 吞吐闸门：小时闸按「尝试」计次（含每次重试），要万级/小时必须同时放开小时闸与日预算。
+  NIKE_MP_QUOTA_HOURLY_CAP: ${NIKE_MP_QUOTA_HOURLY_CAP:-900}
+  NIKE_MP_QUOTA_HOURLY_SLOW_LINE: ${NIKE_MP_QUOTA_HOURLY_SLOW_LINE:-600}
+  NIKE_MP_DAILY_REVIEW_BUDGET: ${NIKE_MP_DAILY_REVIEW_BUDGET:-60000}
+  # 出口池：代理列表（JSON 数组）与列表文件（容器内路径，热重载）；空=直连。
+  NIKE_MP_PROXY_URLS: ${NIKE_MP_PROXY_URLS:-[]}
+  NIKE_MP_PROXY_URLS_FILE: ${NIKE_MP_PROXY_URLS_FILE:-}
+  NIKE_MP_PROXY_COOLDOWN_SECONDS: ${NIKE_MP_PROXY_COOLDOWN_SECONDS:-120}
+  NIKE_MP_FINGERPRINT_ROTATION: ${NIKE_MP_FINGERPRINT_ROTATION:-true}
   # 可选：把 .env 里的值透传给 api/worker/scheduler（未设置时保持默认）。
   NIKE_MP_NIKE_PHONE_AUTH_ENABLED: ${NIKE_MP_NIKE_PHONE_AUTH_ENABLED:-false}
   NIKE_MP_NIKE_PHONE_AUTH_CONTRACT_VERSION: ${NIKE_MP_NIKE_PHONE_AUTH_CONTRACT_VERSION:-}
@@ -45,6 +62,9 @@ services:
     build:
       context: ./apps/api
     environment: *api-env
+    volumes:
+      # 出口池列表（与 worker 共用同一份 runtime 目录）
+      - ./runtime:/data
     depends_on:
       db:
         condition: service_healthy
@@ -66,6 +86,9 @@ services:
     build:
       context: ./apps/api
     environment: *api-env
+    volumes:
+      # 出口池列表（宿主 ./runtime/proxies.txt 由抓取器定时刷新，容器内热重载）
+      - ./runtime:/data:ro
     depends_on:
       db:
         condition: service_healthy
@@ -84,6 +107,22 @@ services:
       migrate:
         condition: service_completed_successfully
     command: python -m app.scheduler_main
+    restart: unless-stopped
+
+  proxy-refresh:
+    build:
+      context: ./apps/api
+    environment:
+      # 付费动态代理（1024proxy whitelist 模式）：端点短命，所以高频小批量刷新。
+      PAID_PROXY_NUM: ${PAID_PROXY_NUM:-200}
+      PAID_PROXY_TTL: ${PAID_PROXY_TTL:-10}
+      PAID_PROXY_REGION: ${PAID_PROXY_REGION:-Rand}
+      PROXY_REFRESH_SECONDS: ${PROXY_REFRESH_SECONDS:-45}
+    volumes:
+      # 定时重建出口池（qa/ 只读挂载，runtime 目录与 worker 共享）
+      - ./qa:/qa:ro
+      - ./runtime:/data
+    command: ["sh", "-c", "while true; do python /qa/fetch_paid_proxies.py > /data/proxies.txt.tmp 2>>/data/fetch.log && [ -s /data/proxies.txt.tmp ] && mv /data/proxies.txt.tmp /data/proxies.txt; sleep $${PROXY_REFRESH_SECONDS:-45}; done"]
     restart: unless-stopped
 
   web:
