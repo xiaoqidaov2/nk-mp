@@ -64,6 +64,91 @@ def _ensure_structure_row(session: Session, store: Store, style: Style) -> GtinS
     ).scalar_one()
 
 
+def _persist_structure(
+    session: Session,
+    store: Store,
+    style: Style,
+    cached: GtinStructure | None,
+    structure: SizeStructure,
+    now: datetime,
+    settings: Settings,
+) -> tuple[GtinStructure, bool]:
+    """写回结构行并报告"结构是否变了"（旧值只在两边都 OK 时才可比）。"""
+    changed = False
+    if cached is not None and cached.status == "OK" and structure.status == "OK":
+        changed = _hash_structure(structure) != cached.structure_hash
+    if cached is None:
+        cached = _ensure_structure_row(session, store, style)
+    cached.status = structure.status
+    cached.structure_hash = _hash_structure(structure)
+    cached.sizes = [
+        {"size_label": entry.size_label, "gtin": entry.gtin} for entry in structure.sizes
+    ]
+    cached.fetched_at = now
+    cached.expires_at = now + timedelta(days=settings.structure_ttl_days)
+    if structure.title and structure.title != style.style_code:
+        style.title = structure.title
+    return cached, changed
+
+
+def _cached_structure(store: Store, style: Style, cached: GtinStructure) -> SizeStructure:
+    sizes = tuple(
+        (entry["size_label"], entry["gtin"])  # type: ignore[index]
+        for entry in (cached.sizes or [])
+    )
+    return SizeStructure(
+        store_code=store.store_code,
+        style_code=style.style_code,
+        status=cached.status,
+        title=style.title or style.style_code,
+        sizes=tuple(SizeEntry(size_label=size, gtin=gtin) for size, gtin in sizes),
+    )
+
+
+def get_or_fetch_structures(
+    session: Session,
+    client: NikeClient,
+    settings: Settings,
+    store: Store,
+    styles: list[Style],
+) -> dict[str, tuple[SizeStructure, bool]]:
+    """这家店一次取回多个款的结构（只有缺失/过期的才发请求）。
+
+    为什么批量：GTIN 是**门店级**的（同款在不同门店的 GTIN 不同），不能按款缓存；但这个
+    端点允许一次带 ≤30 个货号，于是"每 (店, 款) 一个请求"变成"每店 ⌈款数/30⌉ 个请求"
+    ——31 款从 31 次变 2 次，缺 794 对时从 794 次变约 27 次。
+    """
+    now = datetime.now(UTC)
+    cached_rows = {
+        row.style_id: row
+        for row in session.execute(
+            select(GtinStructure).where(
+                GtinStructure.owner_user_id == store.owner_user_id,
+                GtinStructure.store_id == store.id,
+                GtinStructure.style_id.in_([style.id for style in styles]),
+            )
+        ).scalars()
+    }
+    results: dict[str, tuple[SizeStructure, bool]] = {}
+    pending: list[Style] = []
+    for style in styles:
+        cached = cached_rows.get(style.id)
+        if cached is not None and cached.expires_at is not None and cached.expires_at > now:
+            results[style.style_code] = (_cached_structure(store, style, cached), False)
+        else:
+            pending.append(style)
+
+    if pending:
+        fetched = client.fetch_structures(store.store_code, [style.style_code for style in pending])
+        for style in pending:
+            structure = fetched[style.style_code]
+            _row, changed = _persist_structure(
+                session, store, style, cached_rows.get(style.id), structure, now, settings
+            )
+            results[style.style_code] = (structure, changed)
+    return results
+
+
 def get_or_fetch_structure(
     session: Session,
     client: NikeClient,
@@ -83,36 +168,10 @@ def get_or_fetch_structure(
     ).scalar_one_or_none()
 
     if cached is not None and not force and cached.expires_at is not None and cached.expires_at > now:
-        sizes = tuple(
-            (entry["size_label"], entry["gtin"])  # type: ignore[index]
-            for entry in (cached.sizes or [])
-        )
-        structure = SizeStructure(
-            store_code=store.store_code,
-            style_code=style.style_code,
-            status=cached.status,
-            title=style.title or style.style_code,
-            sizes=tuple(SizeEntry(size_label=size, gtin=gtin) for size, gtin in sizes),
-        )
-        return structure, False
+        return _cached_structure(store, style, cached), False
 
     structure = client.fetch_structure(store.store_code, style.style_code)
-    changed = False
-    if cached is not None and cached.status == "OK" and structure.status == "OK":
-        changed = _hash_structure(structure) != cached.structure_hash
-
-    if cached is None:
-        cached = _ensure_structure_row(session, store, style)
-    cached.status = structure.status
-    cached.structure_hash = _hash_structure(structure)
-    cached.sizes = [
-        {"size_label": entry.size_label, "gtin": entry.gtin} for entry in structure.sizes
-    ]
-    cached.fetched_at = now
-    cached.expires_at = now + timedelta(days=settings.structure_ttl_days)
-
-    if structure.title and structure.title != style.style_code:
-        style.title = structure.title
+    _row, changed = _persist_structure(session, store, style, cached, structure, now, settings)
     return structure, changed
 
 
@@ -154,16 +213,12 @@ def probe_store(
                 )
             ).scalar_one()
         styles[style_code] = style
-        structure, changed = get_or_fetch_structure(session, client, settings, store, style)
-        structures[style_code] = structure
-        if changed and structure.status == "OK":
-            changed_structures[style.id] = _hash_structure(structure)
 
-    missing_styles = [code for code in style_codes if not structures[code].sizes]
-    for style_code in missing_styles:
-        structure, changed = get_or_fetch_structure(
-            session, client, settings, store, styles[style_code], force=True
-        )
+    # 一次取回这家店所有款的结构（缺失/过期的才发请求）：31 款 = 2 个请求，而不是 31 个。
+    fetched_structures = get_or_fetch_structures(
+        session, client, settings, store, list(styles.values())
+    )
+    for style_code, (structure, changed) in fetched_structures.items():
         structures[style_code] = structure
         if changed and structure.status == "OK":
             changed_structures[styles[style_code].id] = _hash_structure(structure)

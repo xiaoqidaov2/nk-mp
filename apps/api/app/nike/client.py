@@ -308,7 +308,49 @@ class NikeClient:
         products = (groupings[0].get("products") if groupings else None) or []
         if not products:
             return SizeStructure(store_code, style_code, "MISSING", style_code)
-        product = products[0]
+        return self.parse_structure(store_code, style_code, products[0])
+
+    #: 门店尺码表批量上限：实测 ≤30 正常，40/50 被**静默截断**到 30，≥80 直接 500。
+    STRUCTURE_BATCH_SIZE = 30
+
+    def fetch_structures(
+        self, store_code: str, style_codes: list[str]
+    ) -> dict[str, SizeStructure]:
+        """一次取多款的门店尺码表（GTIN 是**门店级**的，所以不能按款缓存）。
+
+        这个端点（`store_number/{store}?productCodes=...`）免 token、几乎不触发 WAF，
+        把"每 (店, 款) 一个请求"压成"每店 ⌈款数/30⌉ 个请求"——31 款从 31 次变 2 次。
+
+        响应里没有的货号按 ``MISSING`` 处理（未知绝不当作结论）；某一批返回非 200 时该批
+        按 MISSING，而重试耗尽的传输/限流错误照旧抛出——上层把门店记失败并重试，
+        绝不猜成"无货"。
+        """
+        results: dict[str, SizeStructure] = {
+            code: SizeStructure(store_code, code, "MISSING", code) for code in style_codes
+        }
+        for start in range(0, len(style_codes), self.STRUCTURE_BATCH_SIZE):
+            chunk = style_codes[start : start + self.STRUCTURE_BATCH_SIZE]
+            url = (
+                f"{self.settings.nike_test_api_base}/store/product_details/internal/v1/"
+                f"marketplace/CN/language/zh-Hans/store_number/{store_code}"
+                f"?productCodes={','.join(chunk)}&fields=products(productCode,sizes)"
+            )
+            response = self._request("GET", url, authorized=False)
+            if response.status_code != 200:
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                continue
+            for product in payload.get("products") or []:
+                code = str(product.get("productCode") or "").strip()
+                if code in results:
+                    results[code] = self.parse_structure(store_code, code, product)
+        return results
+
+    @staticmethod
+    def parse_structure(store_code: str, style_code: str, product: dict) -> SizeStructure:
+        """把一个 product 节点解析成尺码表；缺件即 ``MISSING``（不是"无货"）。"""
         copy = product.get("copy") or {}
         item_data = product.get("itemData") or {}
         title = str(copy.get("fullTitle") or item_data.get("title") or style_code)

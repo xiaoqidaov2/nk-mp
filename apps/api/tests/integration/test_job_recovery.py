@@ -69,6 +69,11 @@ class FakeNikeClient:
             store_code, style_code, "OK", "测试标题", (SizeEntry("42", f"G-{store_code}"),)
         )
 
+    def fetch_structures(  # noqa: ANN001 - 生产走批量端点，假客户端同样按"逐款"忠实返回
+        self, store_code: str, style_codes: list[str]
+    ) -> dict[str, SizeStructure]:
+        return {code: self.fetch_structure(store_code, code) for code in style_codes}
+
     def review(self, gtins, region_id, with_price=False):  # noqa: ANN001
         start = time.monotonic()
         try:

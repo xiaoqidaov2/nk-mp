@@ -30,6 +30,11 @@ class _StructureClient:
             tuple(SizeEntry(label, f"G-{label}") for label in self.sizes),
         )
 
+    def fetch_structures(  # noqa: ANN001 - 生产走批量端点，这里逐款忠实返回
+        self, store_code: str, style_codes: list[str]
+    ) -> dict[str, SizeStructure]:
+        return {code: self.fetch_structure(store_code, code) for code in style_codes}
+
     def review(self, gtins, region_id, with_price=False):  # noqa: ANN001
         return ReviewBatch(
             items={gtin: ReviewItem(gtin=gtin, availability="IN_STOCK") for gtin in gtins},

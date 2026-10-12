@@ -56,6 +56,67 @@ def _ok_group(gtins: list[str]) -> dict:
     }
 
 
+def _structure_payload(codes: list[str], sizes: int = 2) -> dict:
+    return {
+        "products": [
+            {
+                "productCode": code,
+                "copy": {"fullTitle": f"{code} 测试"},
+                "sizes": [
+                    {"localizedLabel": f"4{index}", "gtins": [{"gtin": f"G-{code}-{index}"}]}
+                    for index in range(sizes)
+                ],
+            }
+            for code in codes
+        ]
+    }
+
+
+def test_batched_structures_chunk_by_thirty_and_split_per_style(settings) -> None:
+    """一次带 ≤30 个货号（实测 >30 静默截断、≥80 直接 500）：31 款 = 2 个请求。"""
+    codes = [f"ST-{index:02d}" for index in range(31)]
+    replay = _Replay(
+        [_json(_structure_payload(codes[:30])), _json(_structure_payload(codes[30:]))]
+    )
+    client = replay.client(settings)
+
+    result = client.fetch_structures("3875", codes)
+
+    assert len(replay.requests) == 2
+    first = replay.requests[0]
+    assert "internal/v1" in str(first.url)
+    assert first.url.params["productCodes"].count(",") == 29
+    assert set(result) == set(codes)
+    assert result["ST-00"].status == "OK"
+    assert [entry.gtin for entry in result["ST-00"].sizes] == ["G-ST-00-0", "G-ST-00-1"]
+    assert result["ST-30"].sizes[0].gtin == "G-ST-30-0"
+
+
+def test_batched_structures_never_invent_a_style_the_store_lacks(settings) -> None:
+    """响应里没有的货号 → MISSING（未知不当作结论），其余照常解析。"""
+    replay = _Replay([_json(_structure_payload(["ST-01"]))])
+    client = replay.client(settings)
+
+    result = client.fetch_structures("3875", ["ST-01", "ST-99"])
+
+    assert result["ST-01"].status == "OK"
+    assert result["ST-99"].status == "MISSING"
+    assert result["ST-99"].sizes == ()
+
+
+def test_batched_structures_failure_propagates_for_the_store_retry(settings) -> None:
+    """批量端点持续失败时把错误抛给上层：门店记失败/未知并重试，绝不猜成"无货"。
+
+    （与既有约定一致：结构阶段的限流/失败要能让整轮中止，而不是静默变成缺货。）
+    """
+    replay = _Replay([httpx.Response(500)] * 8)
+    client = replay.client(settings)
+
+    with pytest.raises(ScanError):
+        client.fetch_structures("3875", ["ST-01", "ST-02"])
+    assert len(replay.requests) >= 2  # 按既有重试策略重试后才放弃
+
+
 def test_empty_completion_is_retried_then_trusted_when_details_arrive(settings) -> None:
     replay = _Replay(
         [
