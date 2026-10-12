@@ -16,6 +16,7 @@ from app.config import Settings
 from app.db import SessionLocal
 from app.models import (
     ChangeEvent,
+    EventType,
     JobStatus,
     MonitorTask,
     NotificationChannel,
@@ -405,3 +406,100 @@ def test_manual_scan_without_a_task_still_queues_a_delivery() -> None:
         assert row.channel_id == channel_id
         assert row.owner_user_id == owner_id
         assert push.TASK_LESS_TITLE in row.title
+
+
+def test_merged_job_queues_one_delivery_per_task() -> None:
+    """合并作业：每个任务各推一条，只带自己的款与开关（B 关了变价 → B 的消息里没有变价）。"""
+    settings = _settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email=f"merge-push-{uuid4().hex[:8]}@example.com")
+        store = make_store(db, owner=user)
+        style_a = make_style(db, owner=user, code="DN3707-202")
+        style_b = make_style(db, owner=user, code="HJ2461-010")
+        task_a = MonitorTask(
+            tenant_id=tenant.id, name="任务A", store_codes=[store.store_code],
+            style_codes=[style_a.style_code], all_stores=False,
+            notify_on_restock=True, notify_on_sold_out=False, notify_on_price_change=True,
+            created_by=user.id,
+        )
+        task_b = MonitorTask(
+            tenant_id=tenant.id, name="任务B", store_codes=[store.store_code],
+            style_codes=[style_b.style_code], all_stores=False,
+            notify_on_restock=True, notify_on_sold_out=False, notify_on_price_change=False,
+            created_by=user.id,
+        )
+        db.add_all([task_a, task_b])
+        db.flush()
+        channel = NotificationChannel(
+            owner_user_id=user.id,
+            platform="custom",
+            name="合并推送",
+            target_enc=encrypt_secret("json://example.test"),
+            target_fingerprint=secret_fingerprint("json://example.test", purpose="push"),
+            target_hint="••••push",
+            enabled=True,
+        )
+        db.add(channel)
+        db.flush()
+        job = ScanJob(
+            tenant_id=tenant.id, task_id=None, task_ids=[str(task_a.id), str(task_b.id)],
+            kind="MONITOR", status=JobStatus.SUCCEEDED.value,
+            store_codes=[store.store_code], style_codes=[style_a.style_code, style_b.style_code],
+            size_labels=[], total_stores=1, owner_user_id=user.id,
+        )
+        db.add(job)
+        db.flush()
+        db.add_all(
+            [
+                _event(tenant, user, job, store, style_a, EventType.RESTOCK.value),
+                _event(tenant, user, job, store, style_a, EventType.PRICE_CHANGE.value,
+                       before=699.0, after=599.0),
+                _event(tenant, user, job, store, style_b, EventType.RESTOCK.value),
+                _event(tenant, user, job, store, style_b, EventType.PRICE_CHANGE.value,
+                       before=699.0, after=499.0),
+            ]
+        )
+        db.commit()
+        job_id = job.id
+
+    with SessionLocal() as db:
+        job = db.get(ScanJob, job_id)
+        assert push.enqueue_for_job(db, settings, job) == 2   # 每个任务各一条
+        db.commit()
+
+    with SessionLocal() as db:
+        rows = (
+            db.execute(
+                select(NotificationDelivery).where(NotificationDelivery.job_id == job_id)
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 2
+        by_title = {row.title: row for row in rows}
+        assert set(by_title) == {"【库存提醒】任务A", "【库存提醒】任务B"}  # 标题各带自己的任务名
+        assert "DN3707-202" in by_title["【库存提醒】任务A"].body   # 只带自己的款
+        assert "HJ2461-010" not in by_title["【库存提醒】任务A"].body
+        assert "变价" in by_title["【库存提醒】任务A"].body         # A 开了变价
+        assert "HJ2461-010" in by_title["【库存提醒】任务B"].body
+        assert "变价" not in by_title["【库存提醒】任务B"].body      # B 关了变价
+
+
+def _event(tenant, user, job, store, style, event_type: str, *, before=None, after=None) -> ChangeEvent:
+    """构造一条变化事件（dedupe_key/payload_hash 非空）。"""
+    key = f"{event_type}:{uuid4().hex}"  # dedupe_key 列 64 字符上限
+    return ChangeEvent(
+        tenant_id=tenant.id,
+        owner_user_id=user.id,
+        job_id=job.id,
+        store_id=store.id,
+        style_id=style.id,
+        size_label="42",
+        event_type=event_type,
+        before_total_price=before,
+        after_total_price=after,
+        payload_hash=key,
+        dedupe_key=key,
+        checked_at=datetime.now(UTC),
+    )

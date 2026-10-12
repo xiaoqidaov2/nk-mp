@@ -11,7 +11,7 @@ from __future__ import annotations
 import random
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -49,25 +49,41 @@ def _next_run_at(cadence_seconds: int, jitter_seconds: float) -> datetime:
     return datetime.now(UTC) + timedelta(seconds=float(cadence_seconds) + offset)
 
 
+def _active_job_for(session: Session, task: MonitorTask) -> ScanJob | None:
+    """该任务是否已有排队/运行中的作业（含"合并采集"作业：它把任务 id 记在 task_ids 里）。"""
+    return session.execute(
+        select(ScanJob)
+        .where(
+            or_(
+                ScanJob.task_id == task.id,
+                ScanJob.task_ids.contains([str(task.id)]),
+            ),
+            ScanJob.status.in_([JobStatus.QUEUED.value, JobStatus.RUNNING.value]),
+        )
+        .limit(1)
+    ).scalars().first()
+
+
 def dispatch_due_tasks(session: Session, settings: Settings) -> int:
+    """派发到期任务；**同一账号、同一门店集合、同一尺码集合的多个任务合并成一个作业**。
+
+    为什么合并：一次可用性请求能带 **50 个 GTIN（实测硬上限）且跨款式算数**。
+    31 个"1 款 1 任务"各自派作业 → 每店 31 个请求；合并后每店 `ceil(Σ尺码/50) ≈ 12`
+    （2.6× 减少）。事件与推送仍按任务归属（见 ``push.enqueue_for_job``）。
+    """
     dispatched = 0
     tasks = due_tasks(session)
     if not tasks:
         return 0
-    # 一次查清所有任务创建者的冷却窗口：冷却中的账号不派发，到点自动继续。
     cooldowns = throttle.active(session, [task.created_by for task in tasks])
+
+    ready: list[tuple[MonitorTask, object, list[str]]] = []
     for task in tasks:
         cooldown = cooldowns.get(task.created_by)
         if cooldown is not None:
             task.next_run_at = cooldown.until
             continue
-        active = session.execute(
-            select(ScanJob).where(
-                ScanJob.task_id == task.id,
-                ScanJob.status.in_([JobStatus.QUEUED.value, JobStatus.RUNNING.value]),
-            )
-        ).scalars().first()
-        if active is not None:
+        if _active_job_for(session, task) is not None:
             # Keep the cadence moving without stacking duplicate scans.
             task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
             continue
@@ -118,18 +134,42 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
         if not store_codes:
             task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
             continue
+        ready.append((task, binding, store_codes))
+
+    # 按"账号 + 门店集合 + 尺码集合"分组：只有这三项一致的任务才能合并（否则会多扫门店）。
+    groups: dict[tuple, list[tuple[MonitorTask, object, list[str]]]] = {}
+    for entry in ready:
+        task, _binding, store_codes = entry
+        key = (
+            str(task.created_by),
+            str(task.tenant_id),
+            tuple(sorted(store_codes)),
+            tuple(sorted(task.size_labels or [])),
+        )
+        groups.setdefault(key, []).append(entry)
+
+    for entries in groups.values():
+        first_task, binding, store_codes = entries[0]
+        styles: list[str] = []
+        for task, _binding, _stores in entries:
+            for code in task.style_codes or []:
+                if code not in styles:
+                    styles.append(code)
+        merged = len(entries) > 1
         enqueue_job(
             session,
-            tenant_id=task.tenant_id,
+            tenant_id=first_task.tenant_id,
             store_codes=store_codes,
-            style_codes=list(task.style_codes),
-            size_labels=list(task.size_labels or []),
-            task_id=task.id,
+            style_codes=styles,
+            size_labels=list(first_task.size_labels or []),
+            task_id=None if merged else first_task.id,
             kind="MONITOR",
-            owner_user_id=task.created_by,
+            owner_user_id=first_task.created_by,
             credential_binding=binding,
+            task_ids=[task.id for task, _binding, _stores in entries] if merged else None,
         )
-        task.next_run_at = _next_run_at(task.cadence_seconds, settings.dispatch_jitter_seconds)
-        dispatched += 1
+        for task, _binding, _stores in entries:
+            task.next_run_at = _next_run_at(task.cadence_seconds, settings.dispatch_jitter_seconds)
+            dispatched += 1
     session.flush()
     return dispatched

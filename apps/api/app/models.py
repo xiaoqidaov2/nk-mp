@@ -406,6 +406,8 @@ class ScanJob(Base):
     status: Mapped[str] = mapped_column(String(16), default=JobStatus.QUEUED.value)
     store_codes: Mapped[list] = mapped_column(JSONB, default=list)
     style_codes: Mapped[list] = mapped_column(JSONB, default=list)
+    #: 合并采集：一个作业覆盖多个任务（字符串 UUID 列表）；单任务作业为空、用 ``task_id``。
+    task_ids: Mapped[list] = mapped_column(JSONB, default=list)
     #: 入队时从任务冻结的尺码选择；空列表 = 全部尺码。
     size_labels: Mapped[list] = mapped_column(JSONB, default=list)
     total_stores: Mapped[int] = mapped_column(Integer, default=0)
@@ -672,7 +674,9 @@ class NotificationDelivery(Base):
 
     __tablename__ = "notification_delivery"
     __table_args__ = (
-        UniqueConstraint("job_id", "channel_id", name="uq_notification_job_channel"),
+        # 去重按 (job_id, channel_id, task_id) 在代码里判（合并采集后一个作业可能推多条：
+        # 每个任务一条，各自的开关与标题），所以这里只留普通索引供查询。
+        Index("ix_notification_delivery_job_channel", "job_id", "channel_id"),
         Index("ix_notification_delivery_state_ready", "state", "next_attempt_at"),
     )
 

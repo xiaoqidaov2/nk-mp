@@ -133,3 +133,29 @@ store_code=3630 region_id=NIKE0S070 style=DM2362-002 → OUT_OF_STOCK @2026-10-1
 
 ### 4) 设计：自适应采集（见 `docs/adaptive-cadence.md`）
 合并采集（4,557 → 1,764 请求/轮）+ 最大间隔语义 + 预算内优先级调度；线上信号只做"提前"。
+
+
+## 九、第三轮交付的吸收（2026-10-14）
+
+### 1) 落地：跨款合批 + 免轮询
+- **跨款合批**（50 GTIN 可混多个款、逐条给明细、不会全局吞结果）→ 见 `docs/adaptive-cadence.md` 第 1 步，
+  已在 `scheduler`/`jobs`/`push` 实现（一个作业覆盖多任务，推送仍按任务归属）。
+- **免轮询**：实测 PUT 后**立即 GET** 即 `COMPLETED`（0ms）→ `NIKE_MP_REVIEW_POLL_FIRST_SECONDS`
+  默认 **0.5 → 0**（未就绪时仍按 `REVIEW_POLL_INTERVAL_SECONDS` 退避重试）。
+
+### 2) **不能照抄**的两条
+- **"价格零请求"**：`product_feed` / `/discover` 给的是**线上渠道价**；我们客户看的是**门店价**
+  （`cart_reviews` 的 `itemCosts.priceInfo`）→ 两者不可替换，价格请求还得发（只补缺的）。
+- **`api-test` 不能当路由存在性判据**：未知路径回 `401 code35`（全局过滤器）；真 oracle 是
+  **prod + token → 404 code310**。
+
+### 3) 两条硬约束（已核对我们的实现）
+1. **`uuid` 一次性且与 body 哈希绑定**：同 uuid 换 body → `409 Request hash mismatch`，
+   **但 GET 仍会返回上一轮旧快照** → 静默误报来源。我们的 `review()` **每次调用都生成新 uuid**
+   ✓（`request_id = str(uuid.uuid4())`），且 GET 异常一律记为**未知** ✓ 不产生售罄结论。
+2. **WAF 拦截是瞬时随机的**（同路径 30 发：63% 拦截；去掉 UA 65%）→ 结论：**接受随机拦截 +
+   立即 0.2s 重试**（期望成本 ≈2.5×），这与我们已实现的策略一致。
+
+### 4) WAF 路线③的负面结论（不再重复试）
+直连上游 origin（43.109.70.x）**拦截率更高（70%）**；405 页**没有可解 JS**；
+`nvs-store-ootd-api` 系列 0% 拦截但要求 **key=value 签名**（非 Bearer）→ 走不通。

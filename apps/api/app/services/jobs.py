@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -65,6 +65,31 @@ class LeaseLost(RuntimeError):
     """Raised when another worker has taken over this job's lease."""
 
 
+def _job_task_ids(job: ScanJob) -> list[str]:
+    """作业覆盖的任务 id：单任务用 ``task_id``，合并作业（多任务）用 ``task_ids``。"""
+    # ``task_ids`` 是合并采集新增的列：未入库/手工构造的对象取不到，用 getattr 兜底。
+    merged = getattr(job, "task_ids", None) or []
+    if merged:
+        return [str(item) for item in merged]
+    return [str(job.task_id)] if job.task_id else []
+
+
+def _job_tasks(session: Session, job: ScanJob) -> list[MonitorTask]:
+    ids = []
+    for item in _job_task_ids(job):
+        try:
+            ids.append(UUID(str(item)))
+        except ValueError:
+            continue
+    if not ids:
+        return []
+    return list(session.execute(select(MonitorTask).where(MonitorTask.id.in_(ids))).scalars())
+
+
+def _job_cadences(session: Session, job: ScanJob) -> list[int]:
+    return [int(task.cadence_seconds) for task in _job_tasks(session, job)]
+
+
 def enqueue_job(
     session: Session,
     tenant_id,
@@ -77,6 +102,7 @@ def enqueue_job(
     owner_user_id: UUID,
     credential_binding: CredentialBinding,
     size_labels: list[str] | None = None,
+    task_ids: list | None = None,
 ) -> ScanJob:
     user = session.execute(select(User).where(User.id == owner_user_id)).scalar_one_or_none()
     if user is None or not user.is_active or user.tenant_id != tenant_id:
@@ -86,6 +112,7 @@ def enqueue_job(
     job = ScanJob(
         tenant_id=tenant_id,
         task_id=task_id,
+        task_ids=[str(item) for item in (task_ids or [])],
         kind=kind,
         status=JobStatus.QUEUED.value,
         store_codes=list(store_codes),
@@ -372,15 +399,11 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
         )
 
         max_gap_seconds = settings.baseline_max_gap_seconds
-        if job.task_id:
-            task = session.execute(
-                select(MonitorTask).where(MonitorTask.id == job.task_id)
-            ).scalar_one_or_none()
-            if task is not None:
-                # Invariant: the baseline window must always span at least
-                # three full cadences, otherwise a degraded cadence could
-                # silently suppress every event.
-                max_gap_seconds = max(max_gap_seconds, 3 * task.cadence_seconds)
+        # Invariant: the baseline window must always span at least three full
+        # cadences, otherwise a degraded cadence could silently suppress every
+        # event. 合并作业取涉及任务里的**最大**间隔（最保守）。
+        for cadence in _job_cadences(session, job):
+            max_gap_seconds = max(max_gap_seconds, 3 * cadence)
 
         rows = session.execute(
             select(ScanJobStore)
@@ -807,20 +830,18 @@ def _finalize(
         # 整轮全部成功说明账号已恢复：重置风控阶梯；仍在生效的窗口不提前解除。
         throttle.clear(session, job.owner_user_id)
 
-    task = None
-    if job.task_id:
-        task = session.execute(
-            select(MonitorTask).where(MonitorTask.id == job.task_id)
-        ).scalar_one_or_none()
-        if task is not None:
-            now = datetime.now(UTC)
-            next_run_at = now + timedelta(seconds=task.cadence_seconds)
-            if cooldown is not None and cooldown.until > next_run_at:
-                # 冷却窗口内的任务不派发；到点由调度器自动继续。
-                next_run_at = cooldown.until
-            task.last_run_at = now
-            task.next_run_at = next_run_at
-            session.flush()
+    tasks = _job_tasks(session, job)
+    task = tasks[0] if tasks else None
+    now = datetime.now(UTC)
+    for item in tasks:
+        next_run_at = now + timedelta(seconds=item.cadence_seconds)
+        if cooldown is not None and cooldown.until > next_run_at:
+            # 冷却窗口内的任务不派发；到点由调度器自动继续。
+            next_run_at = cooldown.until
+        item.last_run_at = now
+        item.next_run_at = next_run_at
+    if tasks:
+        session.flush()
 
     # 检查结束后按任务的提醒开关聚合推送；提交由调用方负责。
     if settings is not None:
@@ -869,11 +890,15 @@ def _schedule_retry(
     store_ids = [row.store_id for row in rows if not _is_credential_code(row.error_code)]
     if not store_ids:
         return None
-    # 防重叠：同一任务已有作业排队/运行时不补跑（下一轮自然会覆盖）。
+    # 防重叠：这些任务已有作业排队/运行时不补跑（下一轮自然会覆盖）。
+    task_ids = _job_task_ids(job)
     active = session.execute(
         select(ScanJob.id)
         .where(
-            ScanJob.task_id == job.task_id,
+            or_(
+                ScanJob.task_id.in_([job.task_id] if job.task_id else []),
+                ScanJob.task_ids.contains(task_ids) if task_ids else False,
+            ),
             ScanJob.status.in_([JobStatus.QUEUED.value, JobStatus.RUNNING.value]),
         )
         .limit(1)
@@ -893,6 +918,7 @@ def _schedule_retry(
             style_codes=list(job.style_codes or []),
             size_labels=list(job.size_labels or []),
             task_id=job.task_id,
+            task_ids=list(getattr(job, "task_ids", None) or []),
             kind="RETRY",
             owner_user_id=job.owner_user_id,
             credential_binding=CredentialBinding(

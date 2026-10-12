@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import socket
+import uuid
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -39,6 +40,7 @@ from app.models import (
     NotificationDeliveryState,
     NotificationPlatform,
     ScanJob,
+    Style,
 )
 from app.security import decrypt_secret
 
@@ -589,27 +591,28 @@ def push_usage(session: Session, settings: Settings, owner_user_id) -> tuple[int
     return int(used), int(settings.push_max_per_day)
 
 
+def _task_style_ids(session: Session, task: MonitorTask) -> set:
+    """任务覆盖的 style_id 集合（事件按 style_id 归属，这里把货号映射成 id）。"""
+    codes = [code.upper() for code in (task.style_codes or [])]
+    if not codes:
+        return set()
+    rows = session.execute(
+        select(Style.id).where(
+            Style.owner_user_id == task.created_by, Style.style_code.in_(codes)
+        )
+    ).scalars()
+    return set(rows)
+
+
 def enqueue_for_job(session: Session, settings: Settings, job: ScanJob) -> int:
-    """Queue one aggregated delivery per enabled channel for a finished job.
+    """Queue one aggregated delivery per (enabled channel, task) for a finished job.
+
+    合并采集后一个作业可能覆盖多个任务：**每个任务各推一条**（各自的开关与标题），
+    事件按任务的货号/尺码过滤；单任务与无任务作业保持原有单条行为。
 
     Returns the number of rows created; the caller owns the transaction.
     """
     if not settings.push_enabled or job.owner_user_id is None:
-        return 0
-    task = session.get(MonitorTask, job.task_id) if job.task_id is not None else None
-    types = _notified_types(task)
-    if not types:
-        return 0
-    events = (
-        session.execute(
-            select(ChangeEvent)
-            .where(ChangeEvent.job_id == job.id, ChangeEvent.event_type.in_(types))
-            .order_by(ChangeEvent.detected_at, ChangeEvent.id)
-        )
-        .scalars()
-        .all()
-    )
-    if not events:
         return 0
     channels = (
         session.execute(
@@ -639,41 +642,83 @@ def enqueue_for_job(session: Session, settings: Settings, job: ScanJob) -> int:
             job.id,
         )
         return 0
-    message = build_message(
-        task.name if task is not None else TASK_LESS_TITLE,
-        list(events),
-        base_url=settings.public_base_url,
-    )
-    if message is None:
-        return 0
-    title, body = message
-    queued = set(
+
+    task = session.get(MonitorTask, job.task_id) if job.task_id is not None else None
+    events = (
         session.execute(
-            select(NotificationDelivery.channel_id).where(NotificationDelivery.job_id == job.id)
+            select(ChangeEvent)
+            .where(ChangeEvent.job_id == job.id)
+            .order_by(ChangeEvent.detected_at, ChangeEvent.id)
         )
         .scalars()
         .all()
     )
-    created = 0
-    for channel in channels:
-        if channel.id in queued:
-            continue
-        session.add(
-            NotificationDelivery(
-                owner_user_id=job.owner_user_id,
-                channel_id=channel.id,
-                job_id=job.id,
-                task_id=job.task_id,
-                title=title,
-                body=body,
-                state=NotificationDeliveryState.PENDING.value,
+    if not events:
+        return 0
+
+    # 待投递的分组：[(归属任务(None=无任务作业), 标题, 正文)]
+    pending: list[tuple[MonitorTask | None, str, str]] = []
+    merged_ids = getattr(job, "task_ids", None) or []
+    merged_tasks = [session.get(MonitorTask, uuid.UUID(str(item))) for item in merged_ids]
+    merged_tasks = [item for item in merged_tasks if item is not None]
+    if merged_tasks:
+        for item in merged_tasks:
+            types = set(_notified_types(item))
+            if not types:
+                continue
+            style_ids = _task_style_ids(session, item)
+            sizes = set(item.size_labels or [])
+            subset = [
+                event
+                for event in events
+                if event.event_type in types
+                and (not style_ids or event.style_id in style_ids)
+                and (not sizes or event.size_label in sizes)
+            ]
+            message = build_message(item.name, subset, base_url=settings.public_base_url)
+            if message is not None:
+                pending.append((item, message[0], message[1]))
+    else:
+        types = _notified_types(task)
+        if types:
+            message = build_message(
+                task.name if task is not None else TASK_LESS_TITLE,
+                [event for event in events if event.event_type in types],
+                base_url=settings.public_base_url,
             )
-        )
-        created += 1
+            if message is not None:
+                pending.append((task, message[0], message[1]))
+    if not pending:
+        return 0
+
+    queued = set(
+        session.execute(
+            select(NotificationDelivery.channel_id, NotificationDelivery.task_id).where(
+                NotificationDelivery.job_id == job.id
+            )
+        ).all()
+    )
+    created = 0
+    for owner_task, title, body in pending:
+        task_id = owner_task.id if owner_task is not None else job.task_id
+        for channel in channels:
+            if (channel.id, task_id) in queued:
+                continue
+            session.add(
+                NotificationDelivery(
+                    owner_user_id=job.owner_user_id,
+                    channel_id=channel.id,
+                    job_id=job.id,
+                    task_id=task_id,
+                    title=title,
+                    body=body,
+                    state=NotificationDeliveryState.PENDING.value,
+                )
+            )
+            created += 1
     if created:
         session.flush()
     return created
-
 
 def enqueue_system_notification(
     session: Session,

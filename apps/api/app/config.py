@@ -31,8 +31,9 @@ class Settings(BaseSettings):
     #: 上游对**单个请求的 items 总数**限制才是 50，价格并不需要拆 3 个/批（旧值是我方策略）。
     price_chunk_size: int = 10
     review_poll_tries: int = 12
-    #: 首次轮询等待（秒）：review 结果通常已就绪，先快后慢可显著缩短单店耗时。
-    review_poll_first_seconds: float = 0.5
+    #: 首次轮询等待（秒）：实测 PUT 后**立即** GET 就已是 COMPLETED（0ms），默认不再等待；
+    #: 未就绪时会按 review_poll_interval_seconds 退避重试。
+    review_poll_first_seconds: float = 0.0
     #: 后续轮询的间隔上限（秒）：从 first 起每次翻倍，封顶到这个值。
     review_poll_interval_seconds: float = 2.5
     request_retry_limit: int = 7

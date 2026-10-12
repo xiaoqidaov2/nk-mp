@@ -515,3 +515,50 @@ def test_all_store_task_only_covers_clearance_stores() -> None:
     with SessionLocal() as db:
         job = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalar_one()
         assert job.store_codes == ["S1"]
+
+
+def test_due_tasks_of_one_owner_merge_into_a_single_job() -> None:
+    """合并采集：同账号 + 同门店/尺码集合的到期任务派**一个**作业（一次请求可带 50 个跨款 GTIN）。
+
+    门店集合不同的任务不合并（否则会多扫门店）。
+    """
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="merge@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        make_store(db, owner=user, code="S2", region_id="R2")
+        for index, style in enumerate(("DN3707-202", "HJ2461-010", "FZ5029-010")):
+            make_style(db, owner=user, code=style)
+            task = _make_task(db, tenant.id, created_by=user.id, name=f"合并任务 {index}")
+            task.style_codes = [style]
+            task.store_codes = []
+            task.all_stores = True
+            if index == 2:
+                # 第三个只盯一家店 → 门店集合不同，不能并入
+                task.all_stores = False
+                task.store_codes = ["S1"]
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 3  # 计数的是"任务数"
+        db.commit()
+
+    with SessionLocal() as db:
+        jobs = (
+            db.execute(select(ScanJob).where(ScanJob.kind == "MONITOR")).scalars().all()
+        )
+        assert len(jobs) == 2, [(job.id, job.task_id, job.task_ids) for job in jobs]
+        merged = next(job for job in jobs if job.task_ids)
+        assert len(merged.task_ids) == 2
+        assert sorted(merged.style_codes) == ["DN3707-202", "HJ2461-010"]
+        assert sorted(merged.store_codes) == ["S1", "S2"]
+        assert merged.task_id is None
+        single = next(job for job in jobs if not job.task_ids)
+        assert single.task_id is not None
+        assert single.store_codes == ["S1"]
+        # 三个任务的 next_run_at 都被推进，不会重复派发
+        tasks = db.execute(select(MonitorTask)).scalars().all()
+        assert all(task.next_run_at > datetime.now(UTC) for task in tasks)
