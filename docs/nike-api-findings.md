@@ -100,3 +100,36 @@ GET https://api.nike.com/product_feed/threads/v2?filter=marketplace(CN)&filter=l
 3. **自适应最大间隔（新方案）**：任务设置从"固定间隔"改为"**最大间隔**"，实际节奏由算法在
    `[最小间隔, 最大间隔]` 内决定（预算感知 + 历史热度加权 + 线上信号只做"提前"），保证每款
    **至少每最大间隔被扫一次**（不漏），热款更快。
+
+
+## 八、自查与对齐（第三轮，2026-10-13 夜）
+
+### 1) `product_feed` 不能按货号过滤（已实测）
+`filter=styleColor|styleCode|productCode|searchTerms|query(...)` **全部 400**；
+CN 线上渠道共 **118,000** 商品（`count=100` → 1,180 页）。真实结构：
+`objects[].productInfo[0].{merchProduct.styleColor, availability.available, availableSkus[], merchPrice}`。
+
+### 2) 泄漏的 origin 主机：可直连，但**不是**旁路
+| 主机 | 实测 |
+| --- | --- |
+| `api.test.o2o.origin.nike.com.cn` | 404（o2o 路由在该主机不可用）|
+| `api.prod.o2o.origin.nike.com.cn` | 解析到 192.169.122.148；不带 Host → 404；**带 `Host: api.nike.com.cn` → 又回到阿里云 405 阻断页** |
+| `nvsstore.test.commerce.origins.origin…` | 400（LB 无监听）|
+| `svc.test.loyalty.origin…` | 200（无关页面）|
+
+→ **origin 旁路不成立**（LB 按 Host 路由回同一套 edge）。`store/home` 响应里带
+`x-amzn-requestid`/`x-amz-apigw-id`，说明门店服务在 AWS API Gateway 后面（但与我们的取数路径无关）。
+
+### 3) 给逆向方的对齐样本（解开他们的 PRODUCT_NOT_BUYABLE）
+我们生产**确实拿得到真值**（近 24h：`IN_STOCK` 1,955 / `OUT_OF_STOCK` 222,401 / `NOT_CARRIED` 248 万），
+可直接复跑的两条：
+
+```
+store_code=3930 region_id=NIKE0S094 style=IM9441-600 尺码42/42.5/43/44/44.5 → OUT_OF_STOCK @2026-10-13 04:32
+store_code=3630 region_id=NIKE0S070 style=DM2362-002 → OUT_OF_STOCK @2026-10-13 04:30
+```
+**头号假设**：他们用的是 **web 渠道 token**（client `e5517bcc…`）；`o2o/*` 是**小程序渠道**的接口，
+渠道不匹配时业务层很可能统一回 `PRODUCT_NOT_BUYABLE`。**请用小程序渠道的 token 复跑**同一组合。
+
+### 4) 设计：自适应采集（见 `docs/adaptive-cadence.md`）
+合并采集（4,557 → 1,764 请求/轮）+ 最大间隔语义 + 预算内优先级调度；线上信号只做"提前"。
