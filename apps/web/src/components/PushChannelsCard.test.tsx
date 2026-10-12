@@ -19,6 +19,7 @@ vi.mock("@/data/api", () => ({
     testChannel: vi.fn(),
     deliveries: vi.fn(),
     retryDelivery: vi.fn(),
+    usage: vi.fn(),
   },
 }));
 
@@ -32,6 +33,7 @@ const updateMock = vi.mocked(notificationApi.updateChannel);
 const removeMock = vi.mocked(notificationApi.removeChannel);
 const testMock = vi.mocked(notificationApi.testChannel);
 const deliveriesMock = vi.mocked(notificationApi.deliveries);
+const usageMock = vi.mocked(notificationApi.usage);
 const retryMock = vi.mocked(notificationApi.retryDelivery);
 
 const FAIL_TEXT = "发送失败：平台没有接受这条消息（可在渠道里点“发送测试”复查）。";
@@ -126,6 +128,7 @@ describe("PushChannelsCard", () => {
     vi.clearAllMocks();
     channelsMock.mockResolvedValue([]);
     deliveriesMock.mockResolvedValue([]);
+    usageMock.mockResolvedValue({ used: 0, cap: 200, limited: false });
     createMock.mockResolvedValue(channel());
     updateMock.mockResolvedValue(channel());
     removeMock.mockResolvedValue(undefined);
@@ -245,5 +248,21 @@ describe("PushChannelsCard", () => {
   it("explains an empty push history", async () => {
     renderCard();
     expect(await screen.findByText(PUSH.recentEmpty)).toBeTruthy();
+  });
+});
+
+describe("PushChannelsCard 推送用量", () => {
+  it("显示今日已推送条数与上限", async () => {
+    usageMock.mockResolvedValue({ used: 3, cap: 200, limited: false });
+    renderCard();
+    expect(await screen.findByText("今日已推送 3/200 条。")).toBeInTheDocument();
+    expect(screen.queryByText(PUSH.usageLimited)).not.toBeInTheDocument();
+  });
+
+  it("达到上限时给出可见提示，避免静默不推送", async () => {
+    usageMock.mockResolvedValue({ used: 200, cap: 200, limited: true });
+    renderCard();
+    expect(await screen.findByText("今日已推送 200/200 条。")).toBeInTheDocument();
+    expect(await screen.findByText(PUSH.usageLimited)).toBeInTheDocument();
   });
 });

@@ -5,6 +5,7 @@ import { useState } from "react";
 import { BTN, ERR, PUSH, TASK_LIST, formatDate } from "@/copy";
 import { ApiError } from "@/data/client";
 import { notificationApi } from "@/data/api";
+import type { PushUsage } from "@/data/types";
 import type { NotificationChannel, NotificationDelivery, NotificationPlatform } from "@/data/types";
 
 import { SectionCard } from "./SectionCard";
@@ -77,6 +78,10 @@ export function PushChannelsCard() {
   const channels = useQuery<NotificationChannel[]>({
     queryKey: ["notification-channels"],
     queryFn: () => notificationApi.channels(),
+  });
+  const usage = useQuery<PushUsage>({
+    queryKey: ["push-usage"],
+    queryFn: () => notificationApi.usage(),
   });
   const deliveries = useQuery<NotificationDelivery[]>({
     queryKey: ["notification-deliveries"],
@@ -173,6 +178,16 @@ export function PushChannelsCard() {
       }
     >
       <Space direction="vertical" size={12} style={{ width: "100%" }}>
+        {usage.data ? (
+          <Space direction="vertical" size={2}>
+            <Typography.Text type="secondary">
+              {PUSH.usage(usage.data.used, usage.data.cap)}
+            </Typography.Text>
+            {usage.data.limited ? (
+              <Typography.Text type="warning">{PUSH.usageLimited}</Typography.Text>
+            ) : null}
+          </Space>
+        ) : null}
         {items.length === 0 ? (
           <Typography.Text type="secondary">{PUSH.empty}</Typography.Text>
         ) : (

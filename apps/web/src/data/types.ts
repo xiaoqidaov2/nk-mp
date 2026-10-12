@@ -38,6 +38,8 @@ export interface MonitorTask {
   name: string;
   store_codes: string[];
   style_codes: string[];
+  /** 选码：空数组表示全部尺码（与 store_codes 空=全部门店同构）。 */
+  size_labels: string[];
   all_stores: boolean;
   cadence_seconds: number;
   is_active: boolean;
@@ -49,6 +51,9 @@ export interface MonitorTask {
   created_at: string;
   store_count: number;
   style_count: number;
+  /** 账号级冷却（额度/风控受限）：非空表示冷却中，将在该时刻自动继续。 */
+  cooldown_until: string | null;
+  cooldown_reason: string | null;
 }
 
 export interface ScanJob {
@@ -255,6 +260,13 @@ export interface NotificationChannel {
 export type NotificationDeliveryState = "PENDING" | "SENT" | "FAILED";
 
 /** 一次检查聚合出来的单条推送及其投递状态。 */
+/** 今日推送用量：达到上限后不再排新消息，页面据此提示。 */
+export interface PushUsage {
+  used: number;
+  cap: number;
+  limited: boolean;
+}
+
 export interface NotificationDelivery {
   id: number;
   job_id: string | null;

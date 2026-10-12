@@ -90,20 +90,29 @@ export function StylePage() {
   }
   const data = matrix.data;
 
-  const rows = data.stores
-    .map((store) => {
+  const rows = (() => {
+    const list = data.stores.map((store) => {
       const cells = filteredSizes.map(
         (size) => cellLookup.get(`${store.store_code}|${size}`) ?? null,
       );
       const inStockCount = cells.filter((cell) => cell?.availability === "IN_STOCK").length;
       return { store, cells, inStockCount };
-    })
-    .filter((row) => (inStockOnly ? row.inStockCount > 0 : true));
+    });
+    const visible = inStockOnly ? list.filter((row) => row.inStockCount > 0) : list;
+    // 有货优先：在货尺码数多的门店排前面，其余按门店编号稳定排序。
+    return [...visible].sort(
+      (a, b) =>
+        b.inStockCount - a.inStockCount ||
+        a.store.store_code.localeCompare(b.store.store_code),
+    );
+  })();
 
   const taskWithStyle = (tasks.data ?? []).find((task) => task.style_codes.includes(data.style_code));
   const matrixEmpty = data.cells.length === 0;
   const sizeFilterEmpty = !matrixEmpty && filteredSizes.length === 0;
-  const storeFilterEmpty = !matrixEmpty && !sizeFilterEmpty && rows.length === 0;
+  // 默认「仅有货门店」不是用户筛选：整货号都没货时要给数据型空态，而不是"筛选无结果"。
+  const anyInStock = data.cells.some((cell) => cell.availability === "IN_STOCK");
+  const storeRowsEmpty = !matrixEmpty && !sizeFilterEmpty && rows.length === 0;
 
   const emptyState = matrixEmpty ? (
     <EmptyState
@@ -131,12 +140,27 @@ export function StylePage() {
       action={<Button onClick={() => setSizeFilter("")}>{BTN.clearFilter}</Button>}
       compact
     />
-  ) : storeFilterEmpty ? (
-    <EmptyState
-      variant="no-result"
-      action={<Button onClick={() => setInStockOnly(false)}>{BTN.clearFilter}</Button>}
-      compact
-    />
+  ) : storeRowsEmpty ? (
+    anyInStock ? (
+      <EmptyState
+        variant="no-result"
+        description={STYLE_PAGE.storeEmptyFiltered(sizeFilter.trim())}
+        action={<Button onClick={() => setSizeFilter("")}>{BTN.clearFilter}</Button>}
+        compact
+      />
+    ) : (
+      // 整货号都没货：这是数据现状，不是"筛选无结果"，所以给数据型空态与「显示全部门店」。
+      <EmptyState
+        variant="no-data"
+        description={STYLE_PAGE.storeEmptyAllOut(data.stores.length)}
+        action={
+          inStockOnly ? (
+            <Button onClick={() => setInStockOnly(false)}>{STYLE_PAGE.showAllStores}</Button>
+          ) : undefined
+        }
+        compact
+      />
+    )
   ) : null;
 
   const detailCards = (
@@ -248,6 +272,7 @@ export function StylePage() {
               {STYLE_PAGE.countSummary(rows.length, filteredSizes.length)}
             </Typography.Text>
           </Space>
+          <Typography.Text type="secondary">{STYLE_PAGE.stockFirstHint}</Typography.Text>
           <StatusLegend />
         </Space>
       </SectionCard>

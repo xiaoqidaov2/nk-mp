@@ -1,5 +1,6 @@
-import { Alert, App as AntdApp, Button, Space, Switch, Table, Tooltip, Typography } from "antd";
+import { Alert, App as AntdApp, Button, Space, Table, Tag, Tooltip, Typography } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
 import { EmptyState } from "@/components/EmptyState";
@@ -8,16 +9,25 @@ import { NikeConnectionNotice, isCredentialActive, useNikeCredentialQuery } from
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { StatusPill } from "@/components/StatusPill";
+import {
+  EditCadenceModal,
+  EditSizeScopeModal,
+  EditStoreScopeModal,
+} from "@/components/TaskScopeModals";
 import { TimeText } from "@/components/TimeText";
 import { useAuth } from "@/auth/AuthContext";
 import {
   BTN,
+  COOLDOWN,
   EMPTY,
   ERR,
   MODALS,
   MSG,
+  TASK_CADENCE,
   TASK_LIST,
+  TASK_SCOPE,
   formatCadence,
+  formatClock,
   formatDate,
   formatCount,
   formatScanId,
@@ -33,6 +43,7 @@ export function TasksPage() {
   const { message, modal } = AntdApp.useApp();
   const credential = useNikeCredentialQuery();
   const bound = isCredentialActive(credential.data?.status);
+  const [scope, setScope] = useState<{ task: MonitorTask; kind: "sizes" | "stores" | "cadence" } | null>(null);
 
   const tasks = useQuery<MonitorTask[]>({ queryKey: ["tasks"], queryFn: () => taskApi.list() });
   const scans = useQuery<ScanJob[]>({ queryKey: ["scans"], queryFn: () => scanApi.list() });
@@ -100,6 +111,15 @@ export function TasksPage() {
     });
   };
 
+  const cooldownBadge = (task: MonitorTask) =>
+    task.cooldown_until ? (
+      <Tooltip title={COOLDOWN.note}>
+        <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+          {COOLDOWN.tag} · {COOLDOWN.hint(formatClock(task.cooldown_until))}
+        </Tag>
+      </Tooltip>
+    ) : null;
+
   const checkDisabledReason = (task: MonitorTask): string | null => {
     if (!canWrite) return TASK_LIST.disabledReadonly;
     if (!bound) return TASK_LIST.disabledNotConnected;
@@ -166,33 +186,52 @@ export function TasksPage() {
         <>
           <div className="mobile-card-list__row">
             <Link to={`/tasks/${task.id}`}>{task.name}</Link>
-            <Switch
-              checked={task.is_active}
-              disabled={!canWrite || !bound}
-              loading={toggle.isPending && toggle.variables?.id === task.id}
-              onChange={(checked) => {
-                if (!checked) {
-                  confirmPause(() => toggle.mutate({ id: task.id, is_active: false }));
-                } else {
-                  toggle.mutate({ id: task.id, is_active: true });
-                }
-              }}
-              checkedChildren={BTN.enable}
-              unCheckedChildren={BTN.pause}
-            />
+            <Tag color={task.is_active ? "green" : undefined}>
+              {task.is_active ? TASK_LIST.statusActive : TASK_LIST.statusPaused}
+            </Tag>
           </div>
           <CardRow label="检查范围">
-            {formatStoreScope(task.all_stores, task.store_count)}
+            <Space size={4} wrap>
+              <span>{formatStoreScope(task.all_stores, task.store_count)}</span>
+              {task.size_labels?.length ? <Tag>{TASK_SCOPE.pickedSizes(task.size_labels.length)}</Tag> : null}
+            </Space>
           </CardRow>
           <CardRow label="货号数">{`${formatCount(task.style_count)} 个`}</CardRow>
           <CardRow label="检查频率">{formatCadence(task.cadence_seconds)}</CardRow>
+          {task.cooldown_until ? (
+            <CardRow label="检查状态">{cooldownBadge(task)}</CardRow>
+          ) : null}
           <div className="mobile-card-list__actions">
             {checkButton(task, true)}
             <Link to={`/tasks/${task.id}`}>{BTN.view}</Link>
             {canWrite ? (
-              <Button danger size="small" onClick={() => confirmDelete(task)}>
-                {BTN.deleteTask}
-              </Button>
+              <>
+                <Button size="small" onClick={() => setScope({ task, kind: "sizes" })}>
+                  {TASK_SCOPE.sizeAction}
+                </Button>
+                <Button size="small" onClick={() => setScope({ task, kind: "stores" })}>
+                  {TASK_SCOPE.storeAction}
+                </Button>
+                <Button size="small" onClick={() => setScope({ task, kind: "cadence" })}>
+                  {TASK_CADENCE.action}
+                </Button>
+                <Button
+                  size="small"
+                  loading={toggle.isPending && toggle.variables?.id === task.id}
+                  onClick={() => {
+                    if (task.is_active) {
+                      confirmPause(() => toggle.mutate({ id: task.id, is_active: false }));
+                    } else {
+                      toggle.mutate({ id: task.id, is_active: true });
+                    }
+                  }}
+                >
+                  {task.is_active ? BTN.pause : BTN.enable}
+                </Button>
+                <Button danger size="small" onClick={() => confirmDelete(task)}>
+                  {BTN.deleteTask}
+                </Button>
+              </>
             ) : null}
           </div>
         </>
@@ -218,8 +257,15 @@ export function TasksPage() {
             {
               title: "检查范围",
               dataIndex: "store_count",
-              width: 110,
-              render: (_: unknown, row: MonitorTask) => formatStoreScope(row.all_stores, row.store_count),
+              width: 150,
+              render: (_: unknown, row: MonitorTask) => (
+                <Space size={4} wrap>
+                  <span>{formatStoreScope(row.all_stores, row.store_count)}</span>
+                  {row.size_labels?.length ? (
+                    <Tag>{TASK_SCOPE.pickedSizes(row.size_labels.length)}</Tag>
+                  ) : null}
+                </Space>
+              ),
             },
             {
               title: "货号数",
@@ -247,36 +293,65 @@ export function TasksPage() {
             {
               title: "状态",
               dataIndex: "is_active",
-              width: 100,
+              width: 220,
               sorter: (a: MonitorTask, b: MonitorTask) => Number(a.is_active) - Number(b.is_active),
               render: (value: boolean, row: MonitorTask) => (
-                <Switch
-                  checked={value}
-                  disabled={!canWrite || !bound}
-                  loading={toggle.isPending && toggle.variables?.id === row.id}
-                  onChange={(checked) => {
-                    if (!checked) {
-                      confirmPause(() => toggle.mutate({ id: row.id, is_active: false }));
-                    } else {
-                      toggle.mutate({ id: row.id, is_active: true });
-                    }
-                  }}
-                  checkedChildren={BTN.enable}
-                  unCheckedChildren={BTN.pause}
-                />
+                <Space size={4} wrap>
+                  <Tag color={value ? "green" : undefined}>
+                    {value ? TASK_LIST.statusActive : TASK_LIST.statusPaused}
+                  </Tag>
+                  {cooldownBadge(row)}
+                </Space>
               ),
             },
             {
               title: "操作",
-              width: 200,
+              width: 360,
               render: (_: unknown, row: MonitorTask) => (
-                <Space size={8}>
+                <Space size={8} wrap>
                   {checkButton(row)}
                   <Link to={`/tasks/${row.id}`}>{BTN.view}</Link>
                   {canWrite ? (
-                    <Button type="link" size="small" danger onClick={() => confirmDelete(row)}>
-                      {BTN.deleteTask}
-                    </Button>
+                    <>
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={() => setScope({ task: row, kind: "sizes" })}
+                      >
+                        {TASK_SCOPE.sizeAction}
+                      </Button>
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={() => setScope({ task: row, kind: "stores" })}
+                      >
+                        {TASK_SCOPE.storeAction}
+                      </Button>
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={() => setScope({ task: row, kind: "cadence" })}
+                      >
+                        {TASK_CADENCE.action}
+                      </Button>
+                      <Button
+                        type="link"
+                        size="small"
+                        loading={toggle.isPending && toggle.variables?.id === row.id}
+                        onClick={() => {
+                          if (row.is_active) {
+                            confirmPause(() => toggle.mutate({ id: row.id, is_active: false }));
+                          } else {
+                            toggle.mutate({ id: row.id, is_active: true });
+                          }
+                        }}
+                      >
+                        {row.is_active ? BTN.pause : BTN.enable}
+                      </Button>
+                      <Button type="link" size="small" danger onClick={() => confirmDelete(row)}>
+                        {BTN.deleteTask}
+                      </Button>
+                    </>
                   ) : null}
                 </Space>
               ),
@@ -422,6 +497,22 @@ export function TasksPage() {
       </SectionCard>
 
       <SectionCard title="最近检查">{scanCards}</SectionCard>
+
+      <EditSizeScopeModal
+        task={scope?.kind === "sizes" ? scope.task : null}
+        open={scope?.kind === "sizes"}
+        onClose={() => setScope(null)}
+      />
+      <EditStoreScopeModal
+        task={scope?.kind === "stores" ? scope.task : null}
+        open={scope?.kind === "stores"}
+        onClose={() => setScope(null)}
+      />
+      <EditCadenceModal
+        task={scope?.kind === "cadence" ? scope.task : null}
+        open={scope?.kind === "cadence"}
+        onClose={() => setScope(null)}
+      />
     </Space>
   );
 }

@@ -4,7 +4,7 @@ import { App as AntdApp } from "antd";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { nikeCredentialApi, scanApi, taskApi } from "@/data/api";
+import { catalogApi, matrixApi, nikeCredentialApi, scanApi, taskApi } from "@/data/api";
 import type { MonitorTask, NikeCredentialOut } from "@/data/types";
 
 import { TasksPage } from "./TasksPage";
@@ -13,6 +13,8 @@ vi.mock("@/data/api", () => ({
   taskApi: { list: vi.fn(), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
   scanApi: { list: vi.fn(), create: vi.fn() },
   nikeCredentialApi: { status: vi.fn() },
+  catalogApi: { stores: vi.fn(), styles: vi.fn() },
+  matrixApi: { get: vi.fn() },
 }));
 
 const state = vi.hoisted(() => ({ canWrite: true }));
@@ -25,6 +27,8 @@ const tasksMock = vi.mocked(taskApi.list);
 const scansMock = vi.mocked(scanApi.list);
 const removeMock = vi.mocked(taskApi.remove);
 const credentialMock = vi.mocked(nikeCredentialApi.status);
+const storesMock = vi.mocked(catalogApi.stores);
+const matrixMock = vi.mocked(matrixApi.get);
 
 const EMPTY_TASK_LIST = "还没有监控任务。创建后按周期自动检查指定货号与门店。";
 const READONLY = "你当前是只读成员，可以查看结果但不能新建或修改任务。";
@@ -47,6 +51,7 @@ function task(overrides: Partial<MonitorTask> = {}): MonitorTask {
     name: "测试任务",
     store_codes: [],
     style_codes: ["DN3707-202"],
+    size_labels: [],
     all_stores: true,
     cadence_seconds: 1800,
     is_active: true,
@@ -58,6 +63,8 @@ function task(overrides: Partial<MonitorTask> = {}): MonitorTask {
     created_at: new Date().toISOString(),
     store_count: 5,
     style_count: 1,
+    cooldown_until: null,
+    cooldown_reason: null,
     ...overrides,
   };
 }
@@ -112,6 +119,29 @@ describe("TasksPage", () => {
     tasksMock.mockResolvedValue([]);
     scansMock.mockResolvedValue([]);
     credentialMock.mockResolvedValue(activeCredential());
+    storesMock.mockResolvedValue([]);
+    matrixMock.mockResolvedValue({
+      style_code: "DN3707-202",
+      title: "DN3707-202",
+      image_url: "",
+      sizes: ["40", "41"],
+      stores: [],
+      cells: [],
+      structure_status: "OK",
+      last_checked_at: null,
+    });
+  });
+
+  it("操作列提供 选码 / 选门店 / 暂停，点选码打开弹窗", async () => {
+    tasksMock.mockResolvedValue([task()]);
+    renderPage();
+    const sizeButton = await screen.findByRole("button", { name: "选码" });
+    expect(screen.getByRole("button", { name: "选门店" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "暂停" })).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(sizeButton);
+    });
+    expect(await screen.findByText(/选择尺码/)).toBeInTheDocument();
   });
 
   it("shows the empty state sentence while the task list is empty", async () => {
@@ -155,5 +185,17 @@ describe("TasksPage", () => {
     await clickModalConfirm("删除任务");
     await waitFor(() => expect(removeMock).toHaveBeenCalledWith("t1"));
     expect(await screen.findByText("已删除「测试任务」。")).toBeInTheDocument();
+  });
+
+  it("shows a cooling badge with the auto-resume moment when the account is throttled", async () => {
+    const until = new Date(Date.now() + 30 * 60_000).toISOString();
+    tasksMock.mockResolvedValue([
+      task({ cooldown_until: until, cooldown_reason: "throttled", cadence_seconds: 30 }),
+    ]);
+    renderPage();
+
+    const badge = await screen.findByText(/冷却中 · 将在 \d{2}:\d{2} 自动继续/);
+    expect(badge).toBeInTheDocument();
+    expect(await screen.findByText("30 秒")).toBeInTheDocument();
   });
 });

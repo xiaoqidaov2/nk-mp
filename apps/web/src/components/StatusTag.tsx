@@ -168,6 +168,7 @@ const SCAN_ERROR_TEXT: Record<string, string> = {
   UNEXPECTED_STATUS: "Nike 返回了无法识别的状态，本次未取到数据。",
   UNKNOWN_ERROR_CODE: "出现未知问题，本次未取到数据。请把本页截图发给管理员。",
   BUDGET_EXHAUSTED: "今日额度已用完，剩余门店未检查。",
+  THROTTLED: "被 Nike 限速，本次未取到数据。",
 };
 
 /**

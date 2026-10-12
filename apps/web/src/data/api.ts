@@ -12,6 +12,7 @@ import type {
   DingTalkRobot,
   NotificationChannel,
   NotificationDelivery,
+  PushUsage,
   NotificationPlatform,
   ScanJob,
   ScanStore,
@@ -32,8 +33,11 @@ export const authApi = {
 };
 
 export const catalogApi = {
-  stores: (search = "") =>
-    api.get<StoreOut[]>(`/stores${search ? `?search=${encodeURIComponent(search)}` : ""}`),
+  stores: (search = "", scope: "clearance" | "all" = "clearance") => {
+    const params = new URLSearchParams({ scope });
+    if (search) params.set("search", search);
+    return api.get<StoreOut[]>(`/stores?${params.toString()}`);
+  },
   styles: (search = "") =>
     api.get<StyleOut[]>(`/styles${search ? `?search=${encodeURIComponent(search)}` : ""}`),
 };
@@ -130,6 +134,7 @@ export const notificationApi = {
   deliveries: (limit = 10) =>
     api.get<NotificationDelivery[]>(`/me/notifications?limit=${limit}`),
   retryDelivery: (id: number) => api.post<{ ok: boolean }>(`/me/notifications/${id}/retry`),
+  usage: () => api.get<PushUsage>("/me/push-usage"),
   dingtalkRobot: () => api.get<DingTalkRobot>("/me/dingtalk/robot"),
   saveDingTalkRobot: (payload: { robot_code: string; robot_secret: string }) =>
     api.put<DingTalkRobot>("/me/dingtalk/robot", payload),

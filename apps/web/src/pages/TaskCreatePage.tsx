@@ -22,7 +22,18 @@ import { PageHeader } from "@/components/PageHeader";
 import { useHasEnabledChannel } from "@/components/PushChannelsCard";
 import { SectionCard } from "@/components/SectionCard";
 import { useAuth } from "@/auth/AuthContext";
-import { BTN, CADENCE_OPTIONS, CATALOG, EMPTY, ERR, MSG, PUSH, WIZARD, formatCadence } from "@/copy";
+import {
+  BTN,
+  CADENCE_OPTIONS,
+  CATALOG,
+  EMPTY,
+  ERR,
+  MSG,
+  PUSH,
+  TASK_SCOPE,
+  WIZARD,
+  formatCadence,
+} from "@/copy";
 import { ApiError } from "@/data/client";
 import { catalogApi, scanApi, taskApi } from "@/data/api";
 import type { StoreOut, StyleOut } from "@/data/types";
@@ -59,7 +70,11 @@ export function TaskCreatePage() {
   const [storeCodes, setStoreCodes] = useState<string[]>([]);
   const [runImmediately, setRunImmediately] = useState(true);
 
-  const stores = useQuery<StoreOut[]>({ queryKey: ["stores"], queryFn: () => catalogApi.stores() });
+  const [clearanceOnly, setClearanceOnly] = useState(true);
+  const stores = useQuery<StoreOut[]>({
+    queryKey: ["stores", clearanceOnly ? "clearance" : "all"],
+    queryFn: () => catalogApi.stores("", clearanceOnly ? "clearance" : "all"),
+  });
   const styles = useQuery<StyleOut[]>({ queryKey: ["styles"], queryFn: () => catalogApi.styles() });
   const hasEnabledChannel = useHasEnabledChannel();
 
@@ -248,7 +263,13 @@ export function TaskCreatePage() {
                   {BTN.clear}
                 </Button>
               </Space>
-              <Typography.Text type="secondary">{EMPTY.wizardStoreHint}</Typography.Text>
+              <Space size={8}>
+                <Switch checked={clearanceOnly} onChange={setClearanceOnly} />
+                <Typography.Text>{TASK_SCOPE.clearanceOnly}</Typography.Text>
+              </Space>
+              <Typography.Text type="secondary">
+                {`${TASK_SCOPE.clearanceHint}${EMPTY.wizardStoreHint}`}
+              </Typography.Text>
 
               {stores.isSuccess && (stores.data ?? []).length === 0 ? (
                 <Alert

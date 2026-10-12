@@ -273,6 +273,36 @@ export const TASK_LIST = {
   disabledReadonly: "只读成员不能发起检查",
   scanCountLabel: (done: number, total: number) => `${done} / ${total}`,
   manualCheck: "手动检查",
+  statusActive: "启用中",
+  statusPaused: "已暂停",
+} as const;
+
+/** 任务范围（选码 / 选门店）：两者都可"全部"或"指定"。 */
+export const TASK_SCOPE = {
+  sizeAction: "选码",
+  clearanceOnly: "只看换季优惠店",
+  clearanceHint: "默认只显示换季优惠店（这类门店才是常见货源）；打开可查看全部门店。",
+  storeAction: "选门店",
+  allSizes: "全部尺码",
+  allStores: "全部门店",
+  pickedSizes: (count: number) => `指定 ${count} 个码`,
+  pickedStores: (count: number) => `指定 ${count} 家门店`,
+  sizeTitle: (task: string) => `选择尺码 · ${task}`,
+  storeTitle: (task: string) => `选择门店 · ${task}`,
+  sizeHint: "默认全部尺码；只选指定码时，其它码不再检查，也不计入结果。",
+  storeHint: "选「全部门店」时，以后新登记的门店会自动加入；指定门店时只检查所选门店。",
+  sizesLoading: "正在读取尺码表…",
+  sizesMissing: "这个货号还没有尺码表，先运行一次检查后再选码。",
+  storesMissing: "还没有门店数据，连接 Nike 账号并同步门店后再选。",
+  save: "保存",
+  saved: "已更新任务范围",
+} as const;
+
+/** 账号级冷却：额度或风控受限时自动降速，到点自动继续。 */
+export const COOLDOWN = {
+  tag: "冷却中",
+  hint: (time: string) => `将在 ${time} 自动继续`,
+  note: "额度或风控受限，系统已自动降速；到点自动继续，无需操作。",
 } as const;
 
 export const CATALOG = {
@@ -297,7 +327,7 @@ export const WIZARD = {
   taskNameLabel: "任务名称",
   frequencyLabel: "检查频率",
   frequencyNote:
-    "按所选间隔开始新一轮检查；门店越多一轮耗时越长，实际间隔会顺延（上一轮结束前不会叠加）。",
+    "按所选间隔开始新一轮检查；门店越多一轮耗时越长，实际间隔会顺延（上一轮结束前不会叠加）。选「每 30 秒」表示上一轮结束后尽快开始；额度或风控受限时会自动降速，恢复后自动继续。",
   nameConflictTitle: "已存在同名任务",
   nameConflictBody: (base: string, suggested: string) =>
     `「${base}」已被使用。改用「${suggested}」重新创建？`,
@@ -337,7 +367,9 @@ export const ACCOUNT = {
 
 export const PUSH = {
   cardTitle: "消息推送",
-  cardNote: "补货、售罄、变价会推送到你配置的渠道；每次检查只发一条汇总消息。",
+  cardNote: "补货（含门店首次到货）、售罄、变价会推送到你配置的渠道；每次检查只发一条汇总消息。",
+  usage: (used: number, cap: number) => `今日已推送 ${used}/${cap} 条。`,
+  usageLimited: "今天已达推送上限，新的提醒会从明天继续；已发生的变化仍会记录在变化流水里。",
   empty: "还没有配置推送渠道。配置后，监控任务的提醒会发送到你的手机或群。",
   addChannel: "添加渠道",
   platformLabel: "平台",
@@ -474,6 +506,27 @@ export const STYLE_PAGE = {
   detailTitle: "明细（含价格与促销）",
   structureWarning: "部分门店缺少尺码表",
   matrixEmptyCell: "这家店没有这个尺码，或还没探测",
+  stockFirstHint: "有货优先，在货尺码数多的门店排前面。",
+  storeEmptyAllOut: (stores: number) =>
+    `该货号在已监控的 ${stores} 家门店暂无货源（未铺货或已售罄）。`,
+  storeEmptyFiltered: (term: string) => `没有符合「${term}」的在货门店。`,
+} as const;
+
+/* ------------------------------------------------------------------ */
+/* 门店货源（监控详情页优先展示）                                        */
+/* ------------------------------------------------------------------ */
+export const TASK_STOCK = {
+  title: "各门店货源",
+  hint: "有货优先，在货尺码数多的门店排前面；数据取自最近一次检查。",
+  empty: "还没有各门店货源。运行一次检查后再看。",
+  columnStore: "门店",
+  columnStyles: "货号",
+  columnStockCount: "在货码数",
+  columnStockSizes: "在货尺码",
+  columnChecked: "最近检查",
+  countTag: (count: number) => `${count} 码`,
+  noStockTag: "无货",
+  styleTag: (style: string, count: number) => `${style} · ${count} 码`,
 } as const;
 
 export const SEPARATOR = "；";
@@ -617,15 +670,21 @@ export function resendLabel(seconds: number): string {
   return seconds > 0 ? `${Math.ceil(seconds)} 秒后可重新获取` : "重新获取验证码";
 }
 
-/** 周期：<1 小时 N 分钟；整小时 N 小时；<1 分钟不出现。 */
+/** 周期：<1 分钟 N 秒；<1 小时 N 分钟；整小时 N 小时。 */
 export function formatCadence(seconds: number): string {
-  if (seconds < 60) return "";
+  if (seconds < 60) return `${seconds} 秒`;
   if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
   return `${Math.round(seconds / 60)} 分钟`;
 }
 
 export const CADENCE_OPTIONS = [
+  { value: 30, label: "每 30 秒" },
+  { value: 60, label: "每 1 分钟" },
+  { value: 120, label: "每 2 分钟" },
+  { value: 180, label: "每 3 分钟" },
+  { value: 300, label: "每 5 分钟" },
   { value: 600, label: "每 10 分钟" },
+  { value: 900, label: "每 15 分钟" },
   { value: 1800, label: "每 30 分钟" },
   { value: 3600, label: "每 1 小时" },
   { value: 7200, label: "每 2 小时" },
@@ -633,6 +692,41 @@ export const CADENCE_OPTIONS = [
   { value: 43200, label: "每 12 小时" },
   { value: 86400, label: "每 24 小时" },
 ] as const;
+
+/** 平台小时事务预算（与后端 `NIKE_MP_QUOTA_HOURLY_CAP` 默认一致，仅用于页面提示）。 */
+const HOURLY_TRANSACTION_BUDGET = 30000;
+/** 单店单货号一轮的保守估算（可用性 + 轮询 + 在货尺码的价格批次）。 */
+const TRANSACTIONS_PER_STORE = 4;
+
+/**
+ * 不撞限额的建议最小间隔（秒）：一轮消耗 ≈ 门店数 × 货号数 × 4 次，
+ * 平台每小时的事务预算按 30000 估，取整到下一个可选档位。
+ */
+export function recommendedMinCadenceSeconds(storeCount: number, styleCount: number): number {
+  const perSweep = Math.max(1, storeCount) * Math.max(1, styleCount) * TRANSACTIONS_PER_STORE;
+  const sweepsPerHour = HOURLY_TRANSACTION_BUDGET / Math.max(1, perSweep);
+  const floor = Math.ceil(3600 / Math.max(0.0001, sweepsPerHour));
+  const option = CADENCE_OPTIONS.find((item) => item.value >= floor);
+  return option?.value ?? CADENCE_OPTIONS[CADENCE_OPTIONS.length - 1].value;
+}
+
+/** 间隔设置（任务详情/TasksPage 的"改间隔"弹窗共用）。 */
+export const TASK_CADENCE = {
+  action: "改间隔",
+  title: (task: string) => `检查间隔 · ${task}`,
+  current: (label: string) => `当前：${label}`,
+  hint: "间隔越短，发现新货越快；门店和货号越多，一轮消耗越大。",
+  advice: (seconds: number) =>
+    `按这个任务的门店/货号量估算，建议不小于 ${formatCadence(seconds)}；低于建议值时，多个任务同时跑会更快触发自动降速。`,
+  saved: "已更新检查间隔",
+} as const;
+
+/** 时刻：HH:mm（Asia/Shanghai）。 */
+export function formatClock(value: string | number | Date | null | undefined): string {
+  const parts = zonedParts(value);
+  if (!parts) return "—";
+  return `${pad2(parts.h)}:${pad2(parts.mi)}`;
+}
 
 /** 数量：整数不加单位，>9999 加千分位。 */
 export function formatCount(value: number): string {

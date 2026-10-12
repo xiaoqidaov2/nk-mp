@@ -90,6 +90,9 @@ describe("copy.ts", () => {
     expect(copy.formatPriceChange(699, 699)).toBe("¥699.00");
     expect(copy.formatCadence(1800)).toBe("30 分钟");
     expect(copy.formatCadence(86400)).toBe("24 小时");
+    expect(copy.formatCadence(30)).toBe("30 秒");
+    expect(copy.formatCadence(90)).toBe("2 分钟");
+    expect(copy.CADENCE_OPTIONS[0]).toEqual({ value: 30, label: "每 30 秒" });
     expect(copy.formatCount(1024)).toBe("1024");
     expect(copy.formatCount(12345)).toBe("12,345");
     expect(copy.formatQuota(128, 500)).toBe("今日查询 128 / 500 次");
@@ -111,5 +114,24 @@ describe("loginErrorText", () => {
     expect(copy.loginErrorText("something else", 1)).toBe(
       "操作没有完成，请稍后重试；若仍失败，请把本页截图发给管理员。",
     );
+  });
+});
+
+
+describe("recommendedMinCadenceSeconds", () => {
+  it("按门店/货号量给出不撞限额的最小档位", () => {
+    // 160 店 × 1 货号 ≈ 640 次/轮 → 30k/小时 只够 ~47 轮 → 落到 2 分钟档
+    expect(copy.recommendedMinCadenceSeconds(160, 1)).toBe(120);
+    // 20 店 × 1 货号 ≈ 80 次/轮 → 最小档 30 秒
+    expect(copy.recommendedMinCadenceSeconds(20, 1)).toBe(30);
+    // 门店与货号相乘：160 店 × 2 货号 → 建议 3 分钟
+    expect(copy.recommendedMinCadenceSeconds(160, 2)).toBe(180);
+  });
+
+  it("档位表覆盖 30 秒到 10 分钟之间的常用选择（客户反馈原档位断档）", () => {
+    const values = copy.CADENCE_OPTIONS.map((option) => option.value);
+    for (const wanted of [30, 60, 120, 180, 300, 600]) {
+      expect(values).toContain(wanted);
+    }
   });
 });

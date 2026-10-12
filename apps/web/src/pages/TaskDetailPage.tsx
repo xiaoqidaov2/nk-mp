@@ -1,5 +1,7 @@
 import { Alert, App as AntdApp, Button, Descriptions, Space, Switch, Table, Tag, Typography } from "antd";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { TableProps } from "antd";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { useAuth } from "@/auth/AuthContext";
@@ -13,19 +15,31 @@ import { StatusPill } from "@/components/StatusPill";
 import { TimeText } from "@/components/TimeText";
 import {
   BTN,
+  COOLDOWN,
   EMPTY,
   ERR,
   MODALS,
   MSG,
   PUSH,
   TASK_LIST,
+  TASK_STOCK,
   formatCadence,
+  formatClock,
   formatCount,
   formatDate,
   formatScanId,
 } from "@/copy";
-import { scanApi, taskApi } from "@/data/api";
+import { matrixApi, scanApi, taskApi } from "@/data/api";
 import type { MonitorTask, ScanJob } from "@/data/types";
+
+interface StockRow {
+  store_code: string;
+  store_name: string;
+  inStock: number;
+  sizes: string[];
+  perStyle: Record<string, number>;
+  checkedAt: string | null;
+}
 
 export function TaskDetailPage() {
   const { taskId = "" } = useParams();
@@ -43,6 +57,57 @@ export function TaskDetailPage() {
     queryFn: () => scanApi.list(taskId),
     enabled: Boolean(taskId),
   });
+
+  // 门店货源优先展示：按任务的货号取最新矩阵，再按「有货优先、在货码数多」排序。
+  const styleCodes = useMemo(
+    () => (tasks.data?.find((item) => item.id === taskId)?.style_codes ?? []).slice(0, 5),
+    [tasks.data, taskId],
+  );
+  const matrices = useQueries({
+    queries: styleCodes.map((code) => ({
+      queryKey: ["matrix", code.toUpperCase()],
+      queryFn: () => matrixApi.get(code.toUpperCase()),
+      enabled: Boolean(code) && Boolean(tasks.data),
+    })),
+  });
+  const stockRows = useMemo(() => {
+    const byStore = new Map<string, StockRow>();
+    matrices.forEach((query, index) => {
+      const data = query.data;
+      if (!data) return;
+      const code = (styleCodes[index] ?? data.style_code).toUpperCase();
+      for (const store of data.stores) {
+        if (!byStore.has(store.store_code)) {
+          byStore.set(store.store_code, {
+            store_code: store.store_code,
+            store_name: store.store_name,
+            inStock: 0,
+            sizes: [],
+            perStyle: {},
+            checkedAt: null,
+          });
+        }
+      }
+      for (const cell of data.cells) {
+        const row = byStore.get(cell.store_code);
+        if (!row) continue;
+        if (cell.checked_at && (!row.checkedAt || cell.checked_at > row.checkedAt)) {
+          row.checkedAt = cell.checked_at;
+        }
+        if (cell.availability === "IN_STOCK") {
+          row.inStock += 1;
+          row.sizes.push(cell.size_label);
+          row.perStyle[code] = (row.perStyle[code] ?? 0) + 1;
+        }
+      }
+    });
+    for (const row of byStore.values()) {
+      row.sizes.sort((a, b) => Number.parseFloat(a) - Number.parseFloat(b));
+    }
+    return [...byStore.values()].sort(
+      (a, b) => b.inStock - a.inStock || a.store_code.localeCompare(b.store_code),
+    );
+  }, [matrices, styleCodes]);
 
   const task = tasks.data?.find((item) => item.id === taskId);
   const related = scans.data ?? [];
@@ -229,6 +294,112 @@ export function TaskDetailPage() {
     task.notify_on_price_change ? { key: "price", label: "变价" } : null,
   ].filter((item): item is { key: string; label: string } => item !== null);
 
+  const stockColumns: NonNullable<TableProps<StockRow>["columns"]> = [
+    {
+      title: TASK_STOCK.columnStore,
+      dataIndex: "store_code",
+      width: 180,
+      render: (code: string, row: StockRow) => (
+        <Link to={`/stores/${code}`}>
+          {code}
+          {row.store_name ? ` · ${row.store_name}` : ""}
+        </Link>
+      ),
+    },
+    {
+      title: TASK_STOCK.columnStockCount,
+      dataIndex: "inStock",
+      width: 110,
+      defaultSortOrder: "descend",
+      sorter: (a: StockRow, b: StockRow) => a.inStock - b.inStock,
+      render: (value: number) =>
+        value > 0 ? (
+          <Tag color="green">{TASK_STOCK.countTag(value)}</Tag>
+        ) : (
+          <Tag>{TASK_STOCK.noStockTag}</Tag>
+        ),
+    },
+    {
+      title: TASK_STOCK.columnStockSizes,
+      render: (_: unknown, row: StockRow) =>
+        row.sizes.length ? row.sizes.map((size) => <Tag key={size}>{size}</Tag>) : "—",
+    },
+    {
+      title: TASK_STOCK.columnChecked,
+      dataIndex: "checkedAt",
+      width: 150,
+      render: (value: string | null) => <TimeText value={value} />,
+    },
+  ];
+  if (styleCodes.length > 1) {
+    stockColumns.splice(3, 0, {
+      title: TASK_STOCK.columnStyles,
+      width: 220,
+      render: (_: unknown, row: StockRow) =>
+        Object.entries(row.perStyle).length
+          ? Object.entries(row.perStyle).map(([style, count]) => (
+              <Tag key={style} color="blue">
+                {TASK_STOCK.styleTag(style, count)}
+              </Tag>
+            ))
+          : "—",
+    });
+  }
+
+  const stockCards = (
+    <ResponsiveList
+      items={stockRows}
+      rowKey={(row) => row.store_code}
+      loading={matrices.some((query) => query.isLoading)}
+      empty={
+        <EmptyState
+          variant="no-data"
+          description={TASK_STOCK.empty}
+          action={checkButton}
+          compact
+        />
+      }
+      renderCard={(row) => (
+        <>
+          <div className="mobile-card-list__row">
+            <Link to={`/stores/${row.store_code}`}>{row.store_code}</Link>
+            {row.inStock > 0 ? (
+              <Tag color="green">{TASK_STOCK.countTag(row.inStock)}</Tag>
+            ) : (
+              <Tag>{TASK_STOCK.noStockTag}</Tag>
+            )}
+          </div>
+          <CardRow label={TASK_STOCK.columnStockSizes}>
+            {row.sizes.length ? row.sizes.map((size) => <Tag key={size}>{size}</Tag>) : "—"}
+          </CardRow>
+          <CardRow label={TASK_STOCK.columnChecked}>
+            <TimeText value={row.checkedAt} />
+          </CardRow>
+        </>
+      )}
+      table={
+        <Table<StockRow>
+          size="small"
+          rowKey="store_code"
+          dataSource={stockRows}
+          loading={matrices.some((query) => query.isLoading)}
+          pagination={{ pageSize: 10, hideOnSinglePage: true }}
+          columns={stockColumns}
+          locale={{
+            emptyText: (
+              <EmptyState
+                variant="no-data"
+                description={TASK_STOCK.empty}
+                action={checkButton}
+                compact
+              />
+            ),
+          }}
+        />
+      }
+    />
+  );
+
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
       <PageHeader title={task.name} back={{ onClick: () => navigate("/tasks") }} />
@@ -265,6 +436,16 @@ export function TaskDetailPage() {
       >
         <Descriptions size="small" column={{ xs: 1, md: 2 }}>
           <Descriptions.Item label="检查频率">{formatCadence(task.cadence_seconds)}</Descriptions.Item>
+          <Descriptions.Item label="检查状态">
+            {task.cooldown_until ? (
+              <Space size={4}>
+                <Tag color="orange">{COOLDOWN.tag}</Tag>
+                <span>{COOLDOWN.hint(formatClock(task.cooldown_until))}</span>
+              </Space>
+            ) : (
+              "正常"
+            )}
+          </Descriptions.Item>
           <Descriptions.Item label="下次检查">
             {task.next_run_at ? formatDate(task.next_run_at) : BTN.pause}
           </Descriptions.Item>
@@ -313,6 +494,13 @@ export function TaskDetailPage() {
             ))}
           </div>
         </Space>
+      </SectionCard>
+
+      <SectionCard
+        title={TASK_STOCK.title}
+        extra={<Typography.Text type="secondary">{TASK_STOCK.hint}</Typography.Text>}
+      >
+        {stockCards}
       </SectionCard>
 
       <SectionCard title="这个任务的检查记录">{scanCards}</SectionCard>
