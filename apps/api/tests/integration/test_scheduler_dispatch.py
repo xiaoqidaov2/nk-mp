@@ -587,6 +587,65 @@ def test_due_tasks_of_one_owner_merge_into_a_single_job() -> None:
         assert all(task.next_run_at > datetime.now(UTC) for task in tasks)
 
 
+def test_pending_single_jobs_are_superseded_by_the_merge() -> None:
+    """已排队但还没开跑的单任务作业会被合并作业接管。
+
+    生产实测：客户节奏（分钟级）比一次 147 店扫描还快，每个任务永远"有作业在跑"，
+    只有恰好同时空出来的两三个任务才合得起来——只能成对合并。这里验证第二轮会把
+    三个排队作业停掉，换成一个三任务合并作业。
+    """
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="supersede@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        task_ids = []
+        for index in range(3):
+            make_style(db, owner=user, code=f"SUP-{index}")
+            task = _make_task(db, tenant.id, created_by=user.id, name=f"接管任务 {index}")
+            task.style_codes = [f"SUP-{index}"]
+            task.cadence_seconds = 120
+            task.next_run_at = datetime.now(UTC)
+            task_ids.append(task.id)
+        # 直接造三个"已排队但还没开跑"的单任务作业（生产上就是它们把队列塞满的）
+        for task_id in task_ids:
+            db.add(
+                ScanJob(
+                    tenant_id=tenant.id,
+                    owner_user_id=user.id,
+                    kind="MONITOR",
+                    status=JobStatus.QUEUED.value,
+                    store_codes=["S1"],
+                    style_codes=[],
+                    total_stores=1,
+                    task_id=task_id,
+                    task_ids=[],
+                )
+            )
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 3
+        db.commit()
+    with SessionLocal() as db:
+        jobs = (
+            db.execute(select(ScanJob).where(ScanJob.kind == "MONITOR").order_by(ScanJob.created_at))
+            .scalars()
+            .all()
+        )
+        assert len(jobs) == 4, [(job.status, job.task_id, job.task_ids) for job in jobs]
+        cancelled = [job for job in jobs if job.status == JobStatus.CANCELLED.value]
+        assert len(cancelled) == 3
+        assert all(job.task_id is not None for job in cancelled)
+        merged = [job for job in jobs if job.task_ids]
+        assert len(merged) == 1
+        assert len(merged[0].task_ids) == 3
+        assert merged[0].status == JobStatus.QUEUED.value
+        assert sorted(merged[0].style_codes) == ["SUP-0", "SUP-1", "SUP-2"]
+
+
 def test_a_cohort_spread_over_the_jitter_window_still_merges() -> None:
     """抖动把同一批任务摊到几十秒内时，仍要收拢成**一个**作业，并且此后同刻到期。
 

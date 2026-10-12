@@ -12,7 +12,7 @@ import hashlib
 import math
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -125,17 +125,26 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
     cooldowns = throttle.active(session, [task.created_by for task in tasks])
 
     ready: list[tuple[MonitorTask, object, list[str]]] = []
+    #: 已排队但**还没开跑**的单任务作业：本轮若产生合并作业，它们会被取消并由合并作业接管。
+    #: 不这么做的话：客户节奏（分钟级）比一次 147 店扫描还快，每个任务永远"有作业在跑"，
+    #: 只有恰好同时空出来的两三个任务才合得起来——合并永远拼不齐（生产实测：只能成对合并）。
+    superseded: dict[str, ScanJob] = {}
     for task in tasks:
         cooldown = cooldowns.get(task.created_by)
         if cooldown is not None:
             task.next_run_at = cooldown.until
             continue
-        if _active_job_for(session, task) is not None:
-            # Keep the cadence moving without stacking duplicate scans.
-            task.next_run_at = _next_run_at(
-                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
-            )
-            continue
+        active = _active_job_for(session, task)
+        if active is not None:
+            if active.status == JobStatus.QUEUED.value and active.task_id is not None:
+                # 单任务且未开跑 → 允许被本轮合并接管（下面的 ready 照常收它）
+                superseded[str(task.id)] = active
+            else:
+                # Keep the cadence moving without stacking duplicate scans.
+                task.next_run_at = _next_run_at(
+                    task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
+                )
+                continue
         if not task.style_codes or task.created_by is None:
             task.next_run_at = _next_run_at(
                 task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
@@ -210,6 +219,12 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
 
     for _key, entries in groups.items():
         first_task, binding, store_codes = entries[0]
+        if len(entries) == 1 and str(first_task.id) in superseded:
+            # 只有一个任务、且它已有排队作业 → 保留原作业（重复派发等于把扫描频率翻倍）。
+            first_task.next_run_at = _next_run_at(
+                first_task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(first_task)
+            )
+            continue
         styles: list[str] = []
         for task, _binding, _stores in entries:
             for code in task.style_codes or []:
@@ -228,6 +243,24 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             credential_binding=binding,
             task_ids=[task.id for task, _binding, _stores in entries] if merged else None,
         )
+        if merged:
+            # 合并作业接管这些任务：把还没开跑的单任务作业停掉（没有数据损失，它们一行都还没扫）。
+            # 条件更新兜住竞态：worker 若刚好租走（RUNNING），这里就不会命中，那次扫描照常跑完。
+            for task, _binding, _stores in entries:
+                pending = superseded.get(str(task.id))
+                if pending is None:
+                    continue
+                session.execute(
+                    update(ScanJob)
+                    .where(
+                        ScanJob.id == pending.id,
+                        ScanJob.status == JobStatus.QUEUED.value,
+                    )
+                    .values(
+                        status=JobStatus.CANCELLED.value,
+                        error_summary="已并入合并采集作业",
+                    )
+                )
         group_key = _clock_key(first_task)
         next_at = _next_run_at(
             first_task.cadence_seconds, settings.dispatch_jitter_seconds, key=group_key
