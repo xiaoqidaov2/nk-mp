@@ -12,11 +12,22 @@ Covers, against a running QA stack (offline stub only):
    owner.
 5. Unbinding A: a new scan/task fails with 409 NIKE_CREDENTIAL_REQUIRED while
    B keeps scanning; ``GET /me/nike-credential`` stays self-consistent.
+6. 30 秒档：任务保存 30 秒频率，调度器连续推两轮（一轮接一轮，不叠加）。
+7. 风控冷却：stub ``throttled`` 场景 -> 整轮提前结束（THROTTLED）、账号冷却、
+   降速通知、补跑作业在窗口结束后先跑并成功。
 
     apps/api/.venv/bin/python qa/smoke.py
 
+    # 额度用尽（小时闸）专用闭环：先按压低闸值重启栈
+    QA_QUOTA_HOURLY_CAP=2 docker compose ... up -d
+    QA_SMOKE_MODE=cooldown apps/api/.venv/bin/python qa/smoke.py
+
 Environment: ``QA_API`` (default http://127.0.0.1:18000) and ``QA_STUB``
-(default http://127.0.0.1:19100).
+(default http://127.0.0.1:19100); ``QA_PUSH_URL`` overrides the channel
+address the *API* must reach (bridged stacks: ``json://stub:9100/__push``);
+``QA_SMOKE_MODE`` = full | cooldown;
+``QA_THROTTLE_BACKOFF_SECONDS`` / ``QA_JOB_RETRY_DELAY_SECONDS`` mirror the
+stack's own throttle knobs so the script knows the expected windows.
 """
 
 from __future__ import annotations
@@ -25,16 +36,26 @@ import os
 import sys
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 import httpx
 
 API = os.environ.get("QA_API", "http://127.0.0.1:18000")
 STUB = os.environ.get("QA_STUB", "http://127.0.0.1:19100")
+#: 渠道地址是给 **API/worker** 用的，和宿主看到的 STUB 不一定是同一台主机：
+#: 桥接网络下 API 在容器里，必须走服务名（如 json://stub:9100/__push）。
+PUSH_URL = os.environ.get("QA_PUSH_URL", f"json://{urlparse(STUB).netloc}/__push")
 PASSWORD = "qa-password"
 CODE = "123456"
 TERMINAL = {"SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED"}
 STOCK_EVENT_TYPES = {"RESTOCK", "SOLD_OUT", "PRICE_CHANGE", "NEW_ARRIVAL_AT_STORE"}
+
+#: full = 常规闭环 + 30 秒档 + 风控冷却；cooldown = 压低小时闸的额度冷却闭环。
+SMOKE_MODE = os.environ.get("QA_SMOKE_MODE", "full")
+#: 与 QA 栈的 NIKE_MP_THROTTLE_BACKOFF_SECONDS / NIKE_MP_JOB_RETRY_DELAY_SECONDS 保持一致。
+THROTTLE_WINDOW = float(os.environ.get("QA_THROTTLE_BACKOFF_SECONDS", "30"))
+RETRY_DELAY = float(os.environ.get("QA_JOB_RETRY_DELAY_SECONDS", "5"))
 
 STYLE = "DN3707-202"
 STORE = "QA001"
@@ -137,10 +158,15 @@ class User:
 
     # ----------------------------------------------------------- scanning
 
-    def create_task(self, name: str, store_codes: list[str]) -> httpx.Response:
+    def create_task(
+        self, name: str, store_codes: list[str], cadence: int | None = None
+    ) -> httpx.Response:
+        payload: dict = {"name": name, "store_codes": store_codes, "style_codes": [STYLE]}
+        if cadence is not None:
+            payload["cadence_seconds"] = cadence
         response = self.client.post(
             "/api/v1/tasks",
-            json={"name": name, "store_codes": store_codes, "style_codes": [STYLE]},
+            json=payload,
             headers=self.headers(),
         )
         if response.status_code == 201:
@@ -189,6 +215,143 @@ def cell_map(matrix: dict) -> dict[tuple[str, str], dict]:
     return {(cell["store_code"], cell["size_label"]): cell for cell in matrix["cells"]}
 
 
+def _task_entry(ops: "User", task_id: str) -> dict:
+    response = ops.client.get("/api/v1/tasks")
+    if response.status_code != 200:
+        fail(f"task list read failed: {response.status_code} {response.text}")
+    for row in response.json():
+        if row["id"] == task_id:
+            return row
+    fail(f"task {task_id} missing from the list")
+
+
+def _task_jobs(ops: "User", task_id: str) -> list[dict]:
+    response = ops.client.get("/api/v1/scans", params={"task_id": task_id})
+    if response.status_code != 200:
+        fail(f"scan list read failed: {response.status_code} {response.text}")
+    return sorted(response.json(), key=lambda row: row["created_at"])
+
+
+def _wait_jobs(ops: "User", task_id: str, *, minimum: int, timeout: float = 150.0) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = _task_jobs(ops, task_id)
+        if len(rows) >= minimum:
+            return rows
+        time.sleep(1.0)
+    fail(f"task {task_id} did not reach {minimum} round(s) within {timeout}s")
+
+
+def _wait_job_kind(ops: "User", task_id: str, kind: str, timeout: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for row in _task_jobs(ops, task_id):
+            if row["kind"] == kind:
+                return row
+        time.sleep(1.0)
+    fail(f"task {task_id} produced no {kind} job within {timeout}s")
+
+
+def _wait_push(stub: httpx.Client, predicate, timeout: float = 20.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = stub.get("/__push")
+        if response.status_code == 200:
+            for row in response.json():
+                if predicate(row):
+                    return row
+        time.sleep(0.5)
+    fail("expected push notice did not reach the stub")
+
+
+def _section_new_store(stub: httpx.Client, ops: "User") -> None:
+    """新店自动纳入监控：同步后就该被「全部门店」任务覆盖，变化也要推送。"""
+    stub.post("/__scenario", json={"scenario": "baseline"})
+    added = stub.post("/__stores", json={"store_code": "QA900", "display_name": "离线换季优惠新店 900"})
+    if added.status_code != 200 or not added.json().get("added"):
+        fail(f"stub add store failed: {added.status_code} {added.text}")
+    synced = ops.client.post("/api/v1/ops/stores/sync", headers=ops.headers())
+    if synced.status_code != 200:
+        fail(f"store sync failed: {synced.status_code} {synced.text}")
+    if synced.json()["synced"] < 3:
+        fail(f"store sync missed the new store: {synced.text}")
+    stores = ops.client.get("/api/v1/stores").json()
+    codes = sorted(item["store_code"] for item in stores)
+    if "QA900" not in codes:
+        fail(f"new store not in the catalogue: {codes}")
+
+    task = ops.create_task(f"新店任务 {time.strftime('%Y%m%d-%H%M%S')}", [])
+    if task.status_code != 201:
+        fail(f"new-store task create failed: {task.status_code} {task.text}")
+    task_id = task.json()["id"]
+    first = ops.run_scan(task_id)
+    if first["status"] != "SUCCEEDED" or first["total_stores"] != len(codes):
+        fail(f"all-store task did not cover every store: {first} vs {codes}")
+
+    pushes_before = len(stub.get("/__push").json())
+    stub.post("/__scenario", json={"scenario": "restock"})
+    second = ops.run_scan(task_id)
+    if second["status"] != "SUCCEEDED":
+        fail(f"second round unexpected: {second}")
+    notice = _wait_push(
+        stub, lambda row: "QA900" in row["body"] and "补货" in row["body"]
+    )
+    if len(stub.get("/__push").json()) <= pushes_before:
+        fail("new store change produced no push")
+    if "有货" not in notice["body"]:
+        fail(f"new store push misses the current state: {notice['body']!r}")
+    stub.post("/__scenario", json={"scenario": "baseline"})
+    print(f"[新店] 同步后自动纳入监控：{codes}；新店变化已推送")
+
+def _review_requests(ops: "User") -> int:
+    return int(ops.client.get("/api/v1/dashboard").json()["review_requests_today"])
+
+
+def _section_waf_billing(stub: httpx.Client, ops: "User") -> None:
+    """405 挑战重试不计费：同一轮工作，挑战轮与普通轮计费相同、上游调用翻倍。"""
+    stub.post("/__scenario", json={"scenario": "baseline"})
+    created = ops.create_task(f"计费任务 {time.strftime('%Y%m%d-%H%M%S')}", [STORE])
+    if created.status_code != 201:
+        fail(f"billing task create failed: {created.status_code} {created.text}")
+    task_id = created.json()["id"]
+
+    before = _review_requests(ops)
+    plain = ops.run_scan(task_id)
+    if plain["status"] != "SUCCEEDED":
+        fail(f"billing baseline round unexpected: {plain}")
+    billed_plain = _review_requests(ops) - before
+
+    calls_before = int(stub.get("/__stats").json()["review_calls"])
+    stub.post("/__scenario", json={"scenario": "waf"})
+    before = _review_requests(ops)
+    waf_job = ops.run_scan(task_id)
+    if waf_job["status"] != "SUCCEEDED":
+        fail(f"challenge round unexpected: {waf_job}")
+    billed_waf = _review_requests(ops) - before
+    stats = stub.get("/__stats").json()
+    calls_waf = int(stats["review_calls"]) - calls_before
+    challenges = int(stats["waf_challenges"])
+
+    if billed_plain <= 0:
+        fail("baseline round metered nothing")
+    if billed_waf != billed_plain:
+        fail(f"challenge retries were billed: plain={billed_plain} waf={billed_waf}")
+    if calls_waf < billed_waf * 1.5:
+        fail(f"challenge scenario did not add upstream attempts: calls={calls_waf} billed={billed_waf}")
+    stub.post("/__scenario", json={"scenario": "baseline"})
+    print(
+        f"[计费] 挑战不计费：普通轮 {billed_plain} 次 vs 挑战轮 {billed_waf} 次；"
+        f"上游调用 {calls_waf} 次（挑战 {challenges} 次全部免费）"
+    )
+
+def _pause_task(ops: "User", task_id: str) -> None:
+    response = ops.client.patch(
+        f"/api/v1/tasks/{task_id}", json={"is_active": False}, headers=ops.headers()
+    )
+    if response.status_code != 200:
+        fail(f"task pause failed: {response.status_code} {response.text}")
+
+
 def _assert_offline_upstream(ops: "Session") -> None:
     """离线冒烟只能对着 stub 跑：真实模式下会发真实短信、查真实 Nike。"""
     detail = ops.client.get("/api/v1/ops/health/detail")
@@ -202,8 +365,179 @@ def _assert_offline_upstream(ops: "Session") -> None:
         )
 
 
+def _bootstrap_ops(stub: httpx.Client) -> tuple["User", int, dict]:
+    """ops 登录 + 离线校验 + 推送渠道 + 绑定手机 + 同步门店清单。"""
+    ops = User("ops", "ops@qa.local").login()
+    _assert_offline_upstream(ops)
+    # 推送渠道必须先于第一次采集闭环建好：检查结束时会往这里汇总投递。
+    channel = ops.client.post(
+        "/api/v1/me/notification-channels",
+        json={
+            "platform": "custom",
+            "name": "冒烟推送",
+            "fields": {"url": PUSH_URL},
+        },
+        headers=ops.headers(),
+    )
+    if channel.status_code != 201:
+        fail(f"ops push channel create failed: {channel.status_code} {channel.text}")
+    channel_id = channel.json()["id"]
+    tested = ops.client.post(
+        f"/api/v1/me/notification-channels/{channel_id}/test", headers=ops.headers()
+    )
+    if tested.status_code != 200 or not tested.json().get("ok"):
+        fail(f"push test message failed: {tested.status_code} {tested.text}")
+    credential = ops.bind(OPS_PHONE)
+    sync = ops.client.post("/api/v1/ops/stores/sync", headers=ops.headers())
+    if sync.status_code != 200 or not sync.json().get("ok"):
+        fail(f"store sync failed: {sync.status_code} {sync.text}")
+    return ops, int(sync.json()["synced"]), credential
+
+
+def _section_30s(ops: "User") -> None:
+    """30 秒档：上一轮结束后立刻开始下一轮；上一轮未结束前不叠加。"""
+    created = ops.create_task(f"QA 30秒任务 {time.strftime('%Y%m%d-%H%M%S')}", [STORE], cadence=30)
+    if created.status_code != 201:
+        fail(f"30s task create failed: {created.status_code} {created.text}")
+    task = created.json()
+    if task["cadence_seconds"] != 30 or not task["is_active"]:
+        fail(f"30s task did not keep its cadence: {task}")
+    task_id = task["id"]
+    rounds = _wait_jobs(ops, task_id, minimum=2, timeout=150.0)
+    first = ops.wait_job(rounds[0]["id"], timeout=120.0)
+    if first["status"] != "SUCCEEDED" or first["done_stores"] != 1:
+        fail(f"first 30s round unexpected: {first}")
+    second = ops.wait_job(rounds[1]["id"], timeout=120.0)
+    if second["status"] != "SUCCEEDED" or second["done_stores"] != 1:
+        fail(f"second 30s round unexpected: {second}")
+    if datetime.fromisoformat(second["created_at"]) <= datetime.fromisoformat(first["finished_at"]):
+        fail(f"30s rounds must not stack: {first} -> {second}")
+    _pause_task(ops, task_id)
+    print(f"[10/11] 30 秒档闭环：连续两轮（{first['id'][:8]} → {second['id'][:8]}），已暂停")
+
+
+def _section_throttle(stub: httpx.Client, ops: "User") -> None:
+    """风控限速：整轮提前结束、账号冷却、到点先补跑失败门店。"""
+    created = ops.create_task(
+        f"QA 冷却任务 {time.strftime('%Y%m%d-%H%M%S')}", [STORE, "QA002"], cadence=3600
+    )
+    if created.status_code != 201:
+        fail(f"cooldown task create failed: {created.status_code} {created.text}")
+    task_id = created.json()["id"]
+    baseline = _wait_jobs(ops, task_id, minimum=1, timeout=60.0)
+    first = ops.wait_job(baseline[0]["id"], timeout=120.0)
+    if first["status"] != "SUCCEEDED" or first["done_stores"] != 2:
+        fail(f"cooldown task baseline round unexpected: {first}")
+
+    stub.post("/__scenario", json={"scenario": "throttled"})
+    manual = ops.scan(task_id)
+    if manual.status_code != 201:
+        fail(f"throttled scan create failed: {manual.status_code} {manual.text}")
+    aborted = ops.wait_job(manual.json()["id"], timeout=180.0)
+    if aborted["status"] != "FAILED" or aborted["failed_stores"] != 2:
+        fail(f"throttled round should end early with both stores failed: {aborted}")
+    store_rows = ops.client.get(f"/api/v1/scans/{aborted['id']}/stores").json()
+    if {row["error_code"] for row in store_rows} != {"THROTTLED"}:
+        fail(f"store rows should carry THROTTLED: {store_rows}")
+
+    entry = _task_entry(ops, task_id)
+    if entry["cooldown_reason"] != "throttled" or not entry["cooldown_until"]:
+        fail(f"task should report a throttled cooldown: {entry}")
+    until = datetime.fromisoformat(entry["cooldown_until"])
+    window = (until - datetime.now(UTC)).total_seconds()
+    if not (0 < window <= THROTTLE_WINDOW + 30):
+        fail(f"cooldown window {window:.1f}s should follow the QA ladder ({THROTTLE_WINDOW}s)")
+    # 上游先恢复：冷却结束后补跑必须能成功（通知已在冷却进入时入队，不受影响）。
+    stub.post("/__scenario", json={"scenario": "baseline"})
+    notice = _wait_push(
+        stub, lambda row: "自动继续" in row["body"] and "被 Nike 限速" in row["body"]
+    )
+    if "检查已自动降速" not in notice["title"]:
+        fail(f"cooldown notice title unexpected: {notice}")
+
+    # 补跑作业已排队，但 not_before 在冷却窗口内：不允许提前执行。
+    retry = _wait_job_kind(ops, task_id, "RETRY", timeout=30.0)
+    while datetime.now(UTC) < until - timedelta(seconds=2):
+        current = ops.client.get(f"/api/v1/scans/{retry['id']}").json()
+        if current["status"] != "QUEUED":
+            fail(f"retry job must wait for the cooldown window: {current}")
+        time.sleep(1.0)
+
+    done = ops.wait_job(retry["id"], timeout=THROTTLE_WINDOW + RETRY_DELAY + 90)
+    if done["status"] != "SUCCEEDED" or done["done_stores"] != 2:
+        fail(f"retry after the cooldown should recover both stores: {done}")
+    jobs = _task_jobs(ops, task_id)
+    if len(jobs) != 3:
+        fail(f"the retry must run before another full round: {jobs}")
+    settled = _task_entry(ops, task_id)
+    if settled["cooldown_until"] is not None:
+        fail(f"a fully successful round should clear the expired cooldown: {settled}")
+    print("[11/11] 风控冷却闭环：THROTTLED → 冷却 → 补跑成功（无下一轮抢先）")
+
+
+def _run_quota_cooldown(stub: httpx.Client) -> None:
+    """``QA_QUOTA_HOURLY_CAP=2`` 专用：额度用尽 → 整轮提前结束 + 账号冷却。
+
+    小时窗口只能到点重开，脚本不断言"等待恢复"，改为断言窗口、通知与冷却期间
+    不再派发（自动恢复由风控闭环的 30 秒阶梯用例证明）。
+    """
+    stub.post("/__reset")
+    ops, synced, _credential = _bootstrap_ops(stub)
+    print(f"[1/5] ops bound + store sync ok: {synced} stores")
+    created = ops.create_task(f"QA 额度冷却 {time.strftime('%Y%m%d-%H%M%S')}", [STORE, "QA002"])
+    if created.status_code != 201:
+        fail(f"quota cooldown task create failed: {created.status_code} {created.text}")
+    task_id = created.json()["id"]
+    rounds = _wait_jobs(ops, task_id, minimum=1, timeout=60.0)
+    job = ops.wait_job(rounds[0]["id"], timeout=120.0)
+    if job["status"] != "FAILED" or job["done_stores"] != 1 or job["failed_stores"] != 1:
+        fail(
+            "cap=2 round should abort early (1 done / 1 failed): "
+            f"{job}（若刚跑过一次，小时闸已被上一轮用尽：请重建 QA 数据卷后重试）"
+        )
+    store_rows = ops.client.get(f"/api/v1/scans/{job['id']}/stores").json()
+    failed = [row for row in store_rows if row["status"] == "FAILED"]
+    if len(failed) != 1 or failed[0]["error_code"] != "BUDGET_EXHAUSTED":
+        fail(f"the unpaid store should fail with BUDGET_EXHAUSTED: {store_rows}")
+    print(f"[2/5] 额度用尽：作业提前结束（{job['done_stores']} 完成 / {job['failed_stores']} 失败）")
+
+    entry = _task_entry(ops, task_id)
+    if entry["cooldown_reason"] != "platform_hourly_budget" or not entry["cooldown_until"]:
+        fail(f"task should report the hourly-budget cooldown: {entry}")
+    until = datetime.fromisoformat(entry["cooldown_until"])
+    expected = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(
+        hours=1, seconds=30
+    )
+    if abs((until - expected).total_seconds()) > 150:
+        fail(f"hourly cooldown should reopen at the next hour + 30s: {until} vs {expected}")
+    notice = _wait_push(
+        stub, lambda row: "自动继续" in row["body"] and "本小时查询额度已用完" in row["body"]
+    )
+    if "检查已自动降速" not in notice["title"]:
+        fail(f"cooldown notice title unexpected: {notice}")
+    print(f"[3/5] 冷却与通知：至 {until.isoformat()}，通知已送达 stub")
+
+    retry = _wait_job_kind(ops, task_id, "RETRY", timeout=30.0)
+    if retry["status"] != "QUEUED":
+        fail(f"retry must wait for the budget window: {retry}")
+    next_run = datetime.fromisoformat(entry["next_run_at"])
+    if next_run < until - timedelta(seconds=1):
+        fail(f"next run must not precede the cooldown: {entry}")
+    before = len(_task_jobs(ops, task_id))
+    time.sleep(15.0)
+    after = len(_task_jobs(ops, task_id))
+    if after != before:
+        fail("no new round may be dispatched while the account is cooling down")
+    print("[4/5] 冷却期间不再派发；补跑作业排在窗口之后")
+    print("[5/5] 额度冷却闭环通过（窗口到点由调度器自动继续）")
+    print("SMOKE COOLDOWN PASS")
+
+
 def main() -> None:
     with httpx.Client(base_url=STUB, timeout=10.0) as stub:
+        if SMOKE_MODE == "cooldown":
+            _run_quota_cooldown(stub)
+            return
         # --- stub reset + identity registration (A/B get their own prices) ---
         stub.post("/__reset")
         for phone, identity, price in (
@@ -236,31 +570,8 @@ def main() -> None:
             fail(f"wrong code should be 400 invalid_verification_code: {bad_code.text}")
 
         # --- operator binds its phone and syncs the store catalogue ---
-        ops = User("ops", "ops@qa.local").login()
-        _assert_offline_upstream(ops)
-        # 推送渠道必须先于第一次采集闭环建好：检查结束时会往这里汇总投递。
-        channel = ops.client.post(
-            "/api/v1/me/notification-channels",
-            json={
-                "platform": "custom",
-                "name": "冒烟推送",
-                "fields": {"url": f"json://{urlparse(STUB).netloc}/__push"},
-            },
-            headers=ops.headers(),
-        )
-        if channel.status_code != 201:
-            fail(f"ops push channel create failed: {channel.status_code} {channel.text}")
-        channel_id = channel.json()["id"]
-        tested = ops.client.post(
-            f"/api/v1/me/notification-channels/{channel_id}/test", headers=ops.headers()
-        )
-        if tested.status_code != 200 or not tested.json().get("ok"):
-            fail(f"push test message failed: {tested.status_code} {tested.text}")
-        ops_credential = ops.bind(OPS_PHONE)
-        sync = ops.client.post("/api/v1/ops/stores/sync", headers=ops.headers())
-        if sync.status_code != 200 or not sync.json().get("ok"):
-            fail(f"store sync failed: {sync.status_code} {sync.text}")
-        print(f"[1/9] ops bound + store sync ok: {sync.json()['synced']} stores")
+        ops, synced, ops_credential = _bootstrap_ops(stub)
+        print(f"[1/11] ops bound + store sync ok: {synced} stores")
 
         # --- one phone, one platform account: a second binder is refused ---
         a = User("A", "qa-a@qa.local").login()
@@ -271,7 +582,7 @@ def main() -> None:
         b = User("B", "qa-b@qa.local").login()
         b_credential = b.bind(B_PHONE)
         print(
-            f"[2/9] three identities bound (ops={ops_credential['phone_masked']}, "
+            f"[2/11] three identities bound (ops={ops_credential['phone_masked']}, "
             f"A={a_credential['phone_masked']}, B={b_credential['phone_masked']})"
         )
 
@@ -300,7 +611,7 @@ def main() -> None:
         ).json()
         if before_events:
             fail("the first scan must only build a baseline, not a RESTOCK")
-        print("[3/9] baseline scan ok: 40=OUT_OF_STOCK, 42/44/46=IN_STOCK with price")
+        print("[3/11] baseline scan ok: 40=OUT_OF_STOCK, 42/44/46=IN_STOCK with price")
 
         # --- untrusted round: no stock conclusion, no stock events ---
         def stock_event_ids() -> set[int]:
@@ -328,7 +639,7 @@ def main() -> None:
         stores = ops.client.get(f"/api/v1/scans/{untrusted['id']}/stores").json()
         if any(row["status"] != "UNKNOWN" for row in stores):
             fail(f"store rows should be UNKNOWN: {stores}")
-        print(f"[4/9] untrusted round honest: {untrusted['status']} / unknown={untrusted['unknown_stores']}")
+        print(f"[4/11] untrusted round honest: {untrusted['status']} / unknown={untrusted['unknown_stores']}")
 
         # --- retry the incomplete stores after the restock flip ---
         stub.post("/__scenario", json={"scenario": "restock"})
@@ -357,8 +668,56 @@ def main() -> None:
         dashboard = ops.client.get("/api/v1/dashboard").json()
         if dashboard["review_requests_today"] <= 0:
             fail("quota usage was not metered")
+        # 补货必须推送到渠道：只记事件不推送等于"补货了不通知"。
+        restock_notice = _wait_push(stub, lambda row: "补货" in row["body"])
+        if "库存提醒" not in restock_notice["title"]:
+            fail(f"restock push title unexpected: {restock_notice}")
+        # 文案必须能直接定位：货号 + 尺码 + 门店 + 当前状态（有货）。
+        for token in (STYLE, "40", "QA001", "有货"):
+            if token not in restock_notice["body"]:
+                fail(f"restock push body misses {token!r}: {restock_notice['body']!r}")
+        print(f"[5/11] retry + events + push ok: {sorted(restocked)}; quota={dashboard['review_requests_today']}")
+
+        # --- price change must notify: same stock, new price ---
+        stub.post("/__scenario", json={"scenario": "price_up"})
+        prices_before = {
+            row["id"]
+            for row in ops.client.get("/api/v1/changes", params={"event_type": "PRICE_CHANGE"}).json()
+        }
+        price_job = ops.run_scan(task_id)
+        if price_job["status"] != "SUCCEEDED":
+            fail(f"price round unexpected: {price_job}")
+        new_prices = [
+            row
+            for row in ops.client.get("/api/v1/changes", params={"event_type": "PRICE_CHANGE"}).json()
+            if row["id"] not in prices_before
+        ]
+        if not new_prices:
+            fail("a real price change produced no PRICE_CHANGE event")
+        price_notice = _wait_push(stub, lambda row: "变价" in row["body"])
+        if "库存提醒" not in price_notice["title"]:
+            fail(f"price push title unexpected: {price_notice}")
+        # 价格改回 baseline：这一轮用「临时检查」（无 task_id）跑，
+        # 生产里手动检查/任务删除后的补跑都是这种形态，一样必须推送。
+        pushes_before = len(stub.get("/__push").json())
         stub.post("/__scenario", json={"scenario": "baseline"})
-        print(f"[5/9] retry + events ok: {sorted(restocked)}; quota usage={dashboard['review_requests_today']}")
+        manual = ops.client.post(
+            "/api/v1/scans",
+            json={"store_codes": [STORE], "style_codes": [STYLE]},
+            headers=ops.headers(),
+        )
+        if manual.status_code != 201:
+            fail(f"manual scan create failed: {manual.status_code} {manual.text}")
+        manual_job = ops.wait_job(manual.json()["id"])
+        if manual_job["status"] != "SUCCEEDED" or manual_job.get("task_id") is not None:
+            fail(f"manual scan unexpected: {manual_job}")
+        pushes_after = len(stub.get("/__push").json())
+        if pushes_after <= pushes_before:
+            fail("a task-less manual check pushed nothing")
+        print(
+            f"[5b/11] price change notified: {len(new_prices)} 条事件已推送；"
+            f"临时检查（无任务）也推送（{pushes_before} → {pushes_after}）"
+        )
 
         # --- identity-aware prices: same store/style, different accounts ---
         a_task = a.create_task(f"A 冒烟任务 {time.strftime('%Y%m%d-%H%M%S')}", [STORE])
@@ -386,7 +745,7 @@ def main() -> None:
         # Owner isolation inside one tenant: A must not read B's job.
         if a.client.get(f"/api/v1/scans/{b_job['id']}").status_code != 404:
             fail("A must not be able to read B's scan job")
-        print(f"[6/9] identity prices differ: A={a_cell['total_price']} B={b_cell['total_price']}, owner-scoped")
+        print(f"[6/11] identity prices differ: A={a_cell['total_price']} B={b_cell['total_price']}, owner-scoped")
 
         # --- unbind A: A is locked out, B keeps working ---
         a.unbind()
@@ -408,7 +767,7 @@ def main() -> None:
         b_cell_again = cell_map(b.matrix(STORE)).get((STORE, "42"))
         if not b_cell_again or b_cell_again["total_price"] != B_PRICE:
             fail(f"B price must stay {B_PRICE}: {b_cell_again}")
-        print(f"[7/9] A unbound -> 409 {a_scan.json()['error_code']}; B still scanning at {B_PRICE}")
+        print(f"[7/11] A unbound -> 409 {a_scan.json()['error_code']}; B still scanning at {B_PRICE}")
 
         # --- credential status is self-consistent for all three accounts ---
         a_state = a.credential()
@@ -427,7 +786,7 @@ def main() -> None:
         if stats["send_count"] != 3:
             fail(f"the stub should have counted exactly 3 SMS sends: {stats}")
         print(
-            f"[8/9] credential states ok: A={a_state['status']} "
+            f"[8/11] credential states ok: A={a_state['status']} "
             f"B={b_state['status']} ops={ops_state['status']}; stub sends={stats['send_count']}"
         )
 
@@ -458,7 +817,11 @@ def main() -> None:
         rows = notifications.json()
         if not rows or rows[0]["state"] != "SENT":
             fail(f"推送断言失败：最近记录首条应为已发送（{rows}）")
-        print("[9/9] 推送：测试消息与汇总消息均已送达")
+        print("[9/11] 推送：测试消息与汇总消息均已送达")
+        _section_30s(ops)
+        _section_throttle(stub, ops)
+        _section_new_store(stub, ops)
+        _section_waf_billing(stub, ops)
         print("SMOKE PASS")
 
 

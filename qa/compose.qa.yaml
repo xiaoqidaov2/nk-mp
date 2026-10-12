@@ -15,6 +15,16 @@ x-qa-upstream-env: &qa-upstream-env
   NIKE_MP_CREDENTIAL_KEY: ${NIKE_MP_CREDENTIAL_KEY:-qa-credential-key}
   NIKE_MP_NIKE_PHONE_AUTH_ENABLED: "true"
   NIKE_MP_NIKE_PHONE_AUTH_CONTRACT_VERSION: "2026-09-29/mp-phone-otc-pkce"
+  # 离线冒烟追求速度：重试上限、风控阶梯、补跑延迟都按秒级设置。
+  NIKE_MP_REQUEST_RETRY_LIMIT: "2"
+  NIKE_MP_REVIEW_POLL_TRIES: "2"
+  NIKE_MP_REVIEW_POLL_INTERVAL_SECONDS: "0.2"
+  NIKE_MP_THROTTLE_BACKOFF_SECONDS: ${QA_THROTTLE_BACKOFF_SECONDS:-30}
+  NIKE_MP_JOB_RETRY_DELAY_SECONDS: ${QA_JOB_RETRY_DELAY_SECONDS:-5}
+  NIKE_MP_QUOTA_HOURLY_CAP: ${QA_QUOTA_HOURLY_CAP:-900}
+  # 冒烟把推送指向容器内的 stub（json://stub:9100 或回环地址），
+  # 默认的 SSRF 保护会拒绝内网目标，这里显式放开。
+  NIKE_MP_PUSH_ALLOW_PRIVATE_TARGETS: "true"
 
 services:
   stub:

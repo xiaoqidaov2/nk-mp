@@ -24,6 +24,9 @@ docker compose -p nike-mp-auth-qa -f qa/compose.auth.yaml \
 QA_API=http://127.0.0.1:18000 QA_STUB=http://127.0.0.1:19100 \
   apps/api/.venv/bin/python qa/smoke.py
 
+> 渠道地址由容器内的 API/worker 访问：桥接网络下要额外给 `QA_PUSH_URL`
+> （如 `json://stub:19100/__push`），host 变体保持默认推导即可。
+
 # 4. 查看日志 / 停止
 docker compose -p nike-mp-auth-qa logs -f worker
 docker compose -p nike-mp-auth-qa down            # 保留数据卷
@@ -71,6 +74,10 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
   apps/api/.venv/bin/python qa/smoke.py
 ```
 
+> 桥接网络下 API 在容器内：推送渠道地址必须用服务名，再加
+> `QA_PUSH_URL=json://stub:9100/__push`（host 网络变体无需，默认 127.0.0.1 即可）。
+> 内网目标默认被 SSRF 保护拒绝，两个变体都已预置 `NIKE_MP_PUSH_ALLOW_PRIVATE_TARGETS=true`。
+
 ## stub 契约
 
 `qa/stub_upstream.py` 内存实现，重启即清空：
@@ -85,8 +92,13 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
   - `POST /token/v1` → 同时支持 `authorization_code`（每个 code/身份签发**互相区分**的
     access/refresh token，并校验 PKCE S256）与 `refresh_token`（轮换后保持同一身份）。
 - 身份与数据
-  - `+8613800000000` 为内置的 **default 身份**，走原 `baseline`/`restock`/`untrusted`
-    场景开关（`POST /__scenario`）；未携带/未知 token 同样按 default 处理。
+  - 压测门店：`STUB_EXTRA_STORES=N` 让 stub 额外生成 `QA003..QA0NN`（各带 40/42/44/46 尺码表），
+    用于并发/额度曲线压测；默认 0，冒烟仍是 QA001/QA002 两家、断言不变。
+  - `+8613800000000` 为内置的 **default 身份**，走 `baseline`/`restock`/`untrusted`/`throttled`/
+    `price_up` 场景开关（`POST /__scenario`）；未携带/未知 token 同样按 default 处理。
+    - `throttled`：review 轮询返回 403（风控/限速），用于验收「整轮提前结束 + 账号冷却 +
+      到点先补跑失败门店」；已登记的身份（A/B）不受场景开关影响。
+    - `price_up`：在货状态不变、价格 +100，用于验收「变价必须推送」（冒烟第 5b 步）。
   - `POST /__accounts {"phone","identity","price"}` 登记身份（smoke 用 A=699、B=799）；
     已登记的 token 在 o2o 接口返回**自己的固定价格**，不受场景开关影响。
 - 观测与复位
@@ -113,6 +125,52 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
 5. stub 计数：`send_count == 3`；未知手机号 404、错误验证码 400 亦在断言内。
 9. 消息推送：渠道创建 → 测试消息 → 检查结束后的汇总消息送达 stub（`/__push`）；
    最近一条投递记录为 `SENT`。
+10. 30 秒档：新建 `cadence_seconds=30` 的任务 → 调度器连续推两轮（第二轮在第一轮
+    `finished_at` 之后创建，即「一轮接一轮、不叠加」）→ 任务暂停。
+11. 风控冷却：stub 切 `throttled` → 手动检查整轮提前结束（两店均 `FAILED`，原因
+    `THROTTLED`）→ 账号冷却写入并在任务接口可见（`cooldown_reason=throttled`，窗口
+    跟随 QA 阶梯）→ 降速通知送达 stub（含「自动继续」）→ 补跑作业排队且在窗口内保持
+    `QUEUED`（`not_before` 未到不会被租约）→ 窗口过后按 `baseline` 先补跑并成功 →
+    冷却被清空、任务下没有多跑的整轮。
+
+### 冷却与补跑专项（`QA_SMOKE_MODE=cooldown`，压低小时闸）
+
+小时额度窗口只能到点重开，脚本不断言「等一小时」，改为断言结构性事实（整轮提前结束、
+窗口=下一个整点 +30 秒、通知、冷却期间不再派发、补跑作业排在窗口之后）；「到点自动恢复」
+由上面的风控冷却用例（30 秒阶梯）证明。需要单独起一个压低闸值的栈并重建数据卷：
+
+```bash
+# 先停掉并清空默认栈（小时计数在库里，重复跑会立刻无额度）
+docker compose -p nike-mp-auth-qa -f qa/compose.auth.hostnet.yaml \
+  -f qa/compose.stub.hostnet.yaml down -v
+
+QA_QUOTA_HOURLY_CAP=2 \
+  docker compose -p nike-mp-auth-qa -f qa/compose.auth.hostnet.yaml \
+  -f qa/compose.stub.hostnet.yaml up -d --build
+
+docker compose -p nike-mp-auth-qa -f qa/compose.auth.hostnet.yaml \
+  -f qa/compose.stub.hostnet.yaml exec -T api python - < qa/seed_qa.py
+
+QA_SMOKE_MODE=cooldown QA_API=http://127.0.0.1:18000 QA_STUB=http://127.0.0.1:19100 \
+  apps/api/.venv/bin/python qa/smoke.py     # 结束时打印 SMOKE COOLDOWN PASS
+```
+
+相关端口若被占用，沿用上面的 `QA_API_PORT` / `QA_WEB_PORT` / `QA_STUB_PORT` 覆盖方式
+（hostnet 变体还有 `QA_DB_PORT`），并把 `QA_API` / `QA_STUB` 指到对应端口。
+
+### 离线速度与冷却参数（QA 专用默认值）
+
+stub 叠加文件与自包含 QA 栈默认把节奏压到秒级，便于在冒烟里走完「冷却 → 自动补跑」：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `NIKE_MP_REQUEST_RETRY_LIMIT` | `2` | 403/429 退避重试上限（离线不按真实节奏） |
+| `NIKE_MP_THROTTLE_BACKOFF_SECONDS` | `30` | 风控冷却阶梯（真实默认 `300,900,1800,3600`） |
+| `NIKE_MP_JOB_RETRY_DELAY_SECONDS` | `5` | 补跑作业的最小等待（真实默认 `60`） |
+| `QA_QUOTA_HOURLY_CAP` | `900` | 平台小时闸，冷却专项显式设为 `2` |
+
+`qa/smoke.py` 用 `QA_THROTTLE_BACKOFF_SECONDS` / `QA_JOB_RETRY_DELAY_SECONDS` 对齐期望窗口，
+换值启动栈时把同样的值传给脚本即可。
 
 ### 关于手机号
 

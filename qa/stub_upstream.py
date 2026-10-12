@@ -39,6 +39,9 @@ Scenarios (``POST /__scenario``) - applied to the default identity only
 * ``restock``: everything is in stock (triggers RESTOCK for size 40).
 * ``untrusted``: every review answers with an empty COMPLETED payload, which
   must map to UNKNOWN rather than a stock conclusion.
+* ``throttled``: the review *poll* answers 403 (rate limited) for the default
+  identity, which must end the round with THROTTLED and enter the account
+  cooldown instead of probing the remaining stores.
 
 All state is in memory; a restart clears it.
 """
@@ -48,6 +51,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -60,7 +64,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Nike MP offline stub", version="0.2.0")
 
-SCENARIOS = {"baseline", "restock", "untrusted"}
+SCENARIOS = {"baseline", "restock", "untrusted", "throttled", "price_up", "waf"}
 
 #: The one phone the stub always knows, mapped to the scenario-driven default
 #: identity. Additional accounts are registered through ``POST /__accounts``.
@@ -106,24 +110,38 @@ reviews: dict[str, list[dict]] = {}
 #: 推送渠道的离线落点：Apprise 的 json:// 目标会把 {title, message} POST 进来。
 pushes: list[dict] = []
 
-stats = {"send_count": 0, "codes_issued": 0, "token_grants": 0, "refresh_grants": 0}
+stats = {"send_count": 0, "codes_issued": 0, "token_grants": 0, "refresh_grants": 0,
+         "review_calls": 0, "waf_challenges": 0}
 
+
+#: 压测用的额外门店数量（默认 0：冒烟仍然是 QA001/QA002 两家，行为不变）。
+EXTRA_STORES = max(0, int(os.environ.get("STUB_EXTRA_STORES", "0")))
 
 STORES = [
     {
         "id": "NIKE0S001",
         "storeCode": "QA001",
-        "displayName": "离线测试一店",
+        "displayName": "离线换季优惠一店",
         "storeAddress": "测试路 1 号",
         "concept": "NK",
     },
     {
         "id": "NIKE0S002",
         "storeCode": "QA002",
-        "displayName": "离线测试二店",
+        "displayName": "离线换季优惠二店",
         "storeAddress": "测试路 2 号",
         "concept": "NK",
     },
+    *[
+        {
+            "id": f"NIKE0S{index:03d}",
+            "storeCode": f"QA{index:03d}",
+            "displayName": f"离线换季优惠压测店 {index}",
+            "storeAddress": f"压测路 {index} 号",
+            "concept": "NK",
+        }
+        for index in range(3, 3 + EXTRA_STORES)
+    ],
 ]
 
 # Store-scoped size structures, exactly like the real upstream: the same style
@@ -131,6 +149,15 @@ STORES = [
 SIZES_BY_STORE: dict[str, list[tuple[str, str]]] = {
     "QA001": [("40", "QA001-40"), ("42", "QA001-42"), ("44", "QA001-44")],
     "QA002": [("40", "QA002-40"), ("42", "QA002-42"), ("44", "QA002-44"), ("46", "QA002-46")],
+    **{
+        f"QA{index:03d}": [
+            ("40", f"QA{index:03d}-40"),
+            ("42", f"QA{index:03d}-42"),
+            ("44", f"QA{index:03d}-44"),
+            ("46", f"QA{index:03d}-46"),
+        ]
+        for index in range(3, 3 + EXTRA_STORES)
+    },
 }
 
 LOGIN_PAGE = (
@@ -141,6 +168,11 @@ LOGIN_PAGE = (
 
 class ScenarioIn(BaseModel):
     scenario: str
+
+
+class StoreIn(BaseModel):
+    store_code: str
+    display_name: str = ""
 
 
 class AccountIn(BaseModel):
@@ -218,6 +250,33 @@ def set_scenario(payload: ScenarioIn) -> dict:
         return {"ok": False, "message": f"unknown scenario {payload.scenario}"}
     state["scenario"] = payload.scenario
     return {"ok": True, "scenario": state["scenario"]}
+
+
+@app.post("/__stores")
+def add_store(payload: StoreIn) -> dict:
+    """运行期新增一家门店：验收「目录同步后新店自动纳入监控」。"""
+    code = payload.store_code.strip()
+    if not code:
+        return {"ok": False, "message": "store_code is required"}
+    if any(item["storeCode"] == code for item in STORES):
+        return {"ok": True, "added": False, "stores": [item["storeCode"] for item in STORES]}
+    index = len(STORES) + 1
+    STORES.append(
+        {
+            "id": f"NIKE0S9{index:02d}",
+            "storeCode": code,
+            "displayName": payload.display_name or f"离线换季优惠新店 {index}",
+            "storeAddress": f"新店路 {index} 号",
+            "concept": "NK",
+        }
+    )
+    SIZES_BY_STORE[code] = [
+        ("40", f"{code}-40"),
+        ("42", f"{code}-42"),
+        ("44", f"{code}-44"),
+        ("46", f"{code}-46"),
+    ]
+    return {"ok": True, "added": True, "stores": [item["storeCode"] for item in STORES]}
 
 
 @app.post("/__accounts")
@@ -470,8 +529,22 @@ def product_structure(store: str, style: str) -> dict:
     }
 
 
+def _waf_challenge() -> Response | None:
+    """``waf`` 场景下每隔一次调用返回 405 挑战（上游抽签的确定性替身）。"""
+    stats["review_calls"] += 1
+    if state["scenario"] != "waf":
+        return None
+    if stats["review_calls"] % 2 == 0:
+        stats["waf_challenges"] += 1
+        return JSONResponse(status_code=405, content={"data-spm": "challenge"})
+    return None
+
+
 @app.put("/o2o/buy/cart_reviews/v2/{request_id}")
-def submit_review(request_id: str, payload: dict) -> dict:
+def submit_review(request_id: str, payload: dict):
+    challenge = _waf_challenge()
+    if challenge is not None:
+        return challenge
     items = ((payload.get("request") or {}).get("items")) or []
     reviews[request_id] = [str(item.get("skuId") or "") for item in items]
     return {}
@@ -487,11 +560,17 @@ def _is_out_of_stock(gtin: str, account: Account | None) -> bool:
 
 
 @app.get("/o2o/buy/cart_reviews/v2/{request_id}")
-def poll_review(request_id: str, authorization: str = Header(default="")) -> dict:
+def poll_review(request_id: str, authorization: str = Header(default="")) -> Response:
+    challenge = _waf_challenge()
+    if challenge is not None:
+        return challenge
     gtins = reviews.get(request_id, [])
     account = _scoped_account(authorization)
     if account is None and state["scenario"] == "untrusted":
         return {"response": {"fulfillmentGroups": []}}
+    if account is None and state["scenario"] == "throttled":
+        # 风控/限速：客户端退避重试耗尽后必须整轮结束并进入账号级冷却。
+        return JSONResponse(status_code=403, content={"errors": [{"code": "rate_limited"}]})
 
     errors = []
     for index, gtin in enumerate(gtins):
@@ -503,6 +582,9 @@ def poll_review(request_id: str, authorization: str = Header(default="")) -> dic
         return {"error": {"errors": errors}}
 
     price = account.price if account is not None else DEFAULT_PRICE
+    if account is None and state["scenario"] == "price_up":
+        # 只在货状态不变、只改价格：用于验证「变价必推送」。
+        price = DEFAULT_PRICE + 100
     items = []
     for gtin in gtins:
         items.append(

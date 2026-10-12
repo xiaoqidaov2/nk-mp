@@ -26,6 +26,8 @@ x-auth-env: &auth-env
   NIKE_MP_NIKE_OAUTH_BASE: ${QA_NIKE_OAUTH_BASE:-https://accounts.nike.com.cn}
   NIKE_MP_NIKE_PHONE_AUTH_ENABLED: "true"
   NIKE_MP_NIKE_PHONE_AUTH_CONTRACT_VERSION: "2026-09-29/mp-phone-otc-pkce"
+  # 额度冷却闭环要显式压低闸值（如 QA_QUOTA_HOURLY_CAP=2）；默认与生产一致。
+  NIKE_MP_QUOTA_HOURLY_CAP: ${QA_QUOTA_HOURLY_CAP:-900}
   TZ: Asia/Shanghai
 
 services:
