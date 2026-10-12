@@ -62,3 +62,41 @@ consumerChannelId/d9a5bc42-4b9c-4976-858a-f159cf99c647/groupKey/lqwXsC
 - 我们的**小程序契约**（`790b76033778d3e6f18743582900a4ae` + `2026-09-29/mp-phone-otc-pkce`）
   在生产**已跑通**（用户可自助绑定、token 正常续期）→ **保持不动**；上面的 web 链只作为
   另一条可用路径记录在案。
+
+
+## 七、第二轮逆向交付的吸收（2026-10-13 晚）
+
+### 1) `skus/v1` 判死（**纠正我方早先的记录**）
+对方用三组对照证明它**到不了应用层**：大小写都 403、GET/POST/OPTIONS 同一份 403、`skus/v2`/`skusx/v1`
+等同位路径全 404、带不带 token 完全一致，且 403 体**没有 `custom_acl` 标记**（与 `/store/product_details/*`
+那种 CDN ACL 403 不同）→ 是**边缘精确 deny 规则**。`api-test` 上该路径 404。
+→ **不要再去追"按 skuId 批量查门店库存"**。
+
+### 2) 公开面彻底死路
+全站 JS（35 个 chunk）里**没有** `o2o`/`store_number`/`x-nike-region`/门店/自提字样
+→ **门店库存只存在于微信小程序**；grep.app / GitHub / CSDN / 搜狗 / Wayback 全无痕迹。
+另发现网关回显 `x-nike-zhenghe-target-host`，泄漏 4 台上游 origin（我们已实测：**均不可直连**）。
+
+### 3) `product_feed` 实测（免 token）
+```bash
+GET https://api.nike.com/product_feed/threads/v2?filter=marketplace(CN)&filter=language(zh-Hans)\
+    &filter=channelId(d9a5bc42-4b9c-4976-858a-f159cf99c647)&anchor=0&count=100
+# 200：CN 线上渠道共 118,000 个商品；每条 productInfo[0] 里带
+#   merchProduct.styleColor、availability.available、availableSkus[]、merchPrice
+```
+**但**：`filter=styleColor/styleCode/productCode/searchTerms/query(...)` **全部 400**
+→ **不能按货号查询**，要覆盖全量得翻 1,180 页。而且它是**线上渠道**数据。
+
+### 4) 结论：**"一级门"（用线上信号决定要不要扫门店）不成立**（有硬证据）
+`IB7111-005`：线上 7 个尺码 `True/MEDIUM`，我们 147 店里**在售 0**（5 缺货 / 155 不卖）
+`IO7727-001`：多个尺码线上 `True/LOW`，门店在售 0。
+→ 线上渠道是**独立库存池**（可能由仓或其他店供货），**门店级补货不会同步反映**。
+**只有"加扫"方向的用途是安全的**：线上信号变化 → 把该款**提前插队**去扫门店（只增不减，不会漏）。
+
+### 5) 那么吞吐只能靠这三样（已落地两项）
+1. **批上限 50 / 补价批 10**（已上线 ✓）；
+2. **合并采集**：同一 owner 的门店，把多个款合并成 `ceil(总 GTIN/50)` 个请求 —— 31 款 × 147 店从
+   **4,557 次/轮 → 1,764 次/轮（2.6×）**；
+3. **自适应最大间隔（新方案）**：任务设置从"固定间隔"改为"**最大间隔**"，实际节奏由算法在
+   `[最小间隔, 最大间隔]` 内决定（预算感知 + 历史热度加权 + 线上信号只做"提前"），保证每款
+   **至少每最大间隔被扫一次**（不漏），热款更快。
