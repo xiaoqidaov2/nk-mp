@@ -36,9 +36,9 @@ def _seed() -> dict:
     return seed
 
 
-def _create_task(client, csrf, *, size_labels=None) -> str:
+def _create_task(client, csrf, *, size_labels=None, name="尺码任务") -> str:
     payload = {
-        "name": "尺码任务",
+        "name": name,
         "store_codes": ["S001"],
         "style_codes": ["DN3707-202"],
     }
@@ -131,3 +131,53 @@ def test_scan_without_task_defaults_to_all_sizes(client) -> None:
     with SessionLocal() as db:
         job = db.execute(select(ScanJob)).scalar_one()
         assert job.size_labels == []
+
+
+def test_scan_list_by_task_includes_merged_jobs(client) -> None:
+    """合并采集作业（task_id 为空、归属写在 task_ids 里）要出现在任务详情页的扫描列表里。
+
+    否则客户升级后会发现"任务页一条扫描记录都没有"——因为作业都被合并掉了。
+    """
+    seed = _seed()
+    csrf = login(client, "scope@example.com")
+    task_a = _create_task(client, csrf, name="任务 A")
+    task_b = _create_task(client, csrf, name="任务 B")
+
+    with SessionLocal() as db:
+        merged = ScanJob(
+            tenant_id=seed["tenant_id"],
+            owner_user_id=seed["user_id"],
+            kind="MONITOR",
+            status="QUEUED",
+            store_codes=["S001", "S002"],
+            style_codes=["DN3707-202"],
+            task_id=None,
+            task_ids=[task_a, task_b],
+        )
+        single = ScanJob(
+            tenant_id=seed["tenant_id"],
+            owner_user_id=seed["user_id"],
+            kind="MONITOR",
+            status="QUEUED",
+            store_codes=["S001"],
+            style_codes=["DN3707-202"],
+            task_id=task_b,
+            task_ids=[],
+        )
+        db.add_all([merged, single])
+        db.commit()
+        merged_id, single_id = str(merged.id), str(single.id)
+
+    listed = client.get(
+        f"/api/v1/scans?task_id={task_a}", headers=auth_headers(csrf)
+    )
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()
+    assert [row["id"] for row in rows] == [merged_id]
+    assert set(rows[0]["task_ids"]) == {task_a, task_b}
+
+    # 单任务作业仍按 task_id 归属，B 能看到两条
+    for_task_b = client.get(
+        f"/api/v1/scans?task_id={task_b}", headers=auth_headers(csrf)
+    ).json()
+    assert {row["id"] for row in for_task_b} == {merged_id, single_id}

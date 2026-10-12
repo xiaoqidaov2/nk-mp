@@ -170,6 +170,8 @@ class ScanStoreOut(BaseModel):
 class ScanJobOut(BaseModel):
     id: uuid.UUID
     task_id: uuid.UUID | None
+    #: 合并采集作业覆盖的任务（task_id 为空时用它归属；单个任务的作业为空表）。
+    task_ids: list[uuid.UUID] = Field(default_factory=list)
     kind: str
     status: str
     store_codes: list[str]

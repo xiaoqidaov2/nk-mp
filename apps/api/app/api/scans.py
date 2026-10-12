@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -66,12 +66,16 @@ def _live_store_counts(db: Session, job: ScanJob) -> tuple[int, int]:
 
 def _job_out(db: Session, job: ScanJob) -> ScanJobOut:
     progress = 0.0
+    # 门店数为 0 的作业（刚入队、或被跳过）没有实时统计可取，退回作业上的计数——
+    # 否则整个 /scans 列表会因为一个空作业而 500。
+    done_live, unknown_live = job.done_stores, job.unknown_stores
     if job.total_stores:
         done_live, unknown_live = _live_store_counts(db, job)
         progress = round((done_live + unknown_live) / job.total_stores, 3)
     return ScanJobOut(
         id=job.id,
         task_id=job.task_id,
+        task_ids=[UUID(value) for value in (job.task_ids or [])],
         kind=job.kind,
         status=job.status,
         store_codes=list(job.store_codes or []),
@@ -187,7 +191,14 @@ def list_scans(
         ScanJob.owner_user_id == user.id,
     )
     if task_id is not None:
-        stmt = stmt.where(ScanJob.task_id == task_id)
+        # 合并采集作业的 task_id 为空、真正的归属写在 task_ids 里：按任务过滤时要一并带出来，
+        # 否则客户在任务详情页里看不到自己的扫描记录。
+        stmt = stmt.where(
+            or_(
+                ScanJob.task_id == task_id,
+                ScanJob.task_ids.contains([str(task_id)]),
+            )
+        )
     rows = db.execute(
         stmt.order_by(ScanJob.created_at.desc()).limit(max(1, min(limit, 200)))
     ).scalars().all()
