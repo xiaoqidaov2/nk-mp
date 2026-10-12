@@ -463,7 +463,7 @@ def test_a_task_with_an_explicit_store_list_ignores_new_stores() -> None:
 
 
 def test_dispatch_jitter_spreads_the_next_round() -> None:
-    """下一轮不精确落在「现在 + 间隔」：右移不超过 min(配置, 间隔的 10%)。"""
+    """下一轮落在「间隔网格 + 组偏移」上：不超过一个间隔 + min(配置, 间隔的 10%)。"""
     settings = get_settings()
     with SessionLocal() as db:
         tenant = make_tenant(db)
@@ -483,16 +483,31 @@ def test_dispatch_jitter_spreads_the_next_round() -> None:
         task = db.get(MonitorTask, task_id)
         delay = (task.next_run_at - datetime.now(UTC)).total_seconds()
     ceiling = min(settings.dispatch_jitter_seconds, 300 * 0.1)
-    assert 300 <= delay <= 300 + ceiling + 2
+    assert 0 < delay <= 300 + ceiling + 2
 
 
 def test_thirty_second_cadence_keeps_its_jitter_small() -> None:
-    """30 秒档的抖动上限是 3 秒（间隔的 10%）：几乎就是"连续轮次"。"""
+    """30 秒档的组偏移上限是 3 秒（间隔的 10%），且下一个时刻不出 30 秒窗口。"""
     from app.services.scheduler import _next_run_at
 
     now = datetime.now(UTC)
     delay = (_next_run_at(30, 60.0) - now).total_seconds()
-    assert 30 <= delay <= 33.0 + 0.5
+    assert 0 < delay <= 30.0 + 0.5
+
+
+def test_the_next_round_is_grid_aligned_per_group() -> None:
+    """同一组不管何时算，下一个到期时刻都相同——同批任务自动收敛、持续合并。
+
+    这正是生产上"31 个任务一分钟一个作业"的解法：各自随机的抖动会让错位永久保留。
+    """
+    from app.services.scheduler import _next_run_at
+
+    first = _next_run_at(120, 10.0, key="owner|600|stores")
+    second = _next_run_at(120, 10.0, key="owner|600|stores")
+    assert first == second
+    # 不早于此刻、也不超过一个间隔（旧的"现在 + 间隔 + 随机抖动"会超过）
+    delay = (first - datetime.now(UTC)).total_seconds()
+    assert 0 < delay <= 120 + 10
 
 
 def test_all_store_task_only_covers_clearance_stores() -> None:
@@ -602,14 +617,14 @@ def test_a_cohort_spread_over_the_jitter_window_still_merges() -> None:
 
 
 def test_a_task_due_beyond_the_window_waits_for_its_own_round() -> None:
-    """窗口只收拢"马上到期"的任务：还差 60 秒的同组任务不提前扫。"""
+    """窗口只收拢"马上到期"的任务：还差 150 秒的同组任务不提前扫。"""
     settings = get_settings()
     now = datetime.now(UTC)
     with SessionLocal() as db:
         tenant = make_tenant(db)
         user = make_user(db, tenant, email="window@example.com")
         make_store(db, owner=user, code="S1", region_id="R1")
-        for index, offset in enumerate((0.0, 60.0)):
+        for index, offset in enumerate((0.0, 150.0)):
             make_style(db, owner=user, code=f"WIN-{index}")
             task = _make_task(db, tenant.id, created_by=user.id, name=f"窗口任务 {index}")
             task.style_codes = [f"WIN-{index}"]
@@ -630,7 +645,7 @@ def test_a_task_due_beyond_the_window_waits_for_its_own_round() -> None:
         later = db.execute(
             select(MonitorTask).where(MonitorTask.style_codes == ["WIN-1"])
         ).scalar_one()
-        assert later.next_run_at > now + timedelta(seconds=30)  # 原定时刻没被改动
+        assert later.next_run_at > now + timedelta(seconds=120)  # 原定时刻没被改动
 
 
 def test_tasks_with_different_cadence_do_not_merge() -> None:

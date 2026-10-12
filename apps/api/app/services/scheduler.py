@@ -9,7 +9,7 @@ account, and the user's ``is_active`` intent is never changed here.
 from __future__ import annotations
 
 import hashlib
-import random
+import math
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
@@ -46,25 +46,32 @@ def _jitter_span(cadence_seconds: int, jitter_seconds: float) -> float:
     return min(max(0.0, jitter_seconds), max(0.0, float(cadence_seconds) * 0.1))
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
 def _next_run_at(cadence_seconds: int, jitter_seconds: float, key: str | None = None) -> datetime:
-    """下一次派发时刻 = 间隔 + 一点右移（≤ 间隔的 10%，且不超过配置上限）。
+    """下一次派发时刻：**按间隔网格对齐 + 组偏移**，落在 ``(now, now + 间隔]`` 内。
 
-    多任务共用同一 cadence 时若精确对齐在同一秒，会在同一分钟里把小时额度一次打满，
-    于是集体进入冷却——客户看到的正是"任务一多就限速"。抖动把它们铺开：整体通过量不变，
-    峰值下降。
+    为什么不是"现在 + 间隔 + 随机"：每个任务各自随机、各自到期，节奏一旦错开就再也对不上，
+    同一批任务被摊到几十秒～几分钟里各派各的作业，**合并采集永远不成立**（抖动的本意是
+    错峰，但错峰只应发生在**组与组之间**）。
 
-    同一个合并组（``key``）取**同一个**右移量：组内成员永远同刻到期，才会持续合并成一个
-    作业（抖动只用于组与组之间错峰）。
+    网格对齐后，同一 ``(间隔, 组偏移)`` 的任务不管在哪一刻被派发，下一个到期时刻都落在
+    **同一个瞬间**——错位会在一轮内自动收敛，之后每轮都合并成一个作业；而且下一次不会
+    早于此刻、也不会超过一个间隔（旧的"现在 + 间隔 + 抖动"会超过）。
+
+    组偏移（≤ 间隔的 10%，且 ≤ 配置上限）由 ``key`` 稳定哈希得到：组间错峰、组内同刻。
     """
+    interval = float(max(1, int(cadence_seconds)))
     span = _jitter_span(cadence_seconds, jitter_seconds)
-    if span <= 0:
-        return datetime.now(UTC) + timedelta(seconds=float(cadence_seconds))
-    if key is None:
-        offset = random.uniform(0.0, span)
+    if key is None or span <= 0:
+        offset = 0.0
     else:
         digest = hashlib.blake2s(key.encode("utf-8"), digest_size=8).digest()
         offset = (int.from_bytes(digest, "big") % 10_000) / 10_000.0 * span
-    return datetime.now(UTC) + timedelta(seconds=float(cadence_seconds) + offset)
+    elapsed = (datetime.now(UTC) - _EPOCH).total_seconds()
+    slot = math.floor((elapsed - offset) / interval) + 1
+    return _EPOCH + timedelta(seconds=slot * interval + offset)
 
 
 def _active_job_for(session: Session, task: MonitorTask) -> ScanJob | None:
@@ -100,14 +107,9 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
         task
         for task in due_tasks(session, look_ahead_seconds=window)
         if task.next_run_at is None
-        or task.next_run_at
-        <= now
-        + timedelta(
-            seconds=min(
-                window, _jitter_span(task.cadence_seconds, settings.dispatch_jitter_seconds)
-            )
-        )
+        or task.next_run_at <= now + timedelta(seconds=min(window, 0.5 * float(task.cadence_seconds)))
     ]
+    # 网格对齐只对"下一次"生效；窗口负责把**历史遗留的错位**一次性收拢（最多提前半个间隔）。
     if not tasks:
         return 0
     cooldowns = throttle.active(session, [task.created_by for task in tasks])

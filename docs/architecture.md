@@ -55,6 +55,31 @@ worker    → lease job（租约 120s / 心跳 20s）
   所有登录用户都可管理**自己**的 Nike 连接（包括只读角色），扫描/任务写入仍受 `require_write` 限制。
 - 日志与接口响应不输出 token、JWT、Cookie、完整手机号或验证码。
 
+## 发版（生产）
+
+常规路径：`docker compose up -d --build api worker scheduler migrate`（`migrate` 跑 alembic 到 head）。
+
+**已知约束（2026-10-14 实测）**：生产机访问 `registry-1.docker.io` **不通**（`HEAD manifest` 超时），
+`--build` 会在 `load metadata for docker.io/library/python:3.12-slim` 处失败。绕行方案（已验证）：
+
+```bash
+# 1) 有 registry 的构建机（测试机）：同步源码后构建
+docker compose build api
+# 2) 搬运镜像：docker save | gzip | ssh 生产 'gunzip | docker load'
+#    中转链路：构建机 → 本机 → 生产（两跳，约 130MB，耗时约 9 分钟）
+# 3) 生产：打标签（api/worker/migrate/scheduler 同一镜像、同一 Dockerfile）+ 重建，**不加 --build**
+docker tag nike-mp-api:latest nike-mp-worker:latest
+docker tag nike-mp-api:latest nike-mp-migrate:latest
+docker tag nike-mp-api:latest nike-mp-scheduler:latest
+docker compose up -d migrate && docker compose up -d api worker scheduler
+docker compose exec -T api alembic current     # 期望：<最新 revision> (head)
+```
+
+坑：`docker compose exec -T ...` 会**吃掉脚本自身的 stdin**，用 SSH 管道传脚本时必须
+`< /dev/null` 或改成"先 `cat > /tmp/x.sh` 再 `bash /tmp/x.sh`"；`docker compose cp` 进容器的
+文件是临时的（容器一重建就没了）——真正的修复要进镜像。
+
 ## 后续迭代（本版未实现）
 
 通知推送（钉钉/企微）、审计日志、租户级公平队列与老化提权、异步大数据导出。
+

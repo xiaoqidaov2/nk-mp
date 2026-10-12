@@ -77,3 +77,57 @@ candidates = 该 owner 所有款
 2. **最大间隔字段 + 到期强制**（`schemas`/`web`/`scheduler`）：保证不漏的前提下放开节奏。
 3. **优先级 + 预算裁剪**（`scheduler` 的小型调度器）：用历史变化与线上信号做加权，
    把省下来的额度倾斜给热款。
+
+## 五、实施记录（2026-10-14，第 1 步：合并采集已上线）
+
+落到代码里的合并规则（`scheduler.dispatch_due_tasks`）：
+
+```
+合并键 = (账号, cadence_seconds, 门店集合, 尺码集合)   ← 款式取并集，所以"一款一任务"能合
+```
+
+为什么这么定：
+
+- **款式不进键**：一次可用性请求带 50 个跨款 GTIN ✓，一款一任务正是要合的形态；
+- **门店集合进键**：合并会扩大扫描范围（单店任务并进全店任务 = 多扫店）✗；
+- **尺码集合进键**：`size_labels` 是**扫描期过滤器**（`probe.py` 只上报选中尺码）
+  → 合了会把没选的尺码也上报 ✗；
+- **cadence 进键**：节奏不同的任务合并 → 慢任务被快节奏拖着反复扫 ✗。
+
+### 生产上踩到的坑（重要）
+
+派发抖动（`dispatch_jitter_seconds`，≤ 间隔 10%）原本是**每任务随机**的 ✗：
+31 个"1 款 1 任务"的到期时刻被摊开约一分钟 → 调度器每 10 秒轮询一次，
+**每次只到一个任务** → 每个任务各自成一个作业 → **合批从未成立**
+（线上观察到 05:30:04 / 05:30:54 / 05:31:55 一分钟一个作业）。
+
+修法（三条，缺一不可）：
+
+1. **到期收拢窗口**（`dispatch_merge_window_seconds`）：把"马上到期"的任务提前收进同一轮
+   派发，最多提前**半个间隔**（不会明显提前扫）。这一条只负责收拢**历史遗留的错位**。
+2. **按间隔网格对齐**（关键）：`next_run_at` = 「间隔网格 + 组偏移」，落在 `(now, now+间隔]`。
+   同一 `(间隔, 组偏移)` 的任务不管在哪一刻被派发，下一个到期时刻都落在**同一个瞬间**
+   → 错位在一轮内自动收敛，此后每轮都合并（旧的"现在 + 间隔 + 随机抖动"会让错位**永久保留**：
+   两个同批任务错开 60 秒，就永远是 60 秒，窗口再大也合不上）。
+3. **组偏移**由合并键稳定哈希得到（≤ 间隔的 10%，且 ≤ `dispatch_jitter_seconds`）：
+   错峰只发生在**组与组之间**，组内完全同刻。
+
+### 验收口径（生产 SQL）
+
+```sql
+-- 合并是否成立：n_tasks ≥ 2 的作业数
+SELECT count(*) FILTER (WHERE jsonb_array_length(task_ids) >= 2) AS merged,
+       count(*) AS all_jobs, max(jsonb_array_length(task_ids)) AS max_tasks
+FROM scan_job WHERE created_at > now() - interval '1 hour';
+
+-- 单轮请求数：一轮合并作业的 store 行 × 每店批次数
+SELECT total_stores, jsonb_array_length(style_codes) FROM scan_job ORDER BY created_at DESC LIMIT 5;
+```
+
+### 连带修的两处（合并作业没有 `task_id` 暴露出来的）
+
+- `/scans?task_id=X` 现在同时匹配 `task_id` 与 `task_ids` ✗→✓：否则客户在任务详情页
+  看不到自己的扫描记录；
+- `_job_out` 在 `total_stores = 0` 的作业上会 `UnboundLocalError` → `total_stores=0`
+  的作业会让整个 `/scans` 列表 500（潜伏 bug，借这次补的测试暴露并修掉）。
+

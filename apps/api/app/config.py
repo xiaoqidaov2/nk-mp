@@ -88,9 +88,9 @@ class Settings(BaseSettings):
     #: 派发成功后给下一轮时间加的随机右移上限（秒）；实际抖动 ≤ 间隔的 10%。
     #: 多个任务同一间隔时避免同秒齐发、把小时额度瞬间打满。
     dispatch_jitter_seconds: float = 10.0
-    #: 派发收拢窗口（秒）：把"马上到期"的同类任务提前收进同一轮派发，否则抖动会让
-    #: 同一批任务被摊到多轮里、每个任务各成一个作业（合并采集就失效了）。
-    dispatch_merge_window_seconds: float = 30.0
+    #: 派发收拢窗口（秒）：把"马上到期"的同类任务提前收进同一轮派发。网格对齐让错位在一轮内
+    #: 收敛，这个窗口负责收拢**历史遗留的错位**（最多提前半个间隔，见 dispatch_due_tasks）。
+    dispatch_merge_window_seconds: float = 90.0
     #: 每个 (门店, 货号, 尺码) 保留的历史观测条数：间隔小、量大，历史只用于回溯。
     observation_history_limit: int = 30
     daily_review_budget: int = 60000
