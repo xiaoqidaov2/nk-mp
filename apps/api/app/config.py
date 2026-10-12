@@ -24,8 +24,12 @@ class Settings(BaseSettings):
     )
     oauth_client_id: str = "790b76033778d3e6f18743582900a4ae"
 
-    availability_chunk_size: int = 40
-    price_chunk_size: int = 3
+    #: 一次可用性请求的 GTIN 上限。上游实测 **50 是硬上限**（51 → 400 FIELD_INVALID），
+    #: 原来是 40；同一门店的多个货号会一起进这个批次，所以提高直接减少请求数。
+    availability_chunk_size: int = 50
+    #: 缺价时的补价批量。价格本来就会随可用性响应回来，这里只补"还缺的"在货尺码；
+    #: 上游对**单个请求的 items 总数**限制才是 50，价格并不需要拆 3 个/批（旧值是我方策略）。
+    price_chunk_size: int = 10
     review_poll_tries: int = 12
     #: 首次轮询等待（秒）：review 结果通常已就绪，先快后慢可显著缩短单店耗时。
     review_poll_first_seconds: float = 0.5
