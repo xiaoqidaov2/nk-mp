@@ -49,6 +49,16 @@ def _jitter_span(cadence_seconds: int, jitter_seconds: float) -> float:
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+def _clock_key(task: MonitorTask) -> str:
+    """任务的「节奏钟」键：只由账号 + 租户 + 间隔决定。
+
+    合并分组还看门店/尺码集合，但**到期时刻**只看这三项——这样同一账号同一间隔的**所有**
+    任务（含本轮因冷却/无绑定/已有作业被跳过的）都落在同一批网格时刻上，错位不会累积，
+    队列排空后自然聚成一批、合成一个作业。
+    """
+    return f"{task.created_by}|{task.tenant_id}|{task.cadence_seconds}"
+
+
 def _next_run_at(cadence_seconds: int, jitter_seconds: float, key: str | None = None) -> datetime:
     """下一次派发时刻：**按间隔网格对齐 + 组偏移**，落在 ``(now, now + 间隔]`` 内。
 
@@ -122,10 +132,14 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             continue
         if _active_job_for(session, task) is not None:
             # Keep the cadence moving without stacking duplicate scans.
-            task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
+            task.next_run_at = _next_run_at(
+                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
+            )
             continue
         if not task.style_codes or task.created_by is None:
-            task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
+            task.next_run_at = _next_run_at(
+                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
+            )
             continue
 
         user = session.execute(
@@ -141,7 +155,9 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             or tenant is None
             or not tenant.is_active
         ):
-            task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
+            task.next_run_at = _next_run_at(
+                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
+            )
             continue
 
         try:
@@ -149,7 +165,9 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
         except CredentialError:
             # No fallback credential: resume automatically once the user
             # re-connects, on the next cadence.
-            task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
+            task.next_run_at = _next_run_at(
+                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
+            )
             continue
 
         store_codes = list(task.store_codes or [])
@@ -169,7 +187,9 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
                 ).scalars()
             )
         if not store_codes:
-            task.next_run_at = datetime.now(UTC) + timedelta(seconds=task.cadence_seconds)
+            task.next_run_at = _next_run_at(
+                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
+            )
             continue
         ready.append((task, binding, store_codes))
 
@@ -188,7 +208,7 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
         )
         groups.setdefault(key, []).append(entry)
 
-    for key, entries in groups.items():
+    for _key, entries in groups.items():
         first_task, binding, store_codes = entries[0]
         styles: list[str] = []
         for task, _binding, _stores in entries:
@@ -208,7 +228,7 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             credential_binding=binding,
             task_ids=[task.id for task, _binding, _stores in entries] if merged else None,
         )
-        group_key = "|".join(str(part) for part in key)
+        group_key = _clock_key(first_task)
         next_at = _next_run_at(
             first_task.cadence_seconds, settings.dispatch_jitter_seconds, key=group_key
         )

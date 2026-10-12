@@ -389,7 +389,9 @@ def test_30_second_cadence_does_not_stack_rounds() -> None:
         jobs = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalars().all()
         assert len(jobs) == 1
         task = db.get(MonitorTask, task_id)
-        assert task.next_run_at > datetime.now(UTC) + timedelta(seconds=20)
+        # 网格对齐：下一次落在 (now, now + 间隔 + 组偏移] 内（旧的"现在 + 间隔"会超过间隔）。
+        delay = (task.next_run_at - datetime.now(UTC)).total_seconds()
+        assert 0 < delay <= 30 + min(settings.dispatch_jitter_seconds, 3.0) + 0.5
 
 
 def test_a_store_added_later_is_monitored_from_the_next_round() -> None:
@@ -495,17 +497,23 @@ def test_thirty_second_cadence_keeps_its_jitter_small() -> None:
     assert 0 < delay <= 30.0 + 0.5
 
 
-def test_the_next_round_is_grid_aligned_per_group() -> None:
-    """同一组不管何时算，下一个到期时刻都相同——同批任务自动收敛、持续合并。
+def test_the_next_round_is_grid_aligned_per_clock() -> None:
+    """同一"节奏钟"（账号+间隔）不管何时算，下一个到期时刻都相同——同批任务自动收敛。
 
     这正是生产上"31 个任务一分钟一个作业"的解法：各自随机的抖动会让错位永久保留。
+    被跳过的任务（冷却/无绑定/已有作业）也走同一套钟，错位不会累积。
     """
-    from app.services.scheduler import _next_run_at
+    from app.services.scheduler import _clock_key, _next_run_at
 
-    first = _next_run_at(120, 10.0, key="owner|600|stores")
-    second = _next_run_at(120, 10.0, key="owner|600|stores")
+    class _Task:
+        created_by = "user-1"
+        tenant_id = "tenant-1"
+        cadence_seconds = 120
+        # 门店/尺码集合不同的任务，到期时刻也要对齐（它们只是分组不同，节奏钟相同）
+
+    first = _next_run_at(120, 10.0, key=_clock_key(_Task()))
+    second = _next_run_at(120, 10.0, key=_clock_key(_Task()))
     assert first == second
-    # 不早于此刻、也不超过一个间隔（旧的"现在 + 间隔 + 随机抖动"会超过）
     delay = (first - datetime.now(UTC)).total_seconds()
     assert 0 < delay <= 120 + 10
 
