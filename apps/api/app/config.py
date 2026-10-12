@@ -27,14 +27,29 @@ class Settings(BaseSettings):
     availability_chunk_size: int = 40
     price_chunk_size: int = 3
     review_poll_tries: int = 12
+    #: 首次轮询等待（秒）：review 结果通常已就绪，先快后慢可显著缩短单店耗时。
+    review_poll_first_seconds: float = 0.5
+    #: 后续轮询的间隔上限（秒）：从 first 起每次翻倍，封顶到这个值。
     review_poll_interval_seconds: float = 2.5
     request_retry_limit: int = 7
-    request_pace_seconds: float = 1.2
+    #: 405 挑战（阿里 WAF 阻断页）单独的重试上限。线上实测每个请求独立抽签、约一半
+    #: 被拦；上限 7 时"连续被拦"概率 ≈0.8%（每轮约 5 家门店 UNKNOWN），提到 12 降到
+    #: ≈0.02%。与 request_retry_limit 分开，避免 403/5xx 也一起放大。
+    waf_retry_limit: int = 12
+    #: 405 挑战的重试间隔（秒）：实测"立即重试"与退避成功率相同（7/8 vs 7/8），
+    #: 但每次成功墙钟 0.43s vs 1.00s —— 退避只加时延，所以挑战重试几乎不等待。
+    waf_retry_delay_seconds: float = 0.2
+    #: 上游重试（405 挑战 / 5xx / 403 / 429 / 传输错误）的退避基数：base * 2^(n-1)，封顶 max。
+    request_retry_base_seconds: float = 1.5
+    request_retry_max_seconds: float = 8.0
     structure_ttl_days: int = 7
 
     worker_lease_seconds: int = 120
     #: 绑定后预加载（门店目录）任务的租约时长（秒）。
     bootstrap_lease_seconds: int = 120
+    #: 单个作业内的门店并发数：1 = 顺序执行（默认）；>1 时单轮耗时近似成比例下降，
+    #: 代价是瞬时上游请求数与配额消耗速度上升（风控由账号级冷却兜底）。
+    store_concurrency: int = 1
 
     #: 推送消息里的"查看"链接前缀（前端地址）。
     public_base_url: str = "http://127.0.0.1:15173"
@@ -58,12 +73,40 @@ class Settings(BaseSettings):
     catalog_ttl_seconds: int = 86400
     worker_heartbeat_seconds: int = 20
     worker_poll_seconds: float = 3.0
+    #: 同一任务失败门店自动补跑的总轮数上限（原作业算第 0 轮）。
     job_max_attempts: int = 3
-    scheduler_interval_seconds: int = 30
+    #: 补跑作业与冷却窗口的取较晚者：正常情况下的最小等待秒数。
+    job_retry_delay_seconds: int = 60
+    #: 派发粒度：越小越及时，代价是每分钟多一次轻查询（默认 10s）。
+    scheduler_interval_seconds: int = 10
     default_cadence_seconds: int = 1800
+    #: 派发成功后给下一轮时间加的随机右移上限（秒）；实际抖动 ≤ 间隔的 10%。
+    #: 多个任务同一间隔时避免同秒齐发、把小时额度瞬间打满。
+    dispatch_jitter_seconds: float = 10.0
+    #: 每个 (门店, 货号, 尺码) 保留的历史观测条数：间隔小、量大，历史只用于回溯。
+    observation_history_limit: int = 30
     daily_review_budget: int = 60000
     quota_hourly_cap: int = 900
     quota_hourly_slow_line: int = 600
+    #: 被上游风控（403/429）命中后的冷却阶梯（秒，逗号分隔），连续命中逐级延长。
+    throttle_backoff_seconds: str = "300,900,1800,3600"
+    #: 同类冷却通知的最小间隔（秒）；默认 8 小时 => 每 24 小时最多 3 条。
+    throttle_notice_interval_seconds: int = 28800
+    #: 405 挑战风暴熔断：一轮里这么多家门店被 WAF 挑战打满重试就整轮结束并进入冷却
+    #: （0 = 关闭；需求 D-NFR-RATE-06 的 15% 阈值在 160 店规模上约合 3 家门店）。
+    waf_storm_store_limit: int = 0
+    # ---- 出口池与指纹轮换（见 docs/cadence-throttle.md「容量」）----
+    #: 上游出口代理列表（JSON 数组，如 ["http://1.2.3.4:8080"]）；空=直连。
+    proxy_urls: list[str] = []
+    #: 代理列表文件（每行一个 URL，# 注释）；约 60s 重载一次，换池不必重启。
+    proxy_urls_file: str = ""
+    #: True = 钉住同一个出口（稳定住宅出口：一账号一 IP，不轮换）；
+    #: False = 老的"一请求一出口"轮转（多出口分散并发用）。
+    proxy_sticky: bool = False
+    #: 传输层失败后该出口冷却秒数（405 挑战是常态，不算失败、不冷却）。
+    proxy_cooldown_seconds: float = 120.0
+    #: 每请求轮换 UA/客户端提示；实测单请求通过率与特征无关，此项服务于并发规模。
+    fingerprint_rotation: bool = True
     baseline_max_gap_seconds: int = 7 * 24 * 3600
     credential_refresh_cooldown_seconds: int = 60
 

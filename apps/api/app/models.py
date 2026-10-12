@@ -375,6 +375,9 @@ class MonitorTask(Base):
     name: Mapped[str] = mapped_column(String(160))
     store_codes: Mapped[list] = mapped_column(JSONB, default=list)
     style_codes: Mapped[list] = mapped_column(JSONB, default=list)
+    #: 任务级尺码选择；空列表 = 全部尺码（与 store_codes 空=全部门店同构）。
+    #: 保留大小写（尺码形如 "42.5"/"XL"），不能复用 store/style 的 uppercase 规范化。
+    size_labels: Mapped[list] = mapped_column(JSONB, default=list)
     all_stores: Mapped[bool] = mapped_column(Boolean, default=False)
     cadence_seconds: Mapped[int] = mapped_column(Integer, default=1800)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -403,11 +406,17 @@ class ScanJob(Base):
     status: Mapped[str] = mapped_column(String(16), default=JobStatus.QUEUED.value)
     store_codes: Mapped[list] = mapped_column(JSONB, default=list)
     style_codes: Mapped[list] = mapped_column(JSONB, default=list)
+    #: 入队时从任务冻结的尺码选择；空列表 = 全部尺码。
+    size_labels: Mapped[list] = mapped_column(JSONB, default=list)
     total_stores: Mapped[int] = mapped_column(Integer, default=0)
     done_stores: Mapped[int] = mapped_column(Integer, default=0)
     failed_stores: Mapped[int] = mapped_column(Integer, default=0)
     unknown_stores: Mapped[int] = mapped_column(Integer, default=0)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
+    #: 失败门店自动补跑的轮次：原作业为 0，每次补跑 +1（上限 job_max_attempts）。
+    retry_round: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    #: 最早可被租约的时间（冷却窗口内的补跑作业不会被提前领走）。
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     leased_by: Mapped[str | None] = mapped_column(String(96))
@@ -515,6 +524,11 @@ class Credential(Base):
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str] = mapped_column(String(300), default="")
     last_error_code: Mapped[str | None] = mapped_column(String(48))
+    #: 账号级冷却：额度/风控受限时暂停派发，到点自动恢复（见 services/throttle.py）。
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cooldown_level: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    cooldown_reason: Mapped[str | None] = mapped_column(String(32))
+    cooldown_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     phone_masked: Mapped[str | None] = mapped_column(String(32))
     phone_hash: Mapped[str | None] = mapped_column(String(64))
     updated_at: Mapped[datetime] = mapped_column(

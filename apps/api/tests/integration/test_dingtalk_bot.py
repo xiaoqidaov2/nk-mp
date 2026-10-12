@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from datetime import UTC, datetime, timedelta, timezone
+
+from sqlalchemy import select, update
 
 from app.config import Settings
 from app.db import SessionLocal
-from app.models import DingTalkBotLink, DingTalkRobot, MonitorTask, NotificationChannel
+from app.models import Credential, DingTalkBotLink, DingTalkRobot, MonitorTask, NotificationChannel
 from app.services import dingtalk_bot, push
 
-from .helpers import auth_headers, login, make_store, make_style, make_tenant, make_user
+from .helpers import (
+    auth_headers,
+    login,
+    make_store,
+    make_style,
+    make_tenant,
+    make_user,
+    store_credential,
+)
 
 
 def _settings() -> Settings:
@@ -180,3 +190,58 @@ def test_robot_api_validates_saves_and_rebuilds_channels(client, monkeypatch) ->
         "configured": False,
         "robot_code": "",
     }
+
+
+def test_cadence_command_accepts_seconds_and_rejects_below_the_floor() -> None:
+    """频率指令：30 秒起（含秒/分/小时单位），更快的写法被拒且不改任务。"""
+    settings = _settings()
+    user_id, _email = _seed_user()
+    assert "绑定成功" in (
+        dingtalk_bot.handle_message(settings, user_id, _message("cid-cadence", "任务")) or ""
+    )
+
+    fast = dingtalk_bot.handle_message(
+        settings, user_id, _message("cid-cadence", "频率 30秒 到 钉钉任务")
+    )
+    assert fast is not None and "每 30 秒检查一次" in fast
+    with SessionLocal() as db:
+        assert db.execute(select(MonitorTask)).scalar_one().cadence_seconds == 30
+
+    too_fast = dingtalk_bot.handle_message(
+        settings, user_id, _message("cid-cadence", "频率 20秒 到 钉钉任务")
+    )
+    assert too_fast is not None and "30 秒到 24 小时" in too_fast
+    with SessionLocal() as db:
+        assert db.execute(select(MonitorTask)).scalar_one().cadence_seconds == 30
+
+    minutes = dingtalk_bot.handle_message(
+        settings, user_id, _message("cid-cadence", "频率 5分钟 到 钉钉任务")
+    )
+    assert minutes is not None and "每 5 分钟检查一次" in minutes
+    hours = dingtalk_bot.handle_message(
+        settings, user_id, _message("cid-cadence", "频率 2h 到 钉钉任务")
+    )
+    assert hours is not None and "每 2 小时检查一次" in hours
+
+    listed = dingtalk_bot.handle_message(settings, user_id, _message("cid-cadence", "任务"))
+    assert listed is not None and "每 2 小时" in listed
+
+
+def test_task_reply_marks_the_cooldown_window() -> None:
+    """冷却中的任务在机器人列表里标出自动继续时刻。"""
+    settings = _settings()
+    user_id, _email = _seed_user()
+    store_credential(settings, user_id)
+    until = datetime.now(UTC) + timedelta(minutes=25)
+    with SessionLocal() as db:
+        db.execute(
+            update(Credential)
+            .where(Credential.owner_user_id == user_id)
+            .values(cooldown_until=until, cooldown_reason="throttled")
+        )
+        db.commit()
+    # 首条消息完成绑定，第二条才是任务列表。
+    dingtalk_bot.handle_message(settings, user_id, _message("cid-cool", "任务"))
+    reply = dingtalk_bot.handle_message(settings, user_id, _message("cid-cool", "任务"))
+    expected = until.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M")
+    assert reply is not None and f"冷却至 {expected}" in reply

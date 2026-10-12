@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -17,7 +17,16 @@ from app.api.deps import get_current_session, get_db, require_write, settings_de
 from app.api.http_errors import binding_changed_response, credential_error_response
 from app.config import Settings
 from app.db import SessionLocal
-from app.models import AuthSession, JobStatus, MonitorTask, ScanJob, ScanJobStore, Store, User
+from app.models import (
+    AuthSession,
+    JobStatus,
+    MonitorTask,
+    ScanJob,
+    ScanJobStore,
+    Store,
+    StoreJobStatus,
+    User,
+)
 from app.schemas import ScanCreateIn, ScanJobOut, ScanStoreOut
 from app.services.credentials import CredentialError, CredentialService
 from app.services.jobs import enqueue_job, requeue_failed_stores
@@ -35,10 +44,31 @@ TERMINAL = {
 }
 
 
+def _live_store_counts(db: Session, job: ScanJob) -> tuple[int, int]:
+    """跑着的作业按门店行实时统计进度。
+
+    ``job.done_stores`` 只在收尾（``_finalize``）时写，所以进行中的作业在界面上一直显示
+    ``0/N``，客户会以为卡住了。这里读侧兜底：QUEUED/RUNNING 时按 ``scan_job_store`` 的
+    状态现算（已收尾的作业仍以 job 上的计数为准，保持语义一致）。
+    """
+    if job.status not in (JobStatus.QUEUED.value, JobStatus.RUNNING.value):
+        return job.done_stores, job.unknown_stores
+    rows = db.execute(
+        select(ScanJobStore.status, func.count())
+        .where(ScanJobStore.job_id == job.id)
+        .group_by(ScanJobStore.status)
+    ).all()
+    counts = dict(rows)
+    done = counts.get(StoreJobStatus.SUCCEEDED.value, 0) + counts.get(StoreJobStatus.FAILED.value, 0)
+    unknown = counts.get(StoreJobStatus.UNKNOWN.value, 0)
+    return done, unknown
+
+
 def _job_out(db: Session, job: ScanJob) -> ScanJobOut:
     progress = 0.0
     if job.total_stores:
-        progress = round((job.done_stores + job.failed_stores + job.unknown_stores) / job.total_stores, 3)
+        done_live, unknown_live = _live_store_counts(db, job)
+        progress = round((done_live + unknown_live) / job.total_stores, 3)
     return ScanJobOut(
         id=job.id,
         task_id=job.task_id,
@@ -47,9 +77,9 @@ def _job_out(db: Session, job: ScanJob) -> ScanJobOut:
         store_codes=list(job.store_codes or []),
         style_codes=list(job.style_codes or []),
         total_stores=job.total_stores,
-        done_stores=job.done_stores,
+        done_stores=done_live,
         failed_stores=job.failed_stores,
-        unknown_stores=job.unknown_stores,
+        unknown_stores=unknown_live,
         attempt=job.attempt,
         error_summary=job.error_summary or "",
         started_at=job.started_at,
@@ -88,6 +118,8 @@ def create_scan(
     style_codes = payload.style_codes
     store_codes = payload.store_codes
     task_id = payload.task_id
+    #: 临时作业（无 task_id）默认全部尺码；从任务建作业时冻结任务的尺码选择。
+    size_labels: list[str] = []
 
     if task_id is not None:
         task = db.execute(
@@ -101,6 +133,7 @@ def create_scan(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
         style_codes = style_codes or list(task.style_codes or [])
         store_codes = store_codes or list(task.store_codes or [])
+        size_labels = list(task.size_labels or [])
 
     if payload.all_stores or not store_codes:
         store_codes = list(
@@ -129,6 +162,7 @@ def create_scan(
         tenant_id=user.tenant_id,
         store_codes=resolved,
         style_codes=[code.upper() for code in style_codes],
+        size_labels=size_labels,
         task_id=task_id,
         requested_by=user.id,
         kind="SCAN",

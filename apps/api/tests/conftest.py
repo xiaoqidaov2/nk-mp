@@ -51,5 +51,4 @@ def settings() -> Settings:
         review_poll_tries=2,
         review_poll_interval_seconds=0.0,
         request_retry_limit=2,
-        request_pace_seconds=0.0,
     )

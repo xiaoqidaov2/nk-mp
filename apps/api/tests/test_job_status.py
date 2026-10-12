@@ -30,6 +30,12 @@ class _FakeSession:
     def flush(self) -> None:
         self.flushes += 1
 
+    def expire_all(self) -> None:
+        """并发收尾前会丢弃 identity map 缓存；测试替身无需做任何事。"""
+
+    def commit(self) -> None:
+        """`_finalize` 本身不提交；调用方负责，替身记录即可。"""
+
 
 class _Row:
     def __init__(self, status: str) -> None:

@@ -124,6 +124,8 @@ def probe_store(
     store: Store,
     style_codes: list[str],
     job_id=None,
+    *,
+    size_labels: list[str] | None = None,
 ) -> ProbeResult:
     now = datetime.now(UTC)
     observations: list[Observation] = []
@@ -138,9 +140,19 @@ def probe_store(
             )
         ).scalar_one_or_none()
         if style is None:
-            style = Style(style_code=style_code, owner_user_id=store.owner_user_id)
-            session.add(style)
-            session.flush()
+            # 同一轮里多个门店会并发探测同一个货号：让输掉插入的线程改读已存在行，
+            # 而不是抛 IntegrityError。
+            session.execute(
+                pg_insert(Style)
+                .values(owner_user_id=store.owner_user_id, style_code=style_code)
+                .on_conflict_do_nothing(index_elements=["owner_user_id", "style_code"])
+            )
+            style = session.execute(
+                select(Style).where(
+                    Style.owner_user_id == store.owner_user_id,
+                    Style.style_code == style_code,
+                )
+            ).scalar_one()
         styles[style_code] = style
         structure, changed = get_or_fetch_structure(session, client, settings, store, style)
         structures[style_code] = structure
@@ -170,10 +182,26 @@ def probe_store(
             trusted=False,
         )
 
+    # 任务级尺码选择：空列表 = 全部尺码，行为与不传完全一致。
+    if size_labels:
+        wanted = set(size_labels)
+        plan = [item for item in plan if item[2] in wanted]
+        if not plan:
+            # 所选尺码在这家店不存在：这不是门店失败，返回可信的空结果，
+            # 不写 UNKNOWN 门店状态（否则会被失败门店逻辑误判）。
+            return ProbeResult(
+                store_code=store.store_code,
+                observations=[],
+                message="所选尺码在这家店不存在",
+                structure_changes=changed_structures,
+            )
+
     # Every real upstream transaction (PUT, poll GET, retry) consumes quota at
     # the moment the request is issued; exhausting the budget aborts the probe
     # with an UNKNOWN result instead of a guessed one.
-    client.transaction_listener = lambda kind: quota.consume_transaction(session, kind)
+    client.transaction_listener = lambda kind, charge: quota.consume_transaction(
+        session, kind, charge=charge
+    )
 
     availability: dict[str, str] = {}
     prices: dict[str, PriceInfo] = {}
@@ -211,8 +239,11 @@ def probe_store(
                 prices[gtin] = item.price
 
     in_stock = [gtin for gtin, status in availability.items() if status == "IN_STOCK"]
-    for start in range(0, len(in_stock), settings.price_chunk_size):
-        group = in_stock[start : start + settings.price_chunk_size]
+    # 小批量的可用性响应本身就可能带价格：只为「还缺价」的在货尺码再发价格请求，
+    # 避免同一价格查询两次（每次都是一次 PUT + 轮询，直接决定单店耗时）。
+    missing_price = [gtin for gtin in in_stock if gtin not in prices]
+    for start in range(0, len(missing_price), settings.price_chunk_size):
+        group = missing_price[start : start + settings.price_chunk_size]
         try:
             price_batch = client.review(group, region_id=store.region_id, with_price=True)
         except ScanError as exc:

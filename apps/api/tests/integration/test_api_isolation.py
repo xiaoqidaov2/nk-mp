@@ -17,6 +17,7 @@ from app.services.jobs import enqueue_job
 from .helpers import (
     auth_headers,
     login,
+    login_session,
     make_store,
     make_style,
     make_tenant,
@@ -569,3 +570,20 @@ def test_channel_delete_after_concurrent_delete_is_idempotent(client, monkeypatc
     )
     # 行已被并发删掉时本次 DELETE 只是少删一行（ORM 仅告警）：幂等成功。
     assert response.status_code == 204, response.text
+
+
+def test_store_list_defaults_to_clearance_and_can_show_all(client) -> None:
+    """门店目录默认只给换季优惠店；?scope=all 才返回全部门店。"""
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email=f"clearance-list-{uuid.uuid4().hex[:8]}@example.com")
+        make_store(db, owner=user, code="S1", name="NIKE台州兴华换季优惠店")
+        make_store(db, owner=user, code="S2", name="NIKE上海001")
+        db.commit()
+        email = user.email
+    login_session(client, email)
+
+    default_codes = [row["store_code"] for row in client.get("/api/v1/stores").json()]
+    assert default_codes == ["S1"]
+    all_codes = [row["store_code"] for row in client.get("/api/v1/stores?scope=all").json()]
+    assert all_codes == ["S1", "S2"]

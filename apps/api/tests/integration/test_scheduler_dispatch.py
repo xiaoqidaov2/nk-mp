@@ -307,3 +307,211 @@ def test_permanent_rejection_queues_a_reauth_notice(monkeypatch) -> None:
     assert CredentialService(settings, user_id).try_refresh(force=True) is False
     with SessionLocal() as db:
         assert len(db.execute(select(NotificationDelivery)).scalars().all()) == 1
+
+
+def test_cooling_account_is_not_dispatched_until_the_window_ends() -> None:
+    """额度/风控冷却中的账号：不派发，只把 next_run_at 推到窗口结束。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="cooling@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        make_style(db, owner=user, code="DN3707-202")
+        task = _make_task(db, tenant.id, created_by=user.id)
+        db.commit()
+        task_id, user_id = task.id, user.id
+    store_credential(settings, user_id)
+
+    until = datetime.now(UTC) + timedelta(minutes=20)
+    with SessionLocal() as db:
+        db.execute(
+            update(Credential)
+            .where(Credential.owner_user_id == user_id)
+            .values(cooldown_until=until, cooldown_reason="throttled", cooldown_level=1)
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 0
+        db.commit()
+
+    with SessionLocal() as db:
+        assert db.execute(select(ScanJob)).scalars().all() == []
+        task = db.get(MonitorTask, task_id)
+        assert task.next_run_at is not None
+        assert abs((task.next_run_at - until).total_seconds()) <= 1
+        # 冷却到期后恢复派发（把任务重新置为到期，模拟窗口结束后的下一次 tick）。
+        db.execute(
+            update(Credential)
+            .where(Credential.owner_user_id == user_id)
+            .values(cooldown_until=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        task.next_run_at = datetime.now(UTC)
+        db.commit()
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+    with SessionLocal() as db:
+        job = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalar_one()
+        assert job.status == JobStatus.QUEUED.value
+
+
+def test_30_second_cadence_does_not_stack_rounds() -> None:
+    """30 秒档：上一轮作业未结束时只推进 next_run_at，不再叠加一轮。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="fast-cadence@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        make_style(db, owner=user, code="DN3707-202")
+        task = _make_task(db, tenant.id, created_by=user.id)
+        task.cadence_seconds = 30
+        task.next_run_at = datetime.now(UTC)
+        db.commit()
+        task_id, user_id = task.id, user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+
+    # 手动把任务置为"又到期"：本轮作业仍在排队，不允许叠加。
+    with SessionLocal() as db:
+        task = db.get(MonitorTask, task_id)
+        task.next_run_at = datetime.now(UTC)
+        db.commit()
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 0
+        db.commit()
+
+    with SessionLocal() as db:
+        jobs = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalars().all()
+        assert len(jobs) == 1
+        task = db.get(MonitorTask, task_id)
+        assert task.next_run_at > datetime.now(UTC) + timedelta(seconds=20)
+
+
+def test_a_store_added_later_is_monitored_from_the_next_round() -> None:
+    """「全部门店」任务的名单在派发时解析：新同步进来的门店下一轮即被覆盖。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="newstore@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        make_style(db, owner=user, code="DN3707-202")
+        task = _make_task(db, tenant.id, created_by=user.id)
+        db.commit()
+        task_id, user_id = task.id, user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+    with SessionLocal() as db:
+        first = db.execute(
+            select(ScanJob).where(ScanJob.task_id == task_id).order_by(ScanJob.created_at)
+        ).scalars().first()
+        assert sorted(first.store_codes) == ["S1"]
+        first.status = JobStatus.SUCCEEDED.value
+        db.commit()
+
+    # 用户后来同步了门店目录：新店是活跃状态。
+    with SessionLocal() as db:
+        make_store(db, owner=user, code="S9", region_id="R9")
+        task = db.get(MonitorTask, task_id)
+        task.next_run_at = datetime.now(UTC)
+        db.commit()
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+    with SessionLocal() as db:
+        jobs = (
+            db.execute(
+                select(ScanJob).where(ScanJob.task_id == task_id).order_by(ScanJob.created_at)
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(jobs[-1].store_codes) == ["S1", "S9"]
+
+
+def test_a_task_with_an_explicit_store_list_ignores_new_stores() -> None:
+    """指定门店的任务只在选中的门店里跑：新店不会被动加入。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="fixedlist@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        make_style(db, owner=user, code="DN3707-202")
+        task = _make_task(db, tenant.id, created_by=user.id, name="固定门店")
+        task.all_stores = False
+        task.store_codes = ["S1"]
+        db.commit()
+        task_id, user_id = task.id, user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        make_store(db, owner=user, code="S9", region_id="R9")
+        db.commit()
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+    with SessionLocal() as db:
+        job = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalar_one()
+        assert sorted(job.store_codes) == ["S1"]
+
+
+def test_dispatch_jitter_spreads_the_next_round() -> None:
+    """下一轮不精确落在「现在 + 间隔」：右移不超过 min(配置, 间隔的 10%)。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="jitter@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        make_style(db, owner=user, code="DN3707-202")
+        task = _make_task(db, tenant.id, created_by=user.id, name="抖动任务")
+        task.cadence_seconds = 300
+        db.commit()
+        task_id, user_id = task.id, user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+    with SessionLocal() as db:
+        task = db.get(MonitorTask, task_id)
+        delay = (task.next_run_at - datetime.now(UTC)).total_seconds()
+    ceiling = min(settings.dispatch_jitter_seconds, 300 * 0.1)
+    assert 300 <= delay <= 300 + ceiling + 2
+
+
+def test_thirty_second_cadence_keeps_its_jitter_small() -> None:
+    """30 秒档的抖动上限是 3 秒（间隔的 10%）：几乎就是"连续轮次"。"""
+    from app.services.scheduler import _next_run_at
+
+    now = datetime.now(UTC)
+    delay = (_next_run_at(30, 60.0) - now).total_seconds()
+    assert 30 <= delay <= 33.0 + 0.5
+
+
+def test_all_store_task_only_covers_clearance_stores() -> None:
+    """客户要求：默认只盯换季优惠店——「全部门店」解析时也要按这个默认过滤。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="clearance@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1", name="NIKE杭州江南换季优惠店")
+        make_store(db, owner=user, code="S2", region_id="R2", name="NIKE上海001")  # 非换季优惠
+        make_style(db, owner=user, code="DN3707-202")
+        task = _make_task(db, tenant.id, created_by=user.id, name="只看换季优惠")
+        db.commit()
+        task_id, user_id = task.id, user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+    with SessionLocal() as db:
+        job = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalar_one()
+        assert job.store_codes == ["S1"]

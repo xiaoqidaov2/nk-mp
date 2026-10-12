@@ -16,6 +16,21 @@ from sqlalchemy.orm import Session
 from app.models import Store, StoreRegionAlias
 from app.nike.types import StoreRecord
 
+#: 「换季优惠店」的判据。上游 `concept` 区分不出来（换季优惠店与普通店同为 `NVS`），
+#: 唯一可靠信号是门店名带「换季优惠」（2026-10-09 生产库：160 家中 147 家命中，13 家为
+#: 体验店/员工店/Jordan/SKIMS 等）。默认只监控与展示这一类门店——判据集中在这里，
+#: 将来上游改名/加字段只需改这一处。
+CLEARANCE_MARKER = "换季优惠"
+
+
+def is_clearance_name(name: str | None) -> bool:
+    return CLEARANCE_MARKER in (name or "")
+
+
+def clearance_filter():
+    """SQLAlchemy 条件：只要换季优惠店。"""
+    return Store.display_name.like(f"%{CLEARANCE_MARKER}%")
+
 
 def sync_stores(
     session: Session,

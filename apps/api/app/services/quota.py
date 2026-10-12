@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TypeVar
 
 from sqlalchemy import select
@@ -25,6 +25,9 @@ logger = logging.getLogger("nike_mp.quota")
 AVAILABILITY_KIND = "availability"
 PRICE_KIND = "price"
 
+#: 额度窗口重开后的调度余量（秒）：不在窗口边界上抢跑，也给"自动继续"留出落库时间。
+RESUME_MARGIN_SECONDS = 30
+
 _M = TypeVar("_M")
 
 
@@ -36,6 +39,22 @@ def _today() -> datetime:
 def _hour() -> datetime:
     now = datetime.now(UTC)
     return datetime(now.year, now.month, now.day, now.hour, tzinfo=UTC)
+
+
+def resume_at_for(rejection: str, now: datetime | None = None) -> datetime | None:
+    """When the capacity behind a rejection reopens (next hour/day + margin).
+
+    Returns ``None`` for reasons that have no wall-clock window (nothing to
+    wait for); budget rejections always map to the next window boundary.
+    """
+    moment = now or datetime.now(UTC)
+    if rejection == "platform_hourly_budget":
+        hour = datetime(moment.year, moment.month, moment.day, moment.hour, tzinfo=UTC)
+        return hour + timedelta(hours=1, seconds=RESUME_MARGIN_SECONDS)
+    if rejection in ("platform_daily_budget", "tenant_budget"):
+        day = datetime(moment.year, moment.month, moment.day, tzinfo=UTC)
+        return day + timedelta(days=1, seconds=RESUME_MARGIN_SECONDS)
+    return None
 
 
 @dataclass(frozen=True)
@@ -73,6 +92,15 @@ class QuotaGuard:
         self.tenant_budget = tenant_budget
         self.hourly_cap = hourly_cap
         self.hourly_slow_line = hourly_slow_line
+        #: 最近一次被哪个闸拒绝（tenant_budget / platform_daily_budget /
+        #: platform_hourly_budget）；job 用它决定冷却原因与恢复时刻。
+        self.last_rejection: str | None = None
+
+    def resume_at(self) -> datetime | None:
+        """When the rejected cap reopens; ``None`` without a rejected cap."""
+        if not self.last_rejection:
+            return None
+        return resume_at_for(self.last_rejection)
 
     # ------------------------------------------------------------- internals
 
@@ -124,8 +152,15 @@ class QuotaGuard:
 
     # ---------------------------------------------------------------- public
 
-    def consume_transaction(self, session: Session, kind: str = AVAILABILITY_KIND) -> bool:
-        """Reserve one upstream transaction; returns False when any cap is hit.
+    def consume_transaction(
+        self, session: Session, kind: str = AVAILABILITY_KIND, charge: bool = True
+    ) -> bool:
+        """Check the caps (and, unless ``charge`` is false, book one transaction).
+
+        Returns False when any cap is hit — the caller must not issue the
+        request. ``charge=False`` is the pre-flight check: it never counts, so
+        a request that cannot afford the budget is not even sent; the caller
+        books it later with ``charge=True`` once upstream answered.
 
         The counters are committed immediately: the row locks are released
         right away (so concurrent workers are not serialised for the duration
@@ -134,10 +169,14 @@ class QuotaGuard:
         snapshot, hour_row, day_row, tenant_row = self._snapshot(session)
         rejection = snapshot.rejection()
         if rejection:
+            self.last_rejection = rejection
             # Release the row locks promptly; no accounting change is kept.
             session.commit()
             logger.warning("quota rejected upstream request (%s)", rejection)
             return False
+        if not charge:
+            session.commit()
+            return True
         if kind == PRICE_KIND:
             tenant_row.price_requests = int(tenant_row.price_requests) + 1
         else:

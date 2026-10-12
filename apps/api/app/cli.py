@@ -256,7 +256,30 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_user.add_argument("--role", default=Role.TENANT_VIEWER.value)
     monitor_user.add_argument("--display-name", default="")
     monitor_user.set_defaults(func=cmd_add_monitor_user)
+
+    prune = sub.add_parser(
+        "prune-observations",
+        help="按保留策略清理观测历史（每个门店/货号/尺码只留最近 N 条）",
+    )
+    prune.add_argument("--keep", type=int, default=30, help="每个 key 保留条数（默认 30）")
+    prune.add_argument("--batch", type=int, default=1000, help="每片处理多少个 key")
+    prune.add_argument("--owner", default="", help="只清某个 owner 的 user id（默认全表）")
+    prune.set_defaults(func=cmd_prune_observations)
     return parser
+
+
+def cmd_prune_observations(args: argparse.Namespace) -> int:
+    from app.services.retention import prune_all
+
+    owner = None
+    if args.owner:
+        import uuid as _uuid
+
+        owner = _uuid.UUID(args.owner)
+    with _session() as db:
+        removed = prune_all(db, keep=args.keep, owner_user_id=owner, keys=args.batch)
+    print(f"pruned {removed} observation row(s) (keep={args.keep})")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

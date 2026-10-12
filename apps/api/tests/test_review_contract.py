@@ -9,6 +9,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.config import Settings
 from app.nike.client import NikeClient, NikeTransportError
 from app.nike.errors import ErrorCode, ScanError
 
@@ -31,11 +32,11 @@ class _Replay:
             raise item
         return item
 
-    def client(self, settings, **kwargs) -> NikeClient:
+    def client(self, settings, *, sleep=None, **kwargs) -> NikeClient:
         return NikeClient(
             settings,
             "token",
-            sleep=lambda _seconds: None,
+            sleep=sleep or (lambda _seconds: None),
             transport=httpx.MockTransport(self.handler),
             **kwargs,
         )
@@ -212,7 +213,7 @@ def test_transport_timeouts_raise_transport_error(settings) -> None:
 
 def test_quota_listener_blocks_request_before_it_is_sent(settings) -> None:
     replay = _Replay([_json(_ok_group(["g0"]))])
-    client = replay.client(settings, transaction_listener=lambda kind: False)
+    client = replay.client(settings, transaction_listener=lambda kind, charge: False)
     with pytest.raises(ScanError) as excinfo:
         client.review(["g0"], region_id="NIKE0S001")
     assert excinfo.value.code == ErrorCode.BUDGET_EXHAUSTED
@@ -222,8 +223,9 @@ def test_quota_listener_blocks_request_before_it_is_sent(settings) -> None:
 def test_quota_listener_counts_every_attempt(settings) -> None:
     kinds: list[str] = []
 
-    def listener(kind: str) -> bool:
-        kinds.append(kind)
+    def listener(kind: str, charge: bool) -> bool:
+        if charge:
+            kinds.append(kind)
         return True
 
     replay = _Replay(
@@ -300,3 +302,171 @@ def test_credential_guard_scan_error_passes_through(settings) -> None:
     assert excinfo.value.code == ErrorCode.AUTH_REQUIRED
     assert excinfo.value.message == "guard stopped the scan"
     assert replay.requests == []
+
+
+def test_rate_limited_responses_are_retried_then_become_throttled(settings) -> None:
+    """403/429：先退避重试，耗尽重试预算后按 THROTTLED 结束（账号级冷却的信号）。"""
+    replay = _Replay([_json({}, status=403), _json({}, status=403)])
+    client = replay.client(settings)
+    with pytest.raises(ScanError) as excinfo:
+        client.review(["g0"], region_id="NIKE0S001")
+    assert excinfo.value.code == ErrorCode.THROTTLED
+    assert len(replay.requests) == 2  # settings.request_retry_limit == 2
+
+
+def test_a_single_429_is_retried_transparently(settings) -> None:
+    replay = _Replay(
+        [_json({}, status=429), _json({}, status=200), _json(_ok_group(["g0"]))]
+    )
+    client = replay.client(settings)
+    batch = client.review(["g0"], region_id="NIKE0S001")
+    assert batch.trusted is True
+    assert [request.method for request in replay.requests] == ["PUT", "PUT", "GET"]
+
+
+def _timing_settings(**overrides) -> Settings:
+    values = {
+        "credential_key": "test-key-for-unit-tests",
+        "review_poll_tries": 5,
+        "review_poll_first_seconds": 0.5,
+        "review_poll_interval_seconds": 2.5,
+        "request_retry_limit": 5,
+        "waf_retry_limit": 12,
+        "request_retry_base_seconds": 1.5,
+        "request_retry_max_seconds": 8.0,
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def _recording_client(replay: _Replay, settings: Settings, waits: list[float]) -> NikeClient:
+    return replay.client(settings, sleep=waits.append)
+
+
+def test_review_poll_waits_start_short_then_stretch_to_the_cap() -> None:
+    """轮询节奏：首次 0.5s，未就绪才翻倍，封顶在 review_poll_interval_seconds。"""
+    settings = _timing_settings()
+    replay = _Replay(
+        [
+            _json({}, status=200),
+            _json({"response": {"fulfillmentGroups": []}}),
+            _json({"response": {"fulfillmentGroups": []}}),
+            _json(_ok_group(["g0"])),
+        ]
+    )
+    waits: list[float] = []
+    client = _recording_client(replay, settings, waits)
+    batch = client.review(["g0"], region_id="NIKE0S001")
+    assert batch.trusted is True
+    assert waits == [0.5, 1.0, 2.0]
+
+
+def test_review_poll_backoff_is_capped_by_the_interval() -> None:
+    settings = _timing_settings(review_poll_first_seconds=1.5, review_poll_interval_seconds=2.0)
+    replay = _Replay(
+        [
+            _json({}, status=200),
+            _json({"response": {"fulfillmentGroups": []}}),
+            _json({"response": {"fulfillmentGroups": []}}),
+            _json(_ok_group(["g0"])),
+        ]
+    )
+    waits: list[float] = []
+    client = _recording_client(replay, settings, waits)
+    client.review(["g0"], region_id="NIKE0S001")
+    assert waits == [1.5, 2.0, 2.0]
+
+
+def test_waf_challenge_has_its_own_retry_budget() -> None:
+    """405 挑战的重试预算独立于 request_retry_limit（避免 403/5xx 被一起放大）。"""
+    settings = _timing_settings(request_retry_limit=2, waf_retry_limit=12, waf_retry_delay_seconds=0.2)
+    responses = [httpx.Response(405, content=b"<html data-spm=challenge>") for _ in range(6)]
+    responses += [_json({}, status=200), _json(_ok_group(["g0"]))]
+    waits: list[float] = []
+    client = _recording_client(_Replay(responses), settings, waits)
+    assert client.review(["g0"], region_id="NIKE0S001").trusted is True
+    # 6 次 405 全部近即时重试成功（远超 request_retry_limit=2），随后是首次轮询等待。
+    assert waits[:6] == [0.2] * 6
+    assert waits[6] == 0.5
+
+
+def test_waf_challenge_exhausting_its_budget_raises_throttling_error() -> None:
+    settings = _timing_settings(waf_retry_limit=4, request_retry_limit=2, waf_retry_delay_seconds=0.2)
+    replay = _Replay([httpx.Response(405, content=b"<html data-spm=challenge>") for _ in range(4)])
+    waits: list[float] = []
+    client = _recording_client(replay, settings, waits)
+    with pytest.raises(ScanError) as excinfo:
+        client.review(["g0"], region_id="NIKE0S001")
+    assert excinfo.value.code == ErrorCode.WAF_CHALLENGE
+    assert waits == [0.2, 0.2, 0.2]
+
+
+def test_upstream_retry_backoff_doubles_and_caps() -> None:
+    """5xx 走指数退避 1.5 → 3 → 6 → 8（封顶）；405 挑战改为近即时重试（不退避）。"""
+    settings = _timing_settings()
+    replay = _Replay(
+        [
+            httpx.Response(405, content=b"<html data-spm=challenge>"),
+            httpx.Response(405, content=b"<html data-spm=challenge>"),
+            _json({}, status=200),
+            _json(_ok_group(["g0"])),
+        ]
+    )
+    waits: list[float] = []
+    client = _recording_client(replay, settings, waits)
+    assert client.review(["g0"], region_id="NIKE0S001").trusted is True
+    # 两次 405 近即时重试（0.2s），然后是一次 0.5s 的首次轮询等待。
+    assert waits == [0.2, 0.2, 0.5]
+
+    failing = _Replay([_json({}, status=500) for _ in range(5)])
+    retry_waits: list[float] = []
+    failing_client = _recording_client(failing, settings, retry_waits)
+    with pytest.raises(ScanError) as excinfo:
+        failing_client.review(["g0"], region_id="NIKE0S001")
+    assert excinfo.value.code == ErrorCode.UNEXPECTED_STATUS
+    assert retry_waits == [1.5, 3.0, 6.0, 8.0]
+
+
+def test_waf_challenge_retries_are_not_billed(settings) -> None:
+    """405 是上游自己的抽签：重试不计费，只有真正到达业务层的应答才计费。"""
+    charged: list[str] = []
+
+    def listener(kind: str, charge: bool) -> bool:
+        if charge:
+            charged.append(kind)
+        return True
+
+    replay = _Replay(
+        [
+            httpx.Response(405, content=b"<html data-spm=challenge>"),
+            httpx.Response(405, content=b"<html data-spm=challenge>"),
+            httpx.Response(405, content=b"<html data-spm=challenge>"),
+            _json({}, status=202),
+            _json(_ok_group(["g0"])),
+        ]
+    )
+    client = replay.client(settings, token_provider=None, transaction_listener=listener)
+    batch = client.review(["g0"], region_id="NIKE0S001")
+    assert batch.trusted is True
+    # 3 次挑战 + 1 次 202 轮询 + 1 次结果：挑战不计费，应答计 2 次。
+    assert charged == ["availability", "availability"]
+
+
+def test_waf_challenge_exhaustion_sends_no_billable_requests(settings) -> None:
+    """挑战打满预算时整轮失败，但一次费用都不能记。"""
+    charged: list[str] = []
+
+    def listener(kind: str, charge: bool) -> bool:
+        if charge:
+            charged.append(kind)
+        return True
+
+    settings = _timing_settings(waf_retry_limit=4, waf_retry_delay_seconds=0)
+    replay = _Replay(
+        [httpx.Response(405, content=b"<html data-spm=challenge>") for _ in range(4)]
+    )
+    client = replay.client(settings, transaction_listener=listener)
+    with pytest.raises(ScanError) as excinfo:
+        client.review(["g0"], region_id="NIKE0S001")
+    assert excinfo.value.code == ErrorCode.WAF_CHALLENGE
+    assert charged == []

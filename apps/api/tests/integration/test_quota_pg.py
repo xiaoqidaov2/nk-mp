@@ -123,7 +123,7 @@ def test_new_day_resets_the_tenant_bucket(tenants, monkeypatch) -> None:
 
 
 def test_client_counts_every_attempt_including_retries(tenants) -> None:
-    """A 401 retry costs two transactions; both must be metered."""
+    """到达业务层的应答（含 401 重试）每次都计费；只有 405 挑战不计。"""
     settings = get_settings()
     guard = QuotaGuard(tenants["b"], global_budget=100, tenant_budget=100, hourly_cap=100)
     responses = [
@@ -145,7 +145,7 @@ def test_client_counts_every_attempt_including_retries(tenants) -> None:
             token_provider=lambda rejected: "new-token",
             sleep=lambda _seconds: None,
             transport=httpx.MockTransport(handler),
-            transaction_listener=lambda kind: guard.consume_transaction(db, kind),
+            transaction_listener=lambda kind, charge: guard.consume_transaction(db, kind, charge=charge),
         )
         batch = client.review(["G1"], region_id="R1")
         client.close()

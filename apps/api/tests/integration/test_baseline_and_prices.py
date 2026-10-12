@@ -190,3 +190,17 @@ def test_structure_row_creation_survives_a_concurrent_insert(world) -> None:
     with SessionLocal() as db:
         rows = db.execute(select(GtinStructure)).scalars().all()
         assert len(rows) == 1
+
+
+def test_not_carried_to_in_stock_records_a_first_time_arrival(world) -> None:
+    """未铺货 → 有货（新上架）是真实到货：必须落事件，推送侧再按补货开关发出。"""
+    _persist(world, availability="NOT_CARRIED", checked_at=datetime.now(UTC) - timedelta(minutes=60))
+    summary = _persist(
+        world, availability="IN_STOCK", checked_at=datetime.now(UTC), price=899.0
+    )
+    assert summary.new_arrival == 1
+    with SessionLocal() as db:
+        event = db.execute(select(ChangeEvent)).scalar_one()
+        assert event.event_type == "NEW_ARRIVAL_AT_STORE"
+        assert event.before_status == "NOT_CARRIED"
+        assert event.after_status == "IN_STOCK"

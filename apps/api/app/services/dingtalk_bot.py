@@ -52,7 +52,7 @@ from app.models import (
     User,
 )
 from app.security import decrypt_secret, encrypt_secret, secret_fingerprint
-from app.services import nike_auth, push
+from app.services import nike_auth, push, throttle
 from app.services.credentials import CredentialError, CredentialService
 from app.services.jobs import enqueue_job, requeue_failed_stores
 
@@ -75,7 +75,7 @@ HELP_TEXT = (
     "· 加货号/删货号 <货号…> 到 <任务名>\n"
     "· 加门店/删门店 <门店…> 到 <任务名>\n"
     "· 盯 <门店…> 到 <任务名>：改成只盯这几家（盯 全部门店 到 <任务名> 反向操作）\n"
-    "· 频率 <时间> 到 <任务名>：如 频率 30分钟 到 我的任务\n"
+    "· 频率 <时间> 到 <任务名>：如 频率 30分钟 到 我的任务（最快 频率 30秒）\n"
     "· 通知 <任务名> [补货开/关 售罄开/关 变价开/关]：看/改提醒开关\n"
     "· 检查 [任务名]：马上检查一次\n"
     "· 暂停 <任务名> / 启用 <任务名> / 删除（取消监控）<任务名>\n"
@@ -263,15 +263,21 @@ def _tasks_reply(session: Session, owner_user_id) -> str:
     if not rows:
         return "你还没有监控任务。到网页的「监控任务 → 新建监控任务」建一个，我再帮你盯。"
     lines = [f"你的监控任务（{len(rows)} 个）："]
+    cooldown = throttle.current(session, owner_user_id)
     for task in rows:
         state = "启用" if task.is_active else "暂停"
         styles = len(task.style_codes or [])
         stores = "全部" if task.all_stores else len(task.store_codes or [])
-        minutes = max(1, int((task.cadence_seconds or 1800) / 60))
+        cadence = _format_cadence(task.cadence_seconds)
         nxt = ""
         if task.is_active and task.next_run_at is not None:
             nxt = f"，下次 {task.next_run_at.astimezone(_CST).strftime('%H:%M')}"
-        lines.append(f"· {task.name}（{state}，每 {minutes} 分钟{nxt}，货号 {styles}，门店 {stores}）")
+        cooling = ""
+        if cooldown is not None and task.is_active:
+            cooling = f"（冷却至 {cooldown.until.astimezone(_CST).strftime('%H:%M')}）"
+        lines.append(
+            f"· {task.name}（{state}，每 {cadence}{nxt}，货号 {styles}，门店 {stores}）{cooling}"
+        )
     return "\n".join(lines)
 
 
@@ -434,6 +440,7 @@ def _trigger_check(session: Session, settings: Settings, owner_user_id, name: st
             tenant_id=user.tenant_id,
             store_codes=store_codes,
             style_codes=style_codes,
+            size_labels=list(task.size_labels or []),
             task_id=task.id,
             requested_by=owner_user_id,
             kind="SCAN",
@@ -680,15 +687,30 @@ def _edit_codes(session: Session, owner_user_id, body: str, *, styles: bool, add
 
 
 def _parse_cadence(text: str) -> int | None:
-    match = re.fullmatch(r"(\d+)\s*(分钟?|分|小时|时|h|hour)?", text.strip().lower())
+    match = re.fullmatch(r"(\d+)\s*(秒|s|sec|分钟?|分|小时|时|h|hour)?", text.strip().lower())
     if match is None:
         return None
     amount = int(match.group(1))
     unit = match.group(2) or ""
-    seconds = amount * 3600 if unit in {"小时", "时", "h", "hour"} else amount * 60
-    if not (300 <= seconds <= 86400):
+    if unit in {"小时", "时", "h", "hour"}:
+        seconds = amount * 3600
+    elif unit in {"秒", "s", "sec"}:
+        seconds = amount
+    else:
+        seconds = amount * 60
+    if not (30 <= seconds <= 86400):
         return None
     return seconds
+
+
+def _format_cadence(seconds: int | None) -> str:
+    """频率的中文写法：30 秒 / N 分钟 / N 小时。"""
+    value = seconds or 1800
+    if value < 60:
+        return f"{value} 秒"
+    if value % 3600 == 0:
+        return f"{value // 3600} 小时"
+    return f"{max(1, value // 60)} 分钟"
 
 
 def _set_cadence(session: Session, owner_user_id, body: str) -> str:
@@ -698,14 +720,13 @@ def _set_cadence(session: Session, owner_user_id, body: str) -> str:
     time_text, task_name = parsed
     seconds = _parse_cadence(time_text)
     if seconds is None:
-        return "时间要在 5 分钟到 24 小时之间。比如：频率 30分钟 到 钉钉测试任务"
+        return "时间要在 30 秒到 24 小时之间。比如：频率 30分钟 到 钉钉测试任务"
     task, problem = _pick_task(session, owner_user_id, task_name)
     if problem:
         return problem
     task.cadence_seconds = seconds
     session.commit()
-    minutes = max(1, seconds // 60)
-    return f"「{task.name}」改成每 {minutes} 分钟检查一次。"
+    return f"「{task.name}」改成每 {_format_cadence(seconds)}检查一次。"
 
 
 def _delete_task(session: Session, owner_user_id, name: str) -> str:
@@ -977,11 +998,7 @@ def _failure_text(code: str | None, message: str | None) -> str:
     return (message or code or "未知原因")[:40]
 
 
-_AVAILABILITY_LABEL = {
-    "IN_STOCK": "有货",
-    "OUT_OF_STOCK": "无货",
-    "NOT_CARRIED": "未上架",
-}
+_AVAILABILITY_LABEL = push.AVAILABILITY_TEXT
 
 
 def _style_detail_reply(session: Session, owner_user_id, text: str) -> str:

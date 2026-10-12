@@ -14,17 +14,19 @@ from app.api.http_errors import credential_error_response, task_name_conflict_re
 from app.config import Settings
 from app.models import AuthSession, MonitorTask, Store, Style, User
 from app.schemas import TaskIn, TaskOut, TaskUpdate
+from app.services import throttle
 from app.services.credentials import CredentialError, CredentialService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
-def _to_out(task: MonitorTask) -> TaskOut:
+def _to_out(task: MonitorTask, cooldown: throttle.Cooldown | None = None) -> TaskOut:
     return TaskOut(
         id=task.id,
         name=task.name,
         store_codes=list(task.store_codes or []),
         style_codes=list(task.style_codes or []),
+        size_labels=list(task.size_labels or []),
         all_stores=bool(task.all_stores) or not (task.store_codes or []),
         cadence_seconds=task.cadence_seconds,
         is_active=task.is_active,
@@ -36,6 +38,8 @@ def _to_out(task: MonitorTask) -> TaskOut:
         created_at=task.created_at,
         store_count=len(task.store_codes or []),
         style_count=len(task.style_codes or []),
+        cooldown_until=cooldown.until if cooldown is not None else None,
+        cooldown_reason=cooldown.reason if cooldown is not None else None,
     )
 
 
@@ -67,7 +71,9 @@ def list_tasks(
         )
         .order_by(MonitorTask.created_at.desc())
     ).scalars().all()
-    return [_to_out(row) for row in rows]
+    # 冷却属于账号（不是单个任务）：一次查询复用给整个列表。
+    cooldown = throttle.active(db, [user.id]).get(user.id)
+    return [_to_out(row, cooldown) for row in rows]
 
 
 @router.post("", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
@@ -109,6 +115,7 @@ def create_task(
         name=payload.name.strip(),
         store_codes=store_codes,
         style_codes=payload.style_codes,
+        size_labels=list(payload.size_labels),
         all_stores=not store_codes,
         cadence_seconds=payload.cadence_seconds,
         is_active=payload.is_active,
@@ -127,7 +134,7 @@ def create_task(
         if "uq_monitor_task_owner_name" in detail or "monitor_task.created_by" in detail:
             return task_name_conflict_response()
         raise
-    return _to_out(task)
+    return _to_out(task, throttle.active(db, [user.id]).get(user.id))
 
 
 @router.get("/{task_id}", response_model=TaskOut)
@@ -136,7 +143,8 @@ def get_task(
     db: Session = Depends(get_db),
     payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> TaskOut:
-    return _to_out(_load(db, payload[0], task_id))
+    user = payload[0]
+    return _to_out(_load(db, user, task_id), throttle.active(db, [user.id]).get(user.id))
 
 
 @router.patch("/{task_id}", response_model=TaskOut)
@@ -161,6 +169,13 @@ def update_task(
     if payload.is_active is not None:
         task.is_active = payload.is_active
         task.next_run_at = datetime.now(UTC) if payload.is_active else None
+    if payload.store_codes is not None:
+        # 空列表表示"全部门店"：与创建语义一致，置空并打开 all_stores。
+        task.store_codes = list(payload.store_codes)
+        task.all_stores = not payload.store_codes
+    if payload.size_labels is not None:
+        # 空列表表示"全部尺码"，直接存空集即可（探针按非空集合过滤）。
+        task.size_labels = list(payload.size_labels)
     if payload.notify_on_restock is not None:
         task.notify_on_restock = payload.notify_on_restock
     if payload.notify_on_sold_out is not None:
@@ -178,7 +193,7 @@ def update_task(
     except StaleDataError as exc:
         db.rollback()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在") from exc
-    return _to_out(task)
+    return _to_out(task, throttle.active(db, [user.id]).get(user.id))
 
 
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)

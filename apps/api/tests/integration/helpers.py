@@ -55,7 +55,7 @@ def make_store(
     *,
     owner: User,
     code: str | None = None,
-    name: str = "测试门店",
+    name: str = "换季优惠测试店",
     region_id: str | None = None,
 ) -> Store:
     store = Store(

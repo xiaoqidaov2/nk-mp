@@ -153,6 +153,7 @@ DINGTALK_DM_SEND_URL = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSen
 
 _CATEGORIES = (
     (EventType.RESTOCK.value, "补货"),
+    (EventType.NEW_ARRIVAL_AT_STORE.value, "新上架"),
     (EventType.SOLD_OUT.value, "售罄"),
     (EventType.PRICE_CHANGE.value, "变价"),
 )
@@ -340,8 +341,30 @@ def _money(value) -> str:
     return f"¥{value:,.2f}"
 
 
+#: 变化后的当前状态（中文）。推送与机器人共用同一份映射，避免两处文案漂移。
+AVAILABILITY_TEXT = {
+    "IN_STOCK": "有货",
+    "OUT_OF_STOCK": "无货",
+    "NOT_CARRIED": "未上架",
+}
+
+#: 消息里门店名的截断长度；生产目录实测最长 31 字，32 覆盖真实数据、只挡病态长名。
+STORE_LABEL_LIMIT = 32
+
+
+def _store_label(store) -> str:
+    """渲染门店：``编码·名称``（与前端门店选择器一致），缺名只用编码。"""
+    if store is None:
+        return ""
+    code = (store.store_code or "").strip()
+    name = (store.display_name or "").strip()[:STORE_LABEL_LIMIT]
+    if name and code:
+        return f"{code}·{name}"
+    return name or code
+
+
 def _supplement(event: ChangeEvent) -> str:
-    if event.event_type == EventType.RESTOCK.value:
+    if event.event_type in (EventType.RESTOCK.value, EventType.NEW_ARRIVAL_AT_STORE.value):
         if event.after_total_price is None:
             return "待补价"
         return f"¥{event.after_total_price:,.2f}"
@@ -351,9 +374,16 @@ def _supplement(event: ChangeEvent) -> str:
 
 
 def _detail_line(event: ChangeEvent) -> str:
+    """一行说清：货号、尺码、门店、变化后的状态、价格。"""
     style_code = event.style.style_code if event.style is not None else ""
-    store_code = event.store.store_code if event.store is not None else ""
-    parts = ["·", style_code, event.size_label, store_code, _supplement(event)]
+    parts = [
+        "·",
+        style_code,
+        event.size_label,
+        _store_label(event.store),
+        AVAILABILITY_TEXT.get(event.after_status or "", ""),
+        _supplement(event),
+    ]
     return " ".join(part for part in parts if part)
 
 
@@ -362,7 +392,7 @@ def build_message(
 ) -> tuple[str, str] | None:
     """Aggregate one task's notified events into a single message.
 
-    Format is frozen: the category order is 补货/售罄/变价, each category shows
+    Format is frozen: the category order is 补货/新上架/售罄/变价, each category shows
     at most ``DETAIL_LIMIT`` lines, and when a category keeps back rows the
     footer counts them and links to the changes page. A body longer than
     ``BODY_LIMIT`` characters is truncated whole-line by whole-line from the
@@ -513,11 +543,22 @@ def send_now(
     return False, PUSH_DELIVERY_FAILED
 
 
-def _notified_types(task: MonitorTask) -> list[str]:
+def _notified_types(task: MonitorTask | None) -> list[str]:
+    """Return the change types a job's events should announce.
+
+    Task-less jobs (manual "立即检查" rounds, retries spawned after the task was
+    deleted) have no per-task switches to honour. Returning nothing for them
+    silently dropped every real change they detected, so they announce all
+    four categories instead.
+    """
+    if task is None:
+        return [event_type for event_type, _ in _CATEGORIES]
     return [
         event_type
         for event_type, enabled in (
             (EventType.RESTOCK.value, task.notify_on_restock),
+            # 「某店第一次有货」属于到货类：挂在补货开关下，否则这类变化永远推不出去。
+            (EventType.NEW_ARRIVAL_AT_STORE.value, task.notify_on_restock),
             (EventType.SOLD_OUT.value, task.notify_on_sold_out),
             (EventType.PRICE_CHANGE.value, task.notify_on_price_change),
         )
@@ -525,16 +566,37 @@ def _notified_types(task: MonitorTask) -> list[str]:
     ]
 
 
+#: 无任务作业（手动检查、任务删除后的补跑）没有任务名，用统一抬头。
+TASK_LESS_TITLE = "门店检查"
+
+
+def push_usage(session: Session, settings: Settings, owner_user_id) -> tuple[int, int]:
+    """Return ``(used_24h, cap)`` so the cap can be shown instead of silently dropping.
+
+    ``enqueue_for_job`` and ``enqueue_system_notification`` share the same
+    rolling 24 h window; when it is reached both queue nothing, so the caller
+    surfaces the number to the user rather than leaving a silent gap.
+    """
+    since = datetime.now(UTC) - timedelta(days=1)
+    used = session.execute(
+        select(func.count())
+        .select_from(NotificationDelivery)
+        .where(
+            NotificationDelivery.owner_user_id == owner_user_id,
+            NotificationDelivery.created_at >= since,
+        )
+    ).scalar_one()
+    return int(used), int(settings.push_max_per_day)
+
+
 def enqueue_for_job(session: Session, settings: Settings, job: ScanJob) -> int:
     """Queue one aggregated delivery per enabled channel for a finished job.
 
     Returns the number of rows created; the caller owns the transaction.
     """
-    if not settings.push_enabled or job.task_id is None or job.owner_user_id is None:
+    if not settings.push_enabled or job.owner_user_id is None:
         return 0
-    task = session.get(MonitorTask, job.task_id)
-    if task is None:
-        return 0
+    task = session.get(MonitorTask, job.task_id) if job.task_id is not None else None
     types = _notified_types(task)
     if not types:
         return 0
@@ -577,7 +639,11 @@ def enqueue_for_job(session: Session, settings: Settings, job: ScanJob) -> int:
             job.id,
         )
         return 0
-    message = build_message(task.name, list(events), base_url=settings.public_base_url)
+    message = build_message(
+        task.name if task is not None else TASK_LESS_TITLE,
+        list(events),
+        base_url=settings.public_base_url,
+    )
     if message is None:
         return 0
     title, body = message

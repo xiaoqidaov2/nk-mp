@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from app.config import Settings
-from app.models import ChangeEvent, Store, Style
+from app.models import ChangeEvent, MonitorTask, Store, Style
 from app.services import push
 
 
@@ -20,22 +20,32 @@ def _settings(**overrides) -> Settings:
     return Settings(**base)
 
 
+_AFTER_STATUS = {
+    "RESTOCK": "IN_STOCK",
+    "NEW_ARRIVAL_AT_STORE": "IN_STOCK",
+    "PRICE_CHANGE": "IN_STOCK",
+    "SOLD_OUT": "OUT_OF_STOCK",
+}
+
+
 def _event(
     event_type: str,
     *,
     size: str = "42",
     style_code: str = "DN3707-202",
     store_code: str = "QA001",
+    display_name: str = "",
     before=None,
     after=None,
 ) -> ChangeEvent:
     return ChangeEvent(
         event_type=event_type,
         size_label=size,
-        store=Store(store_code=store_code),
+        store=Store(store_code=store_code, display_name=display_name),
         style=Style(style_code=style_code),
         before_total_price=before,
         after_total_price=after,
+        after_status=_AFTER_STATUS.get(event_type),
     )
 
 
@@ -190,12 +200,12 @@ def test_build_message_aggregates_categories_in_order() -> None:
     assert title == "【库存提醒】QA 冒烟任务"
     assert body == (
         "补货 2 条\n"
-        "· DN3707-202 42 QA001 ¥699.00\n"
-        "· DN3707-202 44 QA001 待补价\n"
+        "· DN3707-202 42 QA001 有货 ¥699.00\n"
+        "· DN3707-202 44 QA001 有货 待补价\n"
         "售罄 1 条\n"
-        "· DN3707-202 40 QA001\n"
+        "· DN3707-202 40 QA001 无货\n"
         "变价 1 条\n"
-        "· DN3707-202 42 QA001 ¥699.00 → ¥599.00\n"
+        "· DN3707-202 42 QA001 有货 ¥699.00 → ¥599.00\n"
         "查看：http://127.0.0.1:15173/changes"
     )
 
@@ -349,3 +359,61 @@ def test_enterprise_robot_send_mints_a_token_and_posts_the_group_message(monkeyp
         False,
         push.PUSH_DELIVERY_FAILED,
     )
+
+
+def test_first_time_arrival_rides_the_restock_switch() -> None:
+    """未铺货→有货（新上架）必须被推送，否则这类变化会被静默丢掉。"""
+    on = MonitorTask(
+        name="到货任务", store_codes=[], style_codes=[], all_stores=True,
+        notify_on_restock=True, notify_on_sold_out=False, notify_on_price_change=False,
+    )
+    off = MonitorTask(
+        name="关闭任务", store_codes=[], style_codes=[], all_stores=True,
+        notify_on_restock=False, notify_on_sold_out=False, notify_on_price_change=False,
+    )
+    assert push._notified_types(on) == ["RESTOCK", "NEW_ARRIVAL_AT_STORE"]
+    assert push._notified_types(off) == []
+
+
+def test_message_keeps_arrival_rows_with_price() -> None:
+    arrival = _event("NEW_ARRIVAL_AT_STORE", before=None, after=899.0)
+    message = push.build_message("到货任务", [arrival], base_url="https://example.test")
+    assert message is not None
+    _title, body = message
+    assert "新上架 1 条" in body
+    assert "· DN3707-202 42 QA001 有货 ¥899.00" in body
+
+
+def test_message_orders_arrival_before_sold_out() -> None:
+    events = [
+        _event("SOLD_OUT", after=None),
+        _event("NEW_ARRIVAL_AT_STORE", before=None, after=899.0),
+        _event("RESTOCK", after=899.0),
+    ]
+    _title, body = push.build_message("排序任务", events, base_url="https://example.test") or ("", "")
+    assert body.index("补货") < body.index("新上架") < body.index("售罄")
+
+
+def test_task_less_jobs_announce_every_change_category() -> None:
+    """手动检查 / 任务已删的补跑没有任务开关可依：四类真实变化都必须通知。"""
+    assert push._notified_types(None) == [
+        "RESTOCK",
+        "NEW_ARRIVAL_AT_STORE",
+        "SOLD_OUT",
+        "PRICE_CHANGE",
+    ]
+
+
+def test_detail_line_carries_style_size_store_and_current_state() -> None:
+    """客户按这行定位：货号 + 尺码 + 门店（编码·名称）+ 当前状态 + 价格。"""
+    line = push._detail_line(
+        _event("RESTOCK", size="42", store_code="3402", display_name="NIKE北京朝阳园", after=699)
+    )
+    assert line == "· DN3707-202 42 3402·NIKE北京朝阳园 有货 ¥699.00"
+
+
+def test_detail_line_falls_back_to_the_store_code_and_keeps_long_names_bounded() -> None:
+    assert push._detail_line(_event("SOLD_OUT", store_code="3402")) == "· DN3707-202 42 3402 无货"
+    line = push._detail_line(_event("RESTOCK", store_code="3402", display_name="店" * 80, after=699))
+    assert "店" * push.STORE_LABEL_LIMIT in line
+    assert "店" * (push.STORE_LABEL_LIMIT + 1) not in line

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db
 from app.models import GtinStructure, Store, Style, User
 from app.schemas import StoreOut, StyleOut
+from app.services.stores import clearance_filter
 
 router = APIRouter(tags=["catalog"])
 
@@ -14,15 +15,21 @@ router = APIRouter(tags=["catalog"])
 @router.get("/stores", response_model=list[StoreOut])
 def list_stores(
     search: str = Query(default="", max_length=80),
+    scope: str = Query(default="clearance", pattern="^(clearance|all)$"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[StoreOut]:
-    # 目录是连接缓存：只返回本用户自己拉取到的门店。
+    """门店目录（连接缓存，只含本用户自己拉取到的门店）。
+
+    ``scope=clearance``（默认）只返回**换季优惠店**；``scope=all`` 返回全部。
+    """
     stmt = (
         select(Store)
         .where(Store.owner_user_id == user.id, Store.is_active.is_(True))
         .order_by(Store.store_code)
     )
+    if scope == "clearance":
+        stmt = stmt.where(clearance_filter())
     rows = db.execute(stmt).scalars().all()
     if search:
         needle = search.strip().lower()

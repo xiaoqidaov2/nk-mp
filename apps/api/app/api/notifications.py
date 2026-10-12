@@ -36,6 +36,7 @@ from app.schemas import (
     NotificationChannelOut,
     NotificationChannelPatch,
     NotificationDeliveryOut,
+    PushUsageOut,
 )
 from app.security import decrypt_secret, encrypt_secret, secret_fingerprint
 from app.services import dingtalk_bot, push
@@ -222,6 +223,18 @@ def test_notification_channel(
         channel.last_error_at = now
     db.commit()
     return {"ok": ok, "error": None if ok else push.DELIVERY_FAILED_TEXT}
+
+
+@router.get("/push-usage", response_model=PushUsageOut)
+def get_push_usage(
+    db: Session = Depends(get_db),
+    payload: tuple[User, AuthSession] = Depends(get_current_session),
+    settings: Settings = Depends(settings_dep),
+) -> PushUsageOut:
+    """今天已排的推送条数与上限：到顶时不再排新消息，页面据此给出提示。"""
+    user = payload[0]
+    used, cap = push.push_usage(db, settings, user.id)
+    return PushUsageOut(used=used, cap=cap, limited=used >= cap)
 
 
 @router.get("/notifications", response_model=list[NotificationDeliveryOut])

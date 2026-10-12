@@ -163,9 +163,6 @@ def test_enqueue_skips_disabled_channels_and_unnotified_jobs() -> None:
         )
         assert push.enqueue_for_job(db, settings, job) == 0
     with SessionLocal() as db:
-        _user, _task, job, _channel = _seed(db, name="手动检查", with_task=False)
-        assert push.enqueue_for_job(db, settings, job) == 0
-    with SessionLocal() as db:
         assert db.execute(select(NotificationDelivery)).scalars().all() == []
 
 
@@ -326,3 +323,85 @@ def test_a_pasted_dingtalk_webhook_address_is_accepted_by_the_api(client) -> Non
     assert body["platform"] == "dingtalk"
     # 提示是真实 token 的尾 4 位，而不是 Apprise URL 的 “down”。
     assert body["target_hint"] == "••••3456"
+
+
+def test_enqueue_includes_first_time_arrival() -> None:
+    """未铺货→有货（新上架）必须与补货一样进入推送，否则这类变化会被静默丢掉。"""
+    settings = _settings()
+    with SessionLocal() as db:
+        _user, _task, job, _channel = _seed(
+            db,
+            name="新上架任务",
+            notify_restock=True,
+            notify_sold_out=False,
+            notify_price_change=False,
+            event_types=("NEW_ARRIVAL_AT_STORE",),
+        )
+        assert push.enqueue_for_job(db, settings, job) == 1
+        db.commit()
+        job_id = job.id
+
+    with SessionLocal() as db:
+        row = db.execute(select(NotificationDelivery)).scalar_one()
+        assert row.job_id == job_id
+        assert row.state == NotificationDeliveryState.PENDING.value
+        assert "新上架" in row.body
+
+
+def test_enqueue_respects_the_restock_switch_for_arrivals() -> None:
+    settings = _settings()
+    with SessionLocal() as db:
+        _user, _task, job, _channel = _seed(
+            db,
+            name="关闭补货的任务",
+            notify_restock=False,
+            notify_sold_out=False,
+            notify_price_change=False,
+            event_types=("NEW_ARRIVAL_AT_STORE",),
+        )
+        assert push.enqueue_for_job(db, settings, job) == 0
+    with SessionLocal() as db:
+        assert db.execute(select(NotificationDelivery)).scalars().all() == []
+
+
+def test_push_usage_reports_the_cap() -> None:
+    settings = _settings(push_max_per_day=2)
+    with SessionLocal() as db:
+        user, _task, job, _channel = _seed(db)
+        push.enqueue_for_job(db, settings, job)
+        db.commit()
+        used, cap = push.push_usage(db, settings, user.id)
+    assert (used, cap) == (1, 2)
+
+
+def test_push_usage_endpoint_reports_the_cap(client) -> None:
+    """页面靠这个接口显示「今日已推送 N/上限」：到顶时不再静默丢消息。"""
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email=f"usage-{uuid4().hex[:8]}@example.com")
+        db.commit()
+        email = user.email
+    login_session(client, email)
+
+    response = client.get("/api/v1/me/push-usage")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"used": 0, "cap": 200, "limited": False}
+
+
+def test_manual_scan_without_a_task_still_queues_a_delivery() -> None:
+    """手动「立即检查」产生的作业没有 task_id：检测到的变化同样要推送。"""
+    settings = _settings()
+    with SessionLocal() as db:
+        user, _task, job, channel = _seed(
+            db, name="手动检查", with_task=False, event_types=("RESTOCK",)
+        )
+        assert push.enqueue_for_job(db, settings, job) == 1
+        db.commit()
+        job_id, channel_id, owner_id = job.id, channel.id, user.id
+    with SessionLocal() as db:
+        row = db.execute(
+            select(NotificationDelivery).where(NotificationDelivery.job_id == job_id)
+        ).scalar_one()
+        assert row.channel_id == channel_id
+        assert row.owner_user_id == owner_id
+        assert push.TASK_LESS_TITLE in row.title

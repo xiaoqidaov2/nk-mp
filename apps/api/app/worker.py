@@ -14,6 +14,7 @@ from app.db import SessionLocal
 from app.services.bootstrap import lease_next_plan, run_plan
 from app.services.jobs import LeaseLost, lease_next_job, run_job
 from app.services.push import deliver, lease_due_delivery
+from app.services.retention import prune_idle_slice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("nike_mp.worker")
@@ -58,6 +59,8 @@ def main() -> None:
             job = lease_next_job(session, settings, worker_id)
             if job is None:
                 session.commit()
+                # 空闲时推进一小片历史清理（独立会话，绝不参与作业事务）。
+                prune_idle_slice(keep=settings.observation_history_limit)
                 time.sleep(settings.worker_poll_seconds)
                 continue
             session.commit()

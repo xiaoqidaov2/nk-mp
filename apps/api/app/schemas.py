@@ -57,7 +57,10 @@ class TaskIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     store_codes: list[str] = Field(default_factory=list)
     style_codes: list[str] = Field(default_factory=list)
-    cadence_seconds: int = Field(default=1800, ge=300, le=86400)
+    #: 任务级尺码选择；空列表 = 全部尺码。保留大小写（"42.5"/"XL"）。
+    size_labels: list[str] = Field(default_factory=list)
+    #: 目标是"上一轮结束后按此间隔再开始"；最快 30 秒（一轮接一轮，不叠加）。
+    cadence_seconds: int = Field(default=1800, ge=30, le=86400)
     is_active: bool = True
     notify_on_restock: bool = True
     notify_on_sold_out: bool = True
@@ -73,14 +76,53 @@ class TaskIn(BaseModel):
                 seen.append(cleaned)
         return seen
 
+    @field_validator("size_labels")
+    @classmethod
+    def _normalize_sizes(cls, value: list[str]) -> list[str]:
+        # 尺码不能 uppercase：'42.5'/'XL' 需原样命中上游结构里的 label。
+        seen: list[str] = []
+        for item in value:
+            cleaned = str(item).strip()
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned)
+        return seen
+
 
 class TaskUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    cadence_seconds: int | None = Field(default=None, ge=300, le=86400)
+    #: None = 不改；[] = 全部门店（同时把 all_stores 置真）；非空 = 指定门店（uppercase 去重）。
+    store_codes: list[str] | None = None
+    #: None = 不改；[] = 全部尺码；非空 = 指定尺码（保留大小写、去重）。
+    size_labels: list[str] | None = None
+    cadence_seconds: int | None = Field(default=None, ge=30, le=86400)
     is_active: bool | None = None
     notify_on_restock: bool | None = None
     notify_on_sold_out: bool | None = None
     notify_on_price_change: bool | None = None
+
+    @field_validator("store_codes")
+    @classmethod
+    def _normalize_stores(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        seen: list[str] = []
+        for item in value:
+            cleaned = str(item).strip().upper()
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned)
+        return seen
+
+    @field_validator("size_labels")
+    @classmethod
+    def _normalize_sizes(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        seen: list[str] = []
+        for item in value:
+            cleaned = str(item).strip()
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned)
+        return seen
 
 
 class TaskOut(BaseModel):
@@ -88,6 +130,7 @@ class TaskOut(BaseModel):
     name: str
     store_codes: list[str]
     style_codes: list[str]
+    size_labels: list[str]
     all_stores: bool
     cadence_seconds: int
     is_active: bool
@@ -99,6 +142,9 @@ class TaskOut(BaseModel):
     created_at: datetime
     store_count: int
     style_count: int
+    #: 账号级冷却（额度/风控受限）：页面显示"冷却中，将在 HH:mm 自动继续"。
+    cooldown_until: datetime | None = None
+    cooldown_reason: str | None = None
 
 
 class ScanCreateIn(BaseModel):
@@ -317,6 +363,14 @@ class NotificationDeliveryOut(BaseModel):
     sent_at: datetime | None
     title: str
     summary: str
+
+
+class PushUsageOut(BaseModel):
+    """今日推送用量：达到上限时不再排新消息，页面必须把这个数字显示出来。"""
+
+    used: int
+    cap: int
+    limited: bool
 
 
 class DingTalkRobotIn(BaseModel):

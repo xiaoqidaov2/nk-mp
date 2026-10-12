@@ -9,16 +9,22 @@ stock conclusion.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from app.config import Settings
+from app.nike import fingerprints
+from app.nike.egress import FILE_RELOAD_SECONDS, EgressPool, load_urls_from_file
 from app.nike.errors import ITEM_STATUS_BY_CODE, ErrorCode, ScanError
 from app.nike.types import PriceInfo, ReviewBatch, ReviewItem, SizeEntry, SizeStructure, StoreRecord
+
+logger = logging.getLogger("nike_mp.nike_client")
 
 
 class NikeTransportError(RuntimeError):
@@ -33,9 +39,10 @@ class NikeClient:
         token_provider: Callable[[str | None], str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         transport: httpx.BaseTransport | None = None,
-        transaction_listener: Callable[[str], bool] | None = None,
+        transaction_listener: Callable[[str, bool], bool] | None = None,
         *,
         credential_guard: Callable[[], None] | None = None,
+        egress: EgressPool | None = None,
     ) -> None:
         self.settings = settings
         self._access_token = access_token
@@ -46,9 +53,54 @@ class NikeClient:
             http2=True, timeout=30.0, follow_redirects=False, transport=transport
         )
         self.transaction_listener = transaction_listener
+        self._fingerprint_index = 0
+        self._egress = egress if egress is not None else self._build_egress_pool()
+        self._egress_file_mtime = 0.0
+        self._egress_file_checked_at = 0.0
+
+    def _build_egress_pool(self) -> EgressPool | None:
+        urls = list(self.settings.proxy_urls)
+        if self.settings.proxy_urls_file:
+            urls.extend(load_urls_from_file(self.settings.proxy_urls_file))
+        if not urls:
+            return None
+        pool = EgressPool(
+            urls,
+            cooldown_seconds=self.settings.proxy_cooldown_seconds,
+            sticky=self.settings.proxy_sticky,
+        )
+        logger.info(
+            "egress pool enabled with %d exit(s)%s",
+            len(pool),
+            " (sticky)" if self.settings.proxy_sticky else "",
+        )
+        return pool
+
+    def _reload_egress_file(self) -> None:
+        """Hot-reload the proxy list file (at most once a minute)."""
+        path = self.settings.proxy_urls_file
+        if not path or self._egress is None:
+            return
+        now = time.monotonic()
+        if now - self._egress_file_checked_at < FILE_RELOAD_SECONDS:
+            return
+        self._egress_file_checked_at = now
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._egress_file_mtime:
+            return
+        self._egress_file_mtime = mtime
+        urls = list(self.settings.proxy_urls) + load_urls_from_file(path)
+        if urls:
+            size = self._egress.replace_urls(urls)
+            logger.info("egress pool reloaded from %s (%d exit(s))", path, size)
 
     def close(self) -> None:
         self._client.close()
+        if self._egress is not None:
+            self._egress.close()
 
     def __enter__(self) -> NikeClient:
         return self
@@ -72,6 +124,10 @@ class NikeClient:
         }
         if authorized:
             headers["Authorization"] = f"Bearer {self._access_token}"
+        if self.settings.fingerprint_rotation:
+            # 每请求换一次特征（实测单请求通过率与特征无关，这里服务于"一请求一特征"的并发隔离）。
+            headers.update(fingerprints.pick_profile(self._fingerprint_index))
+            self._fingerprint_index += 1
         return headers
 
     def _request(
@@ -85,27 +141,49 @@ class NikeClient:
     ) -> httpx.Response:
         attempts = 0
         auth_retries = 0
+        waf_attempts = 0
         response: httpx.Response | None = None
-        while attempts < self.settings.request_retry_limit:
+        self._reload_egress_file()
+        # 405 挑战有自己的预算（见 waf_retry_limit），循环上限取两者较大值。
+        max_attempts = max(self.settings.request_retry_limit, self.settings.waf_retry_limit)
+        while attempts < max_attempts:
             if authorized and self._credential_guard is not None:
                 # The binding must still be current and the owner enabled
                 # before any authoritative request consumes quota. Requests
                 # already sent cannot be recalled; only future ones stop.
                 self._run_credential_guard()
-            self._consume_transaction(quota_kind)
+            # 预检不计数：额度见底时一个请求都不发。
+            self._call_quota(quota_kind, charge=False)
             try:
-                response = self._client.request(
+                sender = self._egress.next() if self._egress is not None else self._client
+                response = sender.request(
                     method,
                     url,
                     headers=self._headers(region_id, authorized),
                     content=json.dumps(body) if body is not None else None,
                 )
             except httpx.TransportError as exc:
+                if self._egress is not None:
+                    # 出口坏了就冷却它，下次尝试换下一个出口（"一请求一出口"的轮转）。
+                    self._egress.report_failure(sender)
                 attempts += 1
                 if attempts >= self.settings.request_retry_limit:
                     raise NikeTransportError(str(exc)) from exc
-                self._sleep(1.5 + attempts)
+                self._sleep(self._retry_delay(attempts))
                 continue
+            if response.status_code == 405 and b"data-spm" in response.content:
+                # WAF 挑战是上游每次独立抽签：这次尝试没有到达业务层，**不计费**，
+                # 否则通过率 ~50% 会让额度按 ~2 倍的速率被烧掉、把客户逼进冷却。
+                attempts += 1
+                waf_attempts += 1
+                logger.debug("waf challenge %s/%s on %s", waf_attempts, self.settings.waf_retry_limit, url)
+                if waf_attempts >= self.settings.waf_retry_limit:
+                    raise ScanError(ErrorCode.WAF_CHALLENGE, "WAF challenge not cleared")
+                # 挑战是每次独立抽签：退避不提高通过率，只加时延，因此近即时重试。
+                self._sleep(self.settings.waf_retry_delay_seconds)
+                continue
+            # 到达业务层的应答（含 401/403/429/5xx）才算一次上游事务。
+            self._call_quota(quota_kind, charge=True)
             if response.status_code == 401 and authorized:
                 if auth_retries >= 2 or self._token_provider is None:
                     raise ScanError(ErrorCode.AUTH_REQUIRED, "access token rejected")
@@ -118,11 +196,16 @@ class NikeClient:
                     raise ScanError(ErrorCode.AUTH_REQUIRED, "token refresh did not rotate the credential")
                 self._access_token = refreshed
                 continue
-            if response.status_code == 405 and b"data-spm" in response.content:
+            if response.status_code in (403, 429):
+                # 风控/限速：退避重试有限次，仍被拒绝就交给账号级冷却处理，
+                # 不能继续对同一账号逐店空转。
                 attempts += 1
                 if attempts >= self.settings.request_retry_limit:
-                    raise ScanError(ErrorCode.WAF_CHALLENGE, "WAF challenge not cleared")
-                self._sleep(2.0 + attempts * 1.5)
+                    raise ScanError(
+                        ErrorCode.THROTTLED,
+                        f"upstream rejected the request ({response.status_code})",
+                    )
+                self._sleep(self._retry_delay(attempts))
                 continue
             if response.status_code >= 500:
                 attempts += 1
@@ -130,19 +213,36 @@ class NikeClient:
                     raise ScanError(
                         ErrorCode.UNEXPECTED_STATUS, f"upstream {response.status_code}"
                     )
-                self._sleep(1.5 + attempts)
+                self._sleep(self._retry_delay(attempts))
                 continue
             return response
         raise NikeTransportError("request retries exhausted")
 
-    def _consume_transaction(self, quota_kind: str) -> None:
+    def _call_quota(self, quota_kind: str, *, charge: bool) -> None:
+        """Ask the quota guard about an upstream transaction.
+
+        ``charge=False`` is the pre-flight check: it never counts, so a request
+        the budget cannot afford is not even sent. ``charge=True`` books the
+        transaction after the upstream actually answered.
+        """
         if not quota_kind or self.transaction_listener is None:
             return
-        if not self.transaction_listener(quota_kind):
+        if not self.transaction_listener(quota_kind, charge):
             raise ScanError(
                 ErrorCode.BUDGET_EXHAUSTED,
                 "upstream transaction budget exhausted",
             )
+
+    def _retry_delay(self, attempts: int) -> float:
+        """Exponential backoff for upstream retries, capped by config.
+
+        405 challenge / 5xx / 403 / 429 / transport errors all share it: the
+        first retry is short (the challenge usually clears on the next
+        round-trip), later retries stretch out but never run away.
+        """
+        base = self.settings.request_retry_base_seconds
+        ceiling = self.settings.request_retry_max_seconds
+        return min(base * (2 ** max(0, attempts - 1)), ceiling)
 
     def _run_credential_guard(self) -> None:
         assert self._credential_guard is not None
@@ -304,8 +404,12 @@ class NikeClient:
             raise ScanError(ErrorCode.UNEXPECTED_STATUS, f"review PUT {response.status_code}")
 
         saw_empty = False
+        # 首次轮询很短：绝大多数 review 在 PUT 返回时就已就绪；未就绪才逐步拉长，
+        # 上限仍是 review_poll_interval_seconds，总等待窗口与重试次数保持不变。
+        delay = self.settings.review_poll_first_seconds
         for _ in range(self.settings.review_poll_tries):
-            self._sleep(self.settings.review_poll_interval_seconds)
+            self._sleep(delay)
+            delay = min(delay * 2, self.settings.review_poll_interval_seconds)
             polled = self._request("GET", base, region_id=region_id, quota_kind=quota_kind)
             try:
                 payload = polled.json()
