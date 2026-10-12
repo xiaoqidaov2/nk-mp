@@ -562,3 +562,98 @@ def test_due_tasks_of_one_owner_merge_into_a_single_job() -> None:
         # 三个任务的 next_run_at 都被推进，不会重复派发
         tasks = db.execute(select(MonitorTask)).scalars().all()
         assert all(task.next_run_at > datetime.now(UTC) for task in tasks)
+
+
+def test_a_cohort_spread_over_the_jitter_window_still_merges() -> None:
+    """抖动把同一批任务摊到几十秒内时，仍要收拢成**一个**作业，并且此后同刻到期。
+
+    生产回归：31 个"1 款 1 任务"创建时间被抖动摊开 → 每分钟只到一个 → 各自成作业，
+    合并永不成立（请求数降不下来）。
+    """
+    settings = get_settings()
+    now = datetime.now(UTC)
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="cohort@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        for index in range(3):
+            make_style(db, owner=user, code=f"COHORT-{index}")
+            task = _make_task(db, tenant.id, created_by=user.id, name=f"同批任务 {index}")
+            task.style_codes = [f"COHORT-{index}"]
+            task.cadence_seconds = 120
+            # 到期时刻被抖动摊开：0 / 5 / 9 秒（都在抖动幅度 12 秒之内）
+            task.next_run_at = now + timedelta(seconds=index * 4.5)
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 3
+        db.commit()
+
+    with SessionLocal() as db:
+        jobs = db.execute(select(ScanJob).where(ScanJob.kind == "MONITOR")).scalars().all()
+        assert len(jobs) == 1, [(job.task_id, job.task_ids) for job in jobs]
+        assert len(jobs[0].task_ids) == 3
+        assert sorted(jobs[0].style_codes) == ["COHORT-0", "COHORT-1", "COHORT-2"]
+        # 组内共用同一个 next_run_at：下一轮还会一起到期、继续合并
+        stamps = {task.next_run_at for task in db.execute(select(MonitorTask)).scalars().all()}
+        assert len(stamps) == 1
+
+
+def test_a_task_due_beyond_the_window_waits_for_its_own_round() -> None:
+    """窗口只收拢"马上到期"的任务：还差 60 秒的同组任务不提前扫。"""
+    settings = get_settings()
+    now = datetime.now(UTC)
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="window@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        for index, offset in enumerate((0.0, 60.0)):
+            make_style(db, owner=user, code=f"WIN-{index}")
+            task = _make_task(db, tenant.id, created_by=user.id, name=f"窗口任务 {index}")
+            task.style_codes = [f"WIN-{index}"]
+            task.cadence_seconds = 120
+            task.next_run_at = now + timedelta(seconds=offset)
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+
+    with SessionLocal() as db:
+        job = db.execute(select(ScanJob).where(ScanJob.kind == "MONITOR")).scalar_one()
+        assert not job.task_ids
+        assert job.style_codes == ["WIN-0"]
+        later = db.execute(
+            select(MonitorTask).where(MonitorTask.style_codes == ["WIN-1"])
+        ).scalar_one()
+        assert later.next_run_at > now + timedelta(seconds=30)  # 原定时刻没被改动
+
+
+def test_tasks_with_different_cadence_do_not_merge() -> None:
+    """节奏不同的任务不合并：否则慢任务会被快任务的节奏拖着反复扫。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="cadence@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        for index, cadence in enumerate((60, 300)):
+            make_style(db, owner=user, code=f"CAD-{index}")
+            task = _make_task(db, tenant.id, created_by=user.id, name=f"节奏任务 {index}")
+            task.style_codes = [f"CAD-{index}"]
+            task.cadence_seconds = cadence
+        db.commit()
+        user_id = user.id
+    store_credential(settings, user_id)
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 2
+        db.commit()
+
+    with SessionLocal() as db:
+        jobs = db.execute(select(ScanJob).where(ScanJob.kind == "MONITOR")).scalars().all()
+        assert len(jobs) == 2
+        assert all(not job.task_ids for job in jobs)

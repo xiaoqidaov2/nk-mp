@@ -8,6 +8,7 @@ account, and the user's ``is_active`` intent is never changed here.
 
 from __future__ import annotations
 
+import hashlib
 import random
 from datetime import UTC, datetime, timedelta
 
@@ -22,14 +23,17 @@ from app.services.jobs import enqueue_job
 from app.services.stores import clearance_filter
 
 
-def due_tasks(session: Session, limit: int = 50) -> list[MonitorTask]:
-    now = datetime.now(UTC)
+def due_tasks(
+    session: Session, limit: int = 50, look_ahead_seconds: float = 0.0
+) -> list[MonitorTask]:
+    """到期的活跃任务；``look_ahead_seconds`` 顺带把"马上到期"的任务取出来。"""
+    threshold = datetime.now(UTC) + timedelta(seconds=max(0.0, look_ahead_seconds))
     return list(
         session.execute(
             select(MonitorTask)
             .where(
                 MonitorTask.is_active.is_(True),
-                (MonitorTask.next_run_at.is_(None)) | (MonitorTask.next_run_at <= now),
+                (MonitorTask.next_run_at.is_(None)) | (MonitorTask.next_run_at <= threshold),
             )
             .order_by(MonitorTask.next_run_at.nullsfirst())
             .limit(limit)
@@ -37,15 +41,29 @@ def due_tasks(session: Session, limit: int = 50) -> list[MonitorTask]:
     )
 
 
-def _next_run_at(cadence_seconds: int, jitter_seconds: float) -> datetime:
-    """下一次派发时刻 = 间隔 + 一点随机右移（≤ 间隔的 10%，且不超过配置上限）。
+def _jitter_span(cadence_seconds: int, jitter_seconds: float) -> float:
+    """抖动幅度：≤ 间隔的 10%，且不超过配置上限。"""
+    return min(max(0.0, jitter_seconds), max(0.0, float(cadence_seconds) * 0.1))
+
+
+def _next_run_at(cadence_seconds: int, jitter_seconds: float, key: str | None = None) -> datetime:
+    """下一次派发时刻 = 间隔 + 一点右移（≤ 间隔的 10%，且不超过配置上限）。
 
     多任务共用同一 cadence 时若精确对齐在同一秒，会在同一分钟里把小时额度一次打满，
     于是集体进入冷却——客户看到的正是"任务一多就限速"。抖动把它们铺开：整体通过量不变，
     峰值下降。
+
+    同一个合并组（``key``）取**同一个**右移量：组内成员永远同刻到期，才会持续合并成一个
+    作业（抖动只用于组与组之间错峰）。
     """
-    span = min(max(0.0, jitter_seconds), max(0.0, float(cadence_seconds) * 0.1))
-    offset = random.uniform(0.0, span) if span > 0 else 0.0
+    span = _jitter_span(cadence_seconds, jitter_seconds)
+    if span <= 0:
+        return datetime.now(UTC) + timedelta(seconds=float(cadence_seconds))
+    if key is None:
+        offset = random.uniform(0.0, span)
+    else:
+        digest = hashlib.blake2s(key.encode("utf-8"), digest_size=8).digest()
+        offset = (int.from_bytes(digest, "big") % 10_000) / 10_000.0 * span
     return datetime.now(UTC) + timedelta(seconds=float(cadence_seconds) + offset)
 
 
@@ -65,14 +83,31 @@ def _active_job_for(session: Session, task: MonitorTask) -> ScanJob | None:
 
 
 def dispatch_due_tasks(session: Session, settings: Settings) -> int:
-    """派发到期任务；**同一账号、同一门店集合、同一尺码集合的多个任务合并成一个作业**。
+    """派发到期任务；**同一账号、同一节奏、同一门店/尺码集合的多个任务合并成一个作业**。
 
     为什么合并：一次可用性请求能带 **50 个 GTIN（实测硬上限）且跨款式算数**。
     31 个"1 款 1 任务"各自派作业 → 每店 31 个请求；合并后每店 `ceil(Σ尺码/50) ≈ 12`
     （2.6× 减少）。事件与推送仍按任务归属（见 ``push.enqueue_for_job``）。
+
+    抖动必须"组内一致、组间错开"：否则同一批任务被摊到多轮里，每个任务各成一个作业，
+    合并永远不成立（生产上前 31 个任务就是这样一分钟一个）。所以这里先把"马上到期"
+    的任务收拢进来，再让同组共用同一个 ``next_run_at``。
     """
     dispatched = 0
-    tasks = due_tasks(session)
+    now = datetime.now(UTC)
+    window = max(0.0, float(settings.dispatch_merge_window_seconds))
+    tasks = [
+        task
+        for task in due_tasks(session, look_ahead_seconds=window)
+        if task.next_run_at is None
+        or task.next_run_at
+        <= now
+        + timedelta(
+            seconds=min(
+                window, _jitter_span(task.cadence_seconds, settings.dispatch_jitter_seconds)
+            )
+        )
+    ]
     if not tasks:
         return 0
     cooldowns = throttle.active(session, [task.created_by for task in tasks])
@@ -136,19 +171,22 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             continue
         ready.append((task, binding, store_codes))
 
-    # 按"账号 + 门店集合 + 尺码集合"分组：只有这三项一致的任务才能合并（否则会多扫门店）。
+    # 按"账号 + 节奏 + 门店集合 + 尺码集合"分组：这几项一致才能合并（节奏不同会互相拖累，
+    # 尺码集合是扫描期过滤条件，门店集合决定实际要扫哪些店）。款式取并集——一款一任务时
+    # 正是靠这一点才能把同一批门店合并成一次采集。
     groups: dict[tuple, list[tuple[MonitorTask, object, list[str]]]] = {}
     for entry in ready:
         task, _binding, store_codes = entry
         key = (
             str(task.created_by),
             str(task.tenant_id),
+            int(task.cadence_seconds or 0),
             tuple(sorted(store_codes)),
             tuple(sorted(task.size_labels or [])),
         )
         groups.setdefault(key, []).append(entry)
 
-    for entries in groups.values():
+    for key, entries in groups.items():
         first_task, binding, store_codes = entries[0]
         styles: list[str] = []
         for task, _binding, _stores in entries:
@@ -168,8 +206,12 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             credential_binding=binding,
             task_ids=[task.id for task, _binding, _stores in entries] if merged else None,
         )
+        group_key = "|".join(str(part) for part in key)
+        next_at = _next_run_at(
+            first_task.cadence_seconds, settings.dispatch_jitter_seconds, key=group_key
+        )
         for task, _binding, _stores in entries:
-            task.next_run_at = _next_run_at(task.cadence_seconds, settings.dispatch_jitter_seconds)
+            task.next_run_at = next_at
             dispatched += 1
     session.flush()
     return dispatched
