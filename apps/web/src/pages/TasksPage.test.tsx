@@ -5,7 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { catalogApi, matrixApi, nikeCredentialApi, scanApi, taskApi } from "@/data/api";
-import type { MonitorTask, NikeCredentialOut } from "@/data/types";
+import type { MonitorTask, NikeCredentialOut, ScanJob } from "@/data/types";
 
 import { TasksPage } from "./TasksPage";
 
@@ -65,6 +65,29 @@ function task(overrides: Partial<MonitorTask> = {}): MonitorTask {
     style_count: 1,
     cooldown_until: null,
     cooldown_reason: null,
+    ...overrides,
+  };
+}
+
+function scanJob(overrides: Partial<ScanJob> = {}): ScanJob {
+  return {
+    id: "job-1",
+    task_id: null,
+    task_ids: [],
+    kind: "MONITOR",
+    status: "SUCCEEDED",
+    store_codes: [],
+    style_codes: [],
+    total_stores: 0,
+    done_stores: 0,
+    failed_stores: 0,
+    unknown_stores: 0,
+    attempt: 0,
+    error_summary: "",
+    started_at: null,
+    finished_at: null,
+    created_at: new Date().toISOString(),
+    progress: 0,
     ...overrides,
   };
 }
@@ -197,5 +220,23 @@ describe("TasksPage", () => {
     const badge = await screen.findByText(/冷却中 · 将在 \d{2}:\d{2} 自动继续/);
     expect(badge).toBeInTheDocument();
     expect(await screen.findByText("30 秒")).toBeInTheDocument();
+  });
+
+  it("labels a merged job by how many tasks it covers, not as a manual check", async () => {
+    tasksMock.mockResolvedValue([
+      task({ id: "t1", name: "任务 A" }),
+      task({ id: "t2", name: "任务 B" }),
+    ]);
+    scansMock.mockResolvedValue([
+      scanJob({ id: "job-merged", task_ids: ["t1", "t2"] }),
+      scanJob({ id: "job-manual", task_ids: [] }),
+      scanJob({ id: "job-single", task_id: "t1", task_ids: [] }),
+    ]);
+    renderPage();
+
+    expect(await screen.findByText("合并检查 2 个任务")).toBeInTheDocument();
+    expect(await screen.findByText("手动检查")).toBeInTheDocument();
+    // 单任务作业仍显示任务名（任务表里也有同名行，所以用 findAll）
+    expect((await screen.findAllByText("任务 A")).length).toBeGreaterThan(1);
   });
 });

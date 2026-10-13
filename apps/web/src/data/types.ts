@@ -59,6 +59,8 @@ export interface MonitorTask {
 export interface ScanJob {
   id: string;
   task_id: string | null;
+  /** 合并检查作业覆盖的任务；单个任务的作业为空表（task_id 为空时靠它归属）。 */
+  task_ids: string[];
   kind: string;
   status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "PARTIAL" | "FAILED" | "CANCELLED";
   store_codes: string[];

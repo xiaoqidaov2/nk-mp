@@ -52,6 +52,7 @@ function job(overrides: Partial<ScanJob> = {}): ScanJob {
   return {
     id: "job-12345678",
     task_id: "t1",
+    task_ids: [],
     kind: "SCAN",
     status: "SUCCEEDED",
     store_codes: [],

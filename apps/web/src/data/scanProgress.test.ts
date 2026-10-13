@@ -37,6 +37,7 @@ const job = (status: ScanJob["status"]): ScanJob =>
   ({
     id: "job-1",
     task_id: "task-1",
+    task_ids: [],
     kind: "SCAN",
     status,
     store_codes: [],

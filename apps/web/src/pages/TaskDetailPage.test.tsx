@@ -91,12 +91,20 @@ function scan(): ScanJob {
     status: "SUCCEEDED",
     kind: "MONITOR",
     task_id: "t1",
+    task_ids: [],
+    store_codes: ["S1", "S2"],
+    style_codes: ["DN3707-202"],
     total_stores: 2,
     done_stores: 2,
     failed_stores: 0,
     unknown_stores: 0,
+    attempt: 0,
+    error_summary: "",
+    started_at: "2026-10-06T11:59:00+00:00",
+    finished_at: "2026-10-06T12:00:00+00:00",
     created_at: "2026-10-06T12:00:00+00:00",
-  } as ScanJob;
+    progress: 1,
+  };
 }
 
 function renderPage() {

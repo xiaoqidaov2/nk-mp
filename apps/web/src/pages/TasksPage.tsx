@@ -51,6 +51,16 @@ export function TasksPage() {
   const taskName = (taskId: string | null) =>
     tasks.data?.find((item) => item.id === taskId)?.name ?? TASK_LIST.manualCheck;
 
+  // 合并检查作业没有单个 task_id：显示成"手动检查"会误导（那是系统按周期自动合并的作业）。
+  const relatedTask = (job: ScanJob) => {
+    if (job.task_id) {
+      return taskName(job.task_id);
+    }
+    return job.task_ids.length > 1
+      ? TASK_LIST.mergedCheck(job.task_ids.length)
+      : TASK_LIST.manualCheck;
+  };
+
   const toggle = useMutation({
     mutationFn: ({ id, is_active }: { id: string; is_active: boolean }) =>
       taskApi.update(id, { is_active }),
@@ -408,7 +418,7 @@ export function TasksPage() {
               title: "关联任务",
               dataIndex: "task_id",
               width: 150,
-              render: (value: string | null) => taskName(value),
+              render: (_value: string | null, record: ScanJob) => relatedTask(record),
             },
             {
               title: "状态",

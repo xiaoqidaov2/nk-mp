@@ -273,6 +273,8 @@ export const TASK_LIST = {
   disabledReadonly: "只读成员不能发起检查",
   scanCountLabel: (done: number, total: number) => `${done} / ${total}`,
   manualCheck: "手动检查",
+  /** 合并检查作业：一个作业同时覆盖多个任务（列表里不能再显示成"手动检查"）。 */
+  mergedCheck: (count: number) => `合并检查 ${count} 个任务`,
   statusActive: "启用中",
   statusPaused: "已暂停",
 } as const;
