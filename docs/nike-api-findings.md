@@ -159,3 +159,31 @@ store_code=3630 region_id=NIKE0S070 style=DM2362-002 → OUT_OF_STOCK @2026-10-1
 ### 4) WAF 路线③的负面结论（不再重复试）
 直连上游 origin（43.109.70.x）**拦截率更高（70%）**；405 页**没有可解 JS**；
 `nvs-store-ootd-api` 系列 0% 拦截但要求 **key=value 签名**（非 Bearer）→ 走不通。
+
+## 十、第三方号池 token 的接入红线（2026-10-14 实测）
+
+背景：客户租了一个"号池"（多个租户共用同一批 Nike 小程序账号），担心接入会**顶掉**别人的号。
+
+**已实测的两条性质**（用池里 1 个 QUERY token 做过一次只读查询，未登录/未续期）：
+
+1. **只读使用不会顶号** ✓：顶号/失效来自**登录或 refresh_token 轮换**（Nike 的 refresh 是一次性的），
+   不来自只读 API 调用。我们持有的副本会在对方登录后**自然失效**（我们这边 401），
+   但**不会反过来影响别人** ✓ —— 回查池台账 `status`/`updated_at` 均未被我们的调用改动 ✓。
+2. **池的 token 寿命极短**：access_token 只有小时级；台账里全部 `INACTIVE` 的池
+   （实测：102 个号、最近更新在 98 天前）拿到的 token 打过去只会得到
+   `AUTH_REQUIRED: access token rejected` ✗ —— **死的池没有任何可用数据**。
+
+**红线三条（违反任意一条就会顶号 / 破坏隔离）**：
+
+- **绝不**把池里的 `refresh_token` 导入我们的凭据库 ✗ —— 我们的 `try_refresh` 会轮换它，
+  直接顶掉其他租户 ✗✗；只用 `access_token`（无 refresh 的凭据我们本来就支持：
+  过期即 `NEEDS_AUTHORIZATION`，`refresh_expiring` 会跳过它 ✓）。
+- **绝不**用池里的号做登录/短信验证 ✗（那就是顶号的根因）。
+- **绝不**写回池系统 ✗（只 `GET` 台账；`POST`/`PATCH`/`DELETE` 是对方的管理动作）。
+
+**接入形态（若将来接活号池）**：不要塞进现有"每用户凭据"体系 ✗（那套是 owner-scoped +
+AES-GCM + 自动续期，共享池会破坏租户隔离不变式 ✗）。应做成**独立只读采集侧**：
+定时拉 `QUERY + ACTIVE` 的 access_token → 只读探测 → 首次 401/403 立即丢弃该 token →
+严格限速（共用号的风控预算是别人的资产，别烧掉 ✓）→ **只取 access_token，`openid`/
+`unionid`/`phone`/`id_card` 一律不落库**（PII ✓；平台对手机号本来就只存 HMAC 指纹）。
+
