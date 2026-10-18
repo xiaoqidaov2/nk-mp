@@ -1,8 +1,9 @@
 import { Spin } from "antd";
 import { Suspense, lazy } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation, useSearchParams } from "react-router-dom";
 
 import { useAuth } from "./auth/AuthContext";
+import { safeNext } from "./auth/next";
 import { AppLayout } from "./layout/AppLayout";
 
 const AccountPage = lazy(() =>
@@ -28,6 +29,21 @@ const TaskDetailPage = lazy(() =>
   import("./pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage })),
 );
 const TasksPage = lazy(() => import("./pages/TasksPage").then((m) => ({ default: m.TasksPage })));
+
+/** 未登录访问深链：记住原路径，登录后回到这里（推送里的任务链接靠它）。 */
+function LoginRedirect() {
+  const location = useLocation();
+  const next = `${location.pathname}${location.search}${location.hash}`;
+  const target =
+    next === "/" || next === "/login" ? "/login" : `/login?next=${encodeURIComponent(next)}`;
+  return <Navigate to={target} replace />;
+}
+
+/** 已登录还打开 /login（例如登录后按了后退）：按 next 回到目标页。 */
+function NextRedirect() {
+  const [params] = useSearchParams();
+  return <Navigate to={safeNext(params.get("next"))} replace />;
+}
 
 function PageFallback() {
   return (
@@ -57,7 +73,7 @@ export default function App() {
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route path="/login" element={<LoginPage />} />
-          <Route path="*" element={<Navigate to="/login" replace />} />
+          <Route path="*" element={<LoginRedirect />} />
         </Routes>
       </Suspense>
     );
@@ -66,7 +82,7 @@ export default function App() {
   return (
     <Suspense fallback={<PageFallback />}>
       <Routes>
-        <Route path="/login" element={<Navigate to="/dashboard" replace />} />
+        <Route path="/login" element={<NextRedirect />} />
         <Route element={<AppLayout />}>
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/tasks" element={<TasksPage />} />

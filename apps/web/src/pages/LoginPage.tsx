@@ -1,8 +1,9 @@
 import { Alert, Button, Card, Form, Input, Typography } from "antd";
 import { useState } from "react";
-import { Navigate, useNavigate } from "react-router-dom";
+import { Navigate, useNavigate, useSearchParams } from "react-router-dom";
 
 import { useAuth } from "@/auth/AuthContext";
+import { safeNext } from "@/auth/next";
 import { APP_NAME, ERR, LOGIN_SUBTITLE, loginErrorText } from "@/copy";
 import { ApiError } from "@/data/client";
 
@@ -14,11 +15,13 @@ interface LoginForm {
 export function LoginPage() {
   const { login, user } = useAuth();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const next = safeNext(params.get("next"));
   const [error, setError] = useState("");
   const [failedAttempts, setFailedAttempts] = useState(0);
   const [submitting, setSubmitting] = useState(false);
 
-  if (user) return <Navigate to="/dashboard" replace />;
+  if (user) return <Navigate to={next} replace />;
 
   const onSubmit = async (values: LoginForm) => {
     setSubmitting(true);
@@ -26,7 +29,7 @@ export function LoginPage() {
     try {
       await login(values.email, values.password);
       setFailedAttempts(0);
-      navigate("/dashboard", { replace: true });
+      navigate(next, { replace: true });
     } catch (err) {
       const attempts = failedAttempts + 1;
       setFailedAttempts(attempts);
