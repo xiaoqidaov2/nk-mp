@@ -69,7 +69,10 @@ def cmd_import_credential(args: argparse.Namespace) -> int:
         return 1
     with _session() as db:
         user = _require_user(db, args.user_id)
-        binding = CredentialService(settings, user.id).store_tokens(
+        credential_id = uuid.UUID(str(args.credential_id)) if args.credential_id else None
+        binding = CredentialService(
+            settings, user.id, credential_id=credential_id
+        ).store_tokens(
             access_token, refresh_token, client_id=settings.oauth_client_id
         )
         db.commit()
@@ -95,8 +98,8 @@ def cmd_assign_credential(args: argparse.Namespace) -> int:
             print("credential already has an owner; refusing", file=sys.stderr)
             return 1
         existing = db.execute(
-            select(Credential).where(Credential.owner_user_id == user.id)
-        ).scalar_one_or_none()
+            select(Credential.id).where(Credential.owner_user_id == user.id).limit(1)
+        ).first()
         if existing is not None:
             print("user already has a credential binding; refusing", file=sys.stderr)
             return 1
@@ -230,6 +233,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     credential = sub.add_parser("import-credential", help="导入并加密存储访问凭证")
     credential.add_argument("--user-id", required=True, help="凭证归属的平台用户 UUID")
+    credential.add_argument(
+        "--credential-id",
+        default="",
+        help="要更新的 credential 行 UUID（一用户多账号时必填；不填则新建/覆盖唯一账号）",
+    )
     credential.add_argument("--access-token-file", default="jwt_latest.txt")
     credential.add_argument("--refresh-token-file", default="mp_refresh.txt")
     credential.set_defaults(func=cmd_import_credential)

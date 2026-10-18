@@ -34,7 +34,14 @@ from app.services.credentials import CredentialService
 from app.services.jobs import enqueue_job, lease_next_job, requeue_failed_stores, run_job
 from app.services.quota import resume_at_for
 
-from .helpers import make_store, make_style, make_tenant, make_user, store_credential
+from .helpers import (
+    add_credential,
+    make_store,
+    make_style,
+    make_tenant,
+    make_user,
+    store_credential,
+)
 
 
 class FakeNikeClient:
@@ -44,6 +51,8 @@ class FakeNikeClient:
     calls: list[tuple[str, bool]] = []
     #: 结构获取阶段直接抛错（模拟 403 出现在任何 review 请求之前）。
     structure_error: bool = False
+    #: 门店没有该货号的尺码表（真实上游的稳定结论，不是错误）。
+    structure_missing: bool = False
     #: 并发测试：每次 review 的默认模拟耗时、按 region 的覆盖值，以及调用窗口。
     review_delay: float = 0.0
     delays: dict[str, float] = {}
@@ -65,6 +74,8 @@ class FakeNikeClient:
     def fetch_structure(self, store_code: str, style_code: str) -> SizeStructure:
         if type(self).structure_error:
             raise ScanError(ErrorCode.THROTTLED, "simulated structure rate limit")
+        if type(self).structure_missing:
+            return SizeStructure(store_code, style_code, "MISSING", style_code)
         return SizeStructure(
             store_code, style_code, "OK", "测试标题", (SizeEntry("42", f"G-{store_code}"),)
         )
@@ -758,3 +769,191 @@ def test_waf_storm_breaker_aborts_the_round_and_cools_down(seeded, monkeypatch) 
     assert cooldown["reason"] == "throttled"
     assert cooldown["level"] == 1
     assert cooldown["until"] is not None
+
+
+def test_a_cooling_account_does_not_block_the_other_account(seeded, monkeypatch) -> None:
+    """一用户多账号：A 冷却时派发自动换到 B，整轮照常跑完并成功。"""
+    from app.services.scheduler import dispatch_due_tasks
+
+    monkeypatch.setattr(jobs_module, "NikeClient", FakeNikeClient)
+    FakeNikeClient.calls = []
+    FakeNikeClient.behaviours = {}
+
+    settings = get_settings()
+    second_id = add_credential(settings, seeded["user_id"])
+    with SessionLocal() as db:
+        first = db.get(Credential, seeded["binding"].credential_id)
+        first.cooldown_until = datetime.now(UTC) + timedelta(minutes=30)
+        first.cooldown_reason = "throttled"
+        task = MonitorTask(
+            tenant_id=seeded["tenant_id"],
+            name="多账号轮换",
+            store_codes=["S1", "S2"],
+            style_codes=["DN3707-202"],
+            size_labels=[],
+            all_stores=False,
+            cadence_seconds=1800,
+            is_active=True,
+            next_run_at=datetime.now(UTC),
+            created_by=seeded["user_id"],
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+
+    with SessionLocal() as db:
+        job = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalar_one()
+        assert job.credential_id == second_id
+        job_id = job.id
+
+    _run(_lease(job_id))
+
+    with SessionLocal() as db:
+        job = db.get(ScanJob, job_id)
+        assert job.status == JobStatus.SUCCEEDED.value
+        observations = db.execute(
+            select(Observation).where(Observation.job_id == job_id)
+        ).scalars().all()
+        assert observations
+        assert {row.credential_id for row in observations} == {second_id}
+        assert {row.credential_generation for row in observations} == {1}
+        # 冷却中的账号仍按自己的窗口等待：本轮不写它的冷却，也不提前解除。
+        first = db.get(Credential, seeded["binding"].credential_id)
+        assert first.cooldown_until is not None and first.cooldown_until > datetime.now(UTC)
+        assert first.cooldown_reason == "throttled"
+        assert db.get(MonitorTask, task_id).next_run_at > datetime.now(UTC)
+
+
+def test_a_throttled_round_only_cools_the_account_that_hit_it(seeded, monkeypatch) -> None:
+    """账号 B 整轮被限速：只冷却 B；任务按自己的节奏推进（A 仍可用）。"""
+    from app.services.scheduler import dispatch_due_tasks
+
+    monkeypatch.setattr(jobs_module, "NikeClient", FakeNikeClient)
+    FakeNikeClient.behaviours = {"R1": "throttled", "R2": "throttled"}
+    settings = get_settings()
+    second_id = add_credential(settings, seeded["user_id"])
+    with SessionLocal() as db:
+        # B（新账号）先被选中：A 刚用过。
+        db.get(Credential, seeded["binding"].credential_id).last_used_at = datetime.now(UTC)
+        task = MonitorTask(
+            tenant_id=seeded["tenant_id"],
+            name="单账号限速",
+            store_codes=["S1", "S2"],
+            style_codes=["DN3707-202"],
+            size_labels=[],
+            all_stores=False,
+            cadence_seconds=60,
+            is_active=True,
+            next_run_at=datetime.now(UTC),
+            created_by=seeded["user_id"],
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+    with SessionLocal() as db:
+        job = db.execute(select(ScanJob).where(ScanJob.task_id == task_id)).scalar_one()
+        assert job.credential_id == second_id
+        job_id = job.id
+
+    _run(_lease(job_id))
+
+    with SessionLocal() as db:
+        job = db.get(ScanJob, job_id)
+        assert job.status == JobStatus.FAILED.value
+        assert job.error_summary == ErrorCode.THROTTLED.value
+        second = db.get(Credential, second_id)
+        assert second.cooldown_until is not None
+        assert db.get(Credential, seeded["binding"].credential_id).cooldown_until is None
+        task = db.get(MonitorTask, task_id)
+        # 任务不白等 B 的冷却窗口（另一个账号可用）：按 60 秒节奏推进。
+        assert task.next_run_at <= datetime.now(UTC) + timedelta(seconds=90)
+        assert task.next_run_at < second.cooldown_until
+        # 补跑沿用冻结的 B 账号，并排在 B 的窗口之后。
+        retry = db.execute(select(ScanJob).where(ScanJob.kind == "RETRY")).scalar_one()
+        assert retry.credential_id == second_id
+        assert retry.not_before >= second.cooldown_until - timedelta(seconds=1)
+
+
+def test_structure_missing_stores_are_not_auto_retried(seeded, monkeypatch) -> None:
+    """缺尺码是稳定结论：不补跑（否则 30 秒档下每轮再空转整店），靠 TTL 自然重取。"""
+    monkeypatch.setattr(jobs_module, "NikeClient", FakeNikeClient)
+    FakeNikeClient.calls = []
+    FakeNikeClient.behaviours = {}
+    FakeNikeClient.structure_missing = True
+    try:
+        job_id, _task_id = _enqueue_with_task(seeded)
+        _lease(job_id)
+        _run(job_id)
+
+        with SessionLocal() as db:
+            job = db.get(ScanJob, job_id)
+            assert job.status == JobStatus.FAILED.value
+            rows = db.execute(
+                select(ScanJobStore).where(ScanJobStore.job_id == job_id)
+            ).scalars().all()
+            assert {row.error_code for row in rows} == {ErrorCode.STRUCTURE_MISSING.value}
+            assert db.execute(select(ScanJob).where(ScanJob.kind == "RETRY")).scalars().all() == []
+    finally:
+        FakeNikeClient.structure_missing = False
+
+
+def test_waf_storms_below_the_scaled_threshold_do_not_abort_the_round(monkeypatch) -> None:
+    """40 家门店里 5 家打满 405：阈值 = ceil(0.15×40) = 6 > 5 → 不整轮中止。
+
+    只有达到"这一轮 15% 的门店被挑战打满"（配置下限 3 与 15% 取大）才熔断；
+    否则每 40 轮就来一次整轮中止 + 账号冷却，客户看到的是大量失败与降速。
+    """
+    settings = get_settings()
+    monkeypatch.setattr(settings, "waf_storm_store_limit", 3)
+    monkeypatch.setattr(jobs_module, "NikeClient", FakeNikeClient)
+    FakeNikeClient.calls = []
+    FakeNikeClient.delays = {}
+    FakeNikeClient.review_delay = 0.0
+
+    storm = {f"R{index}" for index in range(1, 6)}
+    with SessionLocal() as db:
+        tenant = make_tenant(db, budget=100000)
+        user = make_user(db, tenant, email="waf-scale@example.com")
+        for index in range(1, 41):
+            make_store(db, owner=user, code=f"S{index:02d}", region_id=f"R{index}")
+        make_style(db, owner=user, code="DN3707-202")
+        db.commit()
+        seed = {"tenant_id": tenant.id, "user_id": user.id, "tenant": tenant}
+    binding = store_credential(settings, seed["user_id"])
+
+    FakeNikeClient.behaviours = dict.fromkeys(storm, "waf")
+
+    with SessionLocal() as db:
+        job = enqueue_job(
+            db,
+            tenant_id=seed["tenant_id"],
+            store_codes=[f"S{index:02d}" for index in range(1, 41)],
+            style_codes=["DN3707-202"],
+            owner_user_id=seed["user_id"],
+            credential_binding=binding,
+        )
+        db.commit()
+        job_id = job.id
+
+    _lease(job_id)
+    _run(job_id)
+
+    with SessionLocal() as db:
+        job = db.get(ScanJob, job_id)
+        rows = db.execute(
+            select(ScanJobStore).where(ScanJobStore.job_id == job_id)
+        ).scalars().all()
+        waf_rows = [row for row in rows if row.error_code == ErrorCode.WAF_CHALLENGE.value]
+        assert len(waf_rows) == 5
+        assert sum(1 for row in rows if row.status == StoreJobStatus.SUCCEEDED.value) == 35
+        # 没有整轮中止：作业按真实结果收敛（部分成功），错误摘要也不是风暴中止。
+        assert job.status == JobStatus.PARTIAL.value
+        assert job.error_summary != ErrorCode.WAF_CHALLENGE.value

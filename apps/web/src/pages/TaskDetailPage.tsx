@@ -7,7 +7,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
 import { EmptyState } from "@/components/EmptyState";
 import { CardRow, ResponsiveList } from "@/components/MobileCardList";
-import { NikeConnectionNotice, isCredentialActive, useNikeCredentialQuery } from "@/components/NikeCredentialCard";
+import { NikeConnectionNotice, isCredentialActive, useNikeCredentialsQuery } from "@/components/NikeCredentialCard";
 import { PageHeader } from "@/components/PageHeader";
 import { useHasEnabledChannel } from "@/components/PushChannelsCard";
 import { SectionCard } from "@/components/SectionCard";
@@ -47,8 +47,8 @@ export function TaskDetailPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { message, modal } = AntdApp.useApp();
-  const credential = useNikeCredentialQuery();
-  const bound = isCredentialActive(credential.data?.status);
+  const credentials = useNikeCredentialsQuery();
+  const bound = credentials.data?.some((row) => isCredentialActive(row.status)) ?? false;
   const hasEnabledChannel = useHasEnabledChannel();
 
   const tasks = useQuery<MonitorTask[]>({ queryKey: ["tasks"], queryFn: () => taskApi.list() });

@@ -42,6 +42,14 @@ Scenarios (``POST /__scenario``) - applied to the default identity only
 * ``throttled``: the review *poll* answers 403 (rate limited) for the default
   identity, which must end the round with THROTTLED and enter the account
   cooldown instead of probing the remaining stores.
+* ``accounts2``: the review *poll* answers 403 for the scoped identity ``A2``
+  only - one platform user with two Nike accounts (``A``/``A2``): the account
+  that got limited cools down and the very next round must be served by the
+  other account. Every other identity (scoped ``A``/``B``, ``default``) keeps
+  its normal behaviour.
+
+``GET /__state`` exposes ``reviews_by_identity`` (review PUT+poll counts per
+identity) so a client can prove *which* bound Nike account served a round.
 
 All state is in memory; a restart clears it.
 """
@@ -64,7 +72,15 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Nike MP offline stub", version="0.2.0")
 
-SCENARIOS = {"baseline", "restock", "untrusted", "throttled", "price_up", "waf"}
+SCENARIOS = {
+    "baseline",
+    "restock",
+    "untrusted",
+    "throttled",
+    "accounts2",
+    "price_up",
+    "waf",
+}
 
 #: The one phone the stub always knows, mapped to the scenario-driven default
 #: identity. Additional accounts are registered through ``POST /__accounts``.
@@ -109,6 +125,10 @@ reviews: dict[str, list[dict]] = {}
 
 #: 推送渠道的离线落点：Apprise 的 json:// 目标会把 {title, message} POST 进来。
 pushes: list[dict] = []
+
+#: 每个身份（A / A2 / B / default）的 review 调用数：一个平台的多个 Nike 账号
+#: 各用各的 token，靠它证明「这一轮究竟是哪个账号在跑」（``GET /__state``）。
+reviews_by_identity: dict[str, int] = {}
 
 stats = {"send_count": 0, "codes_issued": 0, "token_grants": 0, "refresh_grants": 0,
          "review_calls": 0, "waf_challenges": 0}
@@ -236,6 +256,16 @@ def _scoped_account(authorization: str) -> Account | None:
     return account
 
 
+def _count_review(authorization: str) -> None:
+    """Per-identity review traffic counter (``GET /__state``).
+
+    Counts both the review PUT and every poll, so ``reviews_by_identity`` delta
+    across a round tells which bound Nike account actually served it.
+    """
+    identity = _identity_from_header(authorization) or "default"
+    reviews_by_identity[identity] = reviews_by_identity.get(identity, 0) + 1
+
+
 # --------------------------------------------------------------------- admin
 
 
@@ -315,6 +345,23 @@ def read_stats() -> dict:
     }
 
 
+@app.get("/__state")
+def read_state() -> dict:
+    """身份级的运行态：谁（A / A2 / B / default）真的发过 review 请求。
+
+    冒烟用它证明「一用户多账号」的轮换：失败轮 A2 的计数增长、随后成功轮
+    A2 的计数不变（``reviews_by_identity`` 是 PUT + 每次轮询的总和）。
+    """
+    return {
+        "scenario": state["scenario"],
+        "reviews_by_identity": dict(reviews_by_identity),
+        "accounts": [
+            {"phone": a.phone, "identity": a.identity, "price": a.price, "scoped": a.scoped}
+            for a in accounts_by_phone.values()
+        ],
+    }
+
+
 @app.post("/__push")
 def receive_push(payload: dict) -> dict:
     """Record one Apprise ``json://`` payload (fields: title / message)."""
@@ -348,6 +395,7 @@ def reset() -> dict:
     refresh_tokens.clear()
     reviews.clear()
     pushes.clear()
+    reviews_by_identity.clear()
     for key in stats:
         stats[key] = 0
     return {"ok": True}
@@ -529,6 +577,36 @@ def product_structure(store: str, style: str) -> dict:
     }
 
 
+@app.get(
+    "/store/product_details/internal/v1/marketplace/CN/language/zh-Hans/store_number/{store}"
+)
+def product_structures(store: str, productCodes: str = "", fields: str = "") -> dict:  # noqa: ARG001
+    """批量门店尺码表：客户端按 ≤30 货号分块调用（免 token，几乎不触发 WAF）。
+
+    与 ``fetch_structures`` 对齐：顶层 ``products`` 数组，每项带 ``productCode`` +
+    ``sizes[].localizedLabel``/``gtins[0].gtin``；响应里没有的货号由客户端按 MISSING
+    处理（未知绝不当作结论），未知门店返回空数组。
+    """
+    sizes = SIZES_BY_STORE.get(store.upper(), [])
+    codes = list(
+        dict.fromkeys(code.strip().upper() for code in productCodes.split(",") if code.strip())
+    )
+    return {
+        "products": [
+            {
+                "productCode": code,
+                "copy": {"fullTitle": f"离线货号 {code}"},
+                "sizes": [
+                    {"localizedLabel": label, "gtins": [{"gtin": gtin}]}
+                    for label, gtin in sizes
+                ],
+            }
+            for code in codes
+            if sizes
+        ]
+    }
+
+
 def _waf_challenge() -> Response | None:
     """``waf`` 场景下每隔一次调用返回 405 挑战（上游抽签的确定性替身）。"""
     stats["review_calls"] += 1
@@ -541,7 +619,10 @@ def _waf_challenge() -> Response | None:
 
 
 @app.put("/o2o/buy/cart_reviews/v2/{request_id}")
-def submit_review(request_id: str, payload: dict):
+def submit_review(
+    request_id: str, payload: dict, authorization: str = Header(default="")
+) -> Response:
+    _count_review(authorization)
     challenge = _waf_challenge()
     if challenge is not None:
         return challenge
@@ -561,6 +642,7 @@ def _is_out_of_stock(gtin: str, account: Account | None) -> bool:
 
 @app.get("/o2o/buy/cart_reviews/v2/{request_id}")
 def poll_review(request_id: str, authorization: str = Header(default="")) -> Response:
+    _count_review(authorization)
     challenge = _waf_challenge()
     if challenge is not None:
         return challenge
@@ -570,6 +652,9 @@ def poll_review(request_id: str, authorization: str = Header(default="")) -> Res
         return {"response": {"fulfillmentGroups": []}}
     if account is None and state["scenario"] == "throttled":
         # 风控/限速：客户端退避重试耗尽后必须整轮结束并进入账号级冷却。
+        return JSONResponse(status_code=403, content={"errors": [{"code": "rate_limited"}]})
+    if account is not None and account.identity == "A2" and state["scenario"] == "accounts2":
+        # 只打第二个 Nike 账号：账号级冷却后，同一任务必须换第一个账号继续。
         return JSONResponse(status_code=403, content={"errors": [{"code": "rate_limited"}]})
 
     errors = []

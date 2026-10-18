@@ -233,10 +233,10 @@ def test_ops_read_endpoints_use_personal_credential_route(client) -> None:
         db.commit()
 
     login(client, "ops@example.com")
-    # The logged-in user's own Nike connection is the only credential view now.
-    personal = client.get("/api/v1/me/nike-credential")
+    # The logged-in user's own Nike connections are the only credential view now.
+    personal = client.get("/api/v1/me/nike-credentials")
     assert personal.status_code == 200, personal.text
-    assert personal.json()["status"] == "NOT_CONNECTED"
+    assert personal.json() == []
     for path in ("/api/v1/ops/tenants", "/api/v1/ops/health/detail"):
         response = client.get(path)
         assert response.status_code == 200, f"{path}: {response.text}"
@@ -587,3 +587,46 @@ def test_store_list_defaults_to_clearance_and_can_show_all(client) -> None:
     assert default_codes == ["S1"]
     all_codes = [row["store_code"] for row in client.get("/api/v1/stores?scope=all").json()]
     assert all_codes == ["S1", "S2"]
+
+
+def test_changes_feed_hides_diagnostics_unless_requested(client) -> None:
+    """变化流水默认只列四类真实变化；诊断事件要显式按类型筛选才返回。
+
+    客户实测反馈：门店页把 SCAN_FAILED 当"变化"列出来，整页都是"检查失败"，
+    真正的补货/售罄被埋掉。
+    """
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="feed@example.com")
+        store = make_store(db, owner=user, code="S900")
+        now = datetime.now(UTC)
+        db.add_all(
+            [
+                ChangeEvent(
+                    tenant_id=tenant.id,
+                    owner_user_id=user.id,
+                    store_id=store.id,
+                    size_label="42",
+                    event_type="RESTOCK",
+                    dedupe_key=f"restock-{uuid.uuid4()}",
+                    checked_at=now,
+                ),
+                ChangeEvent(
+                    tenant_id=tenant.id,
+                    owner_user_id=user.id,
+                    store_id=store.id,
+                    size_label="",
+                    event_type="SCAN_FAILED",
+                    dedupe_key=f"failed-{uuid.uuid4()}",
+                    checked_at=now,
+                ),
+            ]
+        )
+        db.commit()
+
+    login(client, "feed@example.com")
+    default_types = {row["event_type"] for row in client.get("/api/v1/changes").json()}
+    assert default_types == {"RESTOCK"}
+
+    diagnostics = client.get("/api/v1/changes", params={"event_type": "SCAN_FAILED"}).json()
+    assert [row["event_type"] for row in diagnostics] == ["SCAN_FAILED"]

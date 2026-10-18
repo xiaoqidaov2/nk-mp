@@ -9,6 +9,7 @@ from app.api.http_errors import credential_error_response
 from app.config import Settings
 from app.models import JobStatus, MonitorTask, ScanJob, Store, Style, Tenant, User
 from app.nike.client import NikeClient
+from app.services import monitor
 from app.services.credentials import CredentialError, CredentialService
 from app.services.stores import sync_stores
 
@@ -65,6 +66,16 @@ def list_tenants(
             }
         )
     return out
+
+
+@router.get("/scheduler-health")
+def scheduler_health(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_ops),
+    settings: Settings = Depends(settings_dep),
+) -> dict[str, object]:
+    """调度与节点健康：实例心跳、迟到任务、冷却账号、队列深度（实时查询，不落库）。"""
+    return monitor.build_report(db, settings)
 
 
 @router.get("/health/detail")

@@ -12,7 +12,7 @@ import { TasksPage } from "./TasksPage";
 vi.mock("@/data/api", () => ({
   taskApi: { list: vi.fn(), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
   scanApi: { list: vi.fn(), create: vi.fn() },
-  nikeCredentialApi: { status: vi.fn() },
+  nikeCredentialApi: { list: vi.fn() },
   catalogApi: { stores: vi.fn(), styles: vi.fn() },
   matrixApi: { get: vi.fn() },
 }));
@@ -26,7 +26,7 @@ vi.mock("@/auth/AuthContext", () => ({
 const tasksMock = vi.mocked(taskApi.list);
 const scansMock = vi.mocked(scanApi.list);
 const removeMock = vi.mocked(taskApi.remove);
-const credentialMock = vi.mocked(nikeCredentialApi.status);
+const credentialMock = vi.mocked(nikeCredentialApi.list);
 const storesMock = vi.mocked(catalogApi.stores);
 const matrixMock = vi.mocked(matrixApi.get);
 
@@ -35,12 +35,15 @@ const READONLY = "你当前是只读成员，可以查看结果但不能新建�
 
 function activeCredential(): NikeCredentialOut {
   return {
+    id: "cred-1",
     status: "ACTIVE",
     phone_masked: "138****0000",
     access_expires_at: null,
     last_refreshed_at: null,
     last_error_code: null,
     binding_generation: 1,
+    cooldown_until: null,
+    cooldown_reason: null,
     login_available: true,
   };
 }
@@ -141,7 +144,7 @@ describe("TasksPage", () => {
     credentialMock.mockReset();
     tasksMock.mockResolvedValue([]);
     scansMock.mockResolvedValue([]);
-    credentialMock.mockResolvedValue(activeCredential());
+    credentialMock.mockResolvedValue([activeCredential()]);
     storesMock.mockResolvedValue([]);
     matrixMock.mockResolvedValue({
       style_code: "DN3707-202",

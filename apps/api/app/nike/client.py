@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -25,6 +26,28 @@ from app.nike.errors import ITEM_STATUS_BY_CODE, ErrorCode, ScanError
 from app.nike.types import PriceInfo, ReviewBatch, ReviewItem, SizeEntry, SizeStructure, StoreRecord
 
 logger = logging.getLogger("nike_mp.nike_client")
+
+#: 批量结构端点被收回时的回落只在整个进程里告警一次（否则每店每轮都会刷一行）。
+_batch_fallback_guard = threading.Lock()
+_batch_fallback_warned = False
+
+#: 上游响应计数（进程级、线程安全）。httpx 的“每请求一行 INFO”是最大的日志来源
+#: （实测单个 worker 300MB+，曾把 40G 盘写满 → Postgres 崩溃 → 全站登录 500）。
+#: 改成按作业汇总一行：既保留 WAF/限流占比这个关键指标，又把日志量降几个数量级。
+_stats_guard = threading.Lock()
+_upstream_stats: dict[str, int] = {}
+
+
+def _count_upstream(status: int) -> None:
+    key = str(status)
+    with _stats_guard:
+        _upstream_stats[key] = _upstream_stats.get(key, 0) + 1
+
+
+def upstream_stats() -> dict[str, int]:
+    """当前进程的上游响应计数快照，形如 ``{"200": 12, "405": 30}``。"""
+    with _stats_guard:
+        return dict(_upstream_stats)
 
 
 class NikeTransportError(RuntimeError):
@@ -171,6 +194,7 @@ class NikeClient:
                     raise NikeTransportError(str(exc)) from exc
                 self._sleep(self._retry_delay(attempts))
                 continue
+            _count_upstream(response.status_code)
             if response.status_code == 405 and b"data-spm" in response.content:
                 # WAF 挑战是上游每次独立抽签：这次尝试没有到达业务层，**不计费**，
                 # 否则通过率 ~50% 会让额度按 ~2 倍的速率被烧掉、把客户逼进冷却。
@@ -299,6 +323,14 @@ class NikeClient:
         )
         response = self._request("GET", url, authorized=False)
         if response.status_code != 200:
+            # 确定性拒绝（5xx/403/429 已在 _request 里重试耗尽并抛出）：
+            # 记 MISSING，但要留下可见的警告——"缺尺码"不能掩盖上游契约变化。
+            logger.warning(
+                "structure endpoint rejected (store=%s style=%s status=%s)",
+                store_code,
+                style_code,
+                response.status_code,
+            )
             return SizeStructure(store_code, style_code, "MISSING", style_code)
         try:
             payload = response.json()
@@ -337,6 +369,22 @@ class NikeClient:
             )
             response = self._request("GET", url, authorized=False)
             if response.status_code != 200:
+                # 批量端点被上游收回（2026-10 实测：无 token → 401，带 token → 403）：
+                # 回落到单款端点（同域、免 token、0% WAF、不计费）。不回落的后果是整个
+                # 门店的所有货号都被静默读成"缺尺码"（5xx/限流仍由 _request 抛给上层重试）。
+                global _batch_fallback_warned
+                with _batch_fallback_guard:
+                    first_in_process = not _batch_fallback_warned
+                    _batch_fallback_warned = True
+                log = logger.warning if first_in_process else logger.debug
+                log(
+                    "structure batch endpoint rejected (store=%s status=%s); "
+                    "falling back to per-style lookups",
+                    store_code,
+                    response.status_code,
+                )
+                for code in chunk:
+                    results[code] = self.fetch_structure(store_code, code)
                 continue
             try:
                 payload = response.json()

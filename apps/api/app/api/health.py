@@ -16,7 +16,7 @@ def health(db: Session = Depends(get_db)) -> HealthOut:
     """Infrastructure-only health: database reachability and queue depth.
 
     Personal credential state is never reported here; it lives behind the
-    authenticated ``/me/nike-credential`` endpoint.
+    authenticated ``/me/nike-credentials`` endpoint.
     """
     try:
         db.execute(text("SELECT 1"))

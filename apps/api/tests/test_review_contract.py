@@ -531,3 +531,69 @@ def test_waf_challenge_exhaustion_sends_no_billable_requests(settings) -> None:
         client.review(["g0"], region_id="NIKE0S001")
     assert excinfo.value.code == ErrorCode.WAF_CHALLENGE
     assert charged == []
+
+
+def _single_structure_payload(code: str, sizes: int = 2) -> dict:
+    return {
+        "productGroupings": [
+            {
+                "products": [
+                    {
+                        "productCode": code,
+                        "copy": {"fullTitle": f"{code} 单款"},
+                        "sizes": [
+                            {
+                                "localizedLabel": f"4{index}",
+                                "gtins": [{"gtin": f"S-{code}-{index}"}],
+                            }
+                            for index in range(sizes)
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def test_batch_structure_rejection_falls_back_to_per_style_lookups(settings) -> None:
+    """批量端点被上游收回（实测 401/403）时逐款回落，绝不静默变成"缺尺码"。"""
+    replay = _Replay(
+        [
+            httpx.Response(401),
+            _json(_single_structure_payload("ST-01")),
+            _json({"productGroupings": []}),
+        ]
+    )
+    client = replay.client(settings)
+
+    result = client.fetch_structures("3875", ["ST-01", "ST-02"])
+
+    urls = [str(request.url) for request in replay.requests]
+    assert "internal/v1" in urls[0]
+    assert "style_color/ST-01" in urls[1]
+    assert "style_color/ST-02" in urls[2]
+    assert result["ST-01"].status == "OK"
+    assert [entry.gtin for entry in result["ST-01"].sizes] == ["S-ST-01-0", "S-ST-01-1"]
+    # 单款端点明确没有该货号 → MISSING（未知不当作结论）。
+    assert result["ST-02"].status == "MISSING"
+
+
+def test_upstream_counters_aggregate_responses_for_the_per_round_summary(settings) -> None:
+    """上游响应计数：按状态聚合（取代 httpx 的每请求一行日志）。
+
+    405 挑战占比靠这一行汇总保留；逐请求行曾让单个 worker 日志涨到 300MB+。
+    """
+    from app.nike import client as client_module
+
+    with client_module._stats_guard:
+        client_module._upstream_stats.clear()
+    replay = _Replay(
+        [
+            httpx.Response(405, content=b"data-spm"),
+            _json(_structure_payload(["ST-01"])),
+        ]
+    )
+    client = replay.client(settings)
+    client.fetch_structures("3875", ["ST-01"])
+    stats = client_module.upstream_stats()
+    assert stats == {"405": 1, "200": 1}

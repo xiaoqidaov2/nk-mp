@@ -194,7 +194,7 @@ export const ERR = {
   changesFailedHint: "请刷新页面重试。",
   accountFailed: "账号信息加载失败",
   accountFailedHint: "刷新已有账号信息，请刷新页面重试。",
-  taskNotFound: "这个任务不存在，或你没有权限查看。",
+  taskNotFound: "这个任务不存在，或你没有权限查看。推送里的任务链接要用创建该任务的账号登录后打开。",
   scanNotFound: "这次检查不存在，或你没有权限查看。",
   storeNotFound: "没有找到这家店，可能门店清单还没同步。",
   opsSyncFailed: "门店清单没有更新，请稍后重试。",
@@ -336,6 +336,7 @@ export const WIZARD = {
   nameConflictRetry: "用新名称重试",
   notifyRestock: "补货提醒",
   notifySoldOut: "售罄提醒",
+  notifySoldOutNote: "售罄默认只记录、不提醒；需要提醒时打开上面的开关。",
   notifyPriceChange: "变价提醒",
   runImmediately: "创建后立即检查一次",
   summaryLabel: "确认信息",
@@ -365,6 +366,14 @@ export const ACCOUNT = {
     { item: "门店价与促销后实付价", available: "可获取，无货时没有价格" },
     { item: "一家店的全部在售商品和件数", available: "无法获取，本平台不提供" },
   ],
+  listTitle: "Nike 账号",
+  count: (n: number) => `共 ${n} 个账号`,
+  addAnother: "再绑一个账号",
+  coolingUntil: (t: string) => `冷却至 ${t}`,
+  colStatus: "状态",
+  colPhone: "已连接手机号",
+  colCooldown: "冷却",
+  colActions: "操作",
 } as const;
 
 export const PUSH = {
@@ -480,9 +489,49 @@ export const OPS = {
   healthRunningJobs: "进行中检查",
   healthFailedJobs: "今日失败检查",
   healthStoreCoverage: "已登记门店",
+  diskUsage: (used: string, total: string, percent: number) =>
+    `服务器磁盘：已用 ${used}G / ${total}G（${percent}%）。接近写满时请清理历史镜像与日志，避免数据库停止服务。`,
   tenantTypePlatform: "管理后台",
   tenantTypeCustomer: "客户",
+  schedulerCard: "调度与节点",
+  schedulerNote: "调度实例与执行节点定期上报心跳；到点仍未开始的检查会列在下面。",
+  schedulerInstances: "调度实例",
+  workerNodes: "执行节点",
+  schedulerAlive: "调度运行中",
+  schedulerStale: "调度心跳超时",
+  overdueTasks: "未按预期开始的检查",
+  coolingAccounts: "冷却中的账号",
+  colInstance: "实例",
+  colLastSeen: "最近心跳",
+  colState: "运行状态",
+  colRunningJobs: "进行中作业",
+  colTask: "任务",
+  colNextRun: "预计开始",
+  colOverdue: "已延迟",
+  colLastFinished: "上次完成",
+  colAccount: "账号",
+  colOwner: "所属用户",
+  colCooldownReason: "原因",
+  colCooldownUntil: "恢复时间",
+  emptyScheduler: "暂无调度实例心跳。",
+  emptyWorkers: "暂无执行节点心跳。",
+  emptyOverdue: "没有未按预期开始的检查。",
+  emptyCooling: "当前没有冷却中的账号。",
 } as const;
+
+/**
+ * 冷却原因：只输出中文解释，永不把后端原因码直接放进界面。
+ * 未知原因统一写成“自动降速”，避免暴露实现细节。
+ */
+export function cooldownReasonText(reason: string | null | undefined): string {
+  if (!reason) return "系统自动降速";
+  const value = reason.toLowerCase();
+  if (value.includes("throttl")) return "被 Nike 限速";
+  if (value.includes("tenant")) return "公司查询额度已用完";
+  if (value.includes("hour")) return "本小时查询额度已用完";
+  if (value.includes("day")) return "今日查询额度已用完";
+  return "系统自动降速";
+}
 
 export const STORE_PAGE = {
   capability: "无法获取一家店的全部在售商品。本页只显示已监控货号的探测结果，不代表这家店的全部商品。",
@@ -677,6 +726,14 @@ export function formatCadence(seconds: number): string {
   if (seconds < 60) return `${seconds} 秒`;
   if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
   return `${Math.round(seconds / 60)} 分钟`;
+}
+
+/** 时长：<1 分钟 N 秒；<1 小时 N 分钟；否则 N 小时（用于“已延迟多久”）。 */
+export function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  if (total < 60) return `${total} 秒`;
+  if (total < 3600) return `${Math.round(total / 60)} 分钟`;
+  return `${Math.round(total / 3600)} 小时`;
 }
 
 export const CADENCE_OPTIONS = [

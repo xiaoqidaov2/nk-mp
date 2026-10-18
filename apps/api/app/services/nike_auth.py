@@ -47,7 +47,12 @@ from app.security import (
     encrypt_secret,
     secret_fingerprint,
 )
-from app.services.credentials import CredentialService, apply_tokens_locked
+from app.services.credentials import (
+    CredentialService,
+    CredentialStatusInfo,
+    apply_tokens_locked,
+    status_info_of,
+)
 
 logger = logging.getLogger("nike_mp.nike_auth")
 
@@ -145,24 +150,55 @@ def _parse_ip(value: str):
     return parsed
 
 
-def credential_view(settings: Settings, user_id: UUID) -> dict:
-    info = CredentialService(settings, user_id).status()
-    if info is None or info.status == CredentialStatus.UNASSIGNED.value:
-        return {
-            "status": NOT_CONNECTED,
-            "phone_masked": None,
-            "access_expires_at": None,
-            "last_refreshed_at": None,
-            "last_error_code": None,
-            "binding_generation": None,
-        }
+def _not_connected_view() -> dict:
     return {
+        "id": None,
+        "status": NOT_CONNECTED,
+        "phone_masked": None,
+        "access_expires_at": None,
+        "last_refreshed_at": None,
+        "last_error_code": None,
+        "binding_generation": None,
+        "cooldown_until": None,
+        "cooldown_reason": None,
+    }
+
+
+def credential_view(settings: Settings, user_id: UUID, credential_id: UUID | None = None) -> dict:
+    """One account's view；``credential_id=None`` 时自动选号（兼容旧调用）。"""
+    info = CredentialService(settings, user_id, credential_id=credential_id).status()
+    if info is None or info.status == CredentialStatus.UNASSIGNED.value:
+        return _not_connected_view()
+    return _credential_row_view(info)
+
+
+def credential_views(settings: Settings, user_id: UUID) -> list[dict]:
+    """该用户的全部账号（不含已断开）；空列表 = 尚未连接任何账号。"""
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(Credential)
+            .where(
+                Credential.owner_user_id == user_id,
+                Credential.status.notin_(
+                    [CredentialStatus.REVOKED.value, CredentialStatus.UNASSIGNED.value]
+                ),
+            )
+            .order_by(Credential.updated_at.asc(), Credential.id.asc())
+        ).scalars().all()
+        return [_credential_row_view(status_info_of(info)) for info in rows]
+
+
+def _credential_row_view(info: CredentialStatusInfo) -> dict:
+    return {
+        "id": info.id,
         "status": info.status,
         "phone_masked": info.phone_masked,
         "access_expires_at": info.access_expires_at,
         "last_refreshed_at": info.last_refreshed_at,
         "last_error_code": info.last_error_code,
         "binding_generation": info.binding_generation,
+        "cooldown_until": info.cooldown_until,
+        "cooldown_reason": info.cooldown_reason,
     }
 
 
@@ -177,8 +213,14 @@ def create_attempt(
     phone: str,
     request_id: UUID,
     client_ip: str,
+    credential_id: UUID | None = None,
 ) -> tuple[AttemptView, bool]:
-    """Create (and start) a send attempt. Returns ``(view, created)``."""
+    """Create (and start) a send attempt. Returns ``(view, created)``.
+
+    ``credential_id`` names the account being re-verified: the attempt then
+    updates *that* row and fails loudly if it changed. Without it the attempt
+    adds a new account for the user.
+    """
     phone_e164 = normalize_phone(phone)
     phone_hash = secret_fingerprint(phone_e164, purpose="phone")
     ip_hash = secret_fingerprint(client_ip, purpose="ip") if client_ip else ""
@@ -245,9 +287,20 @@ def create_attempt(
 
         _check_send_limits(session, settings, user_id, phone_hash, ip_hash, now)
 
-        record = session.execute(
-            select(Credential).where(Credential.owner_user_id == user_id)
-        ).scalar_one_or_none()
+        if credential_id is not None:
+            record = session.execute(
+                select(Credential).where(
+                    Credential.id == credential_id,
+                    Credential.owner_user_id == user_id,
+                    Credential.status != CredentialStatus.REVOKED.value,
+                )
+            ).scalar_one_or_none()
+            if record is None:
+                raise NikeAuthError(
+                    "NIKE_CREDENTIAL_CHANGED", "要重新验证的账号不存在或已断开", 409
+                )
+        else:
+            record = None
         attempt = NikeAuthAttempt(
             owner_user_id=user_id,
             auth_session_id=auth_session_id,
@@ -396,16 +449,14 @@ def verify_attempt(
         _expire_row(row, now)
 
         if row.state == NikeAuthState.CONNECTED.value:
-            record = session.execute(
-                select(Credential).where(Credential.owner_user_id == user_id)
-            ).scalar_one_or_none()
+            record = session.get(Credential, row.result_credential_id) if row.result_credential_id else None
             if (
                 record is not None
+                and record.owner_user_id == user_id
                 and record.status != CredentialStatus.REVOKED.value
-                and row.result_credential_id == record.id
                 and row.result_generation == record.binding_generation
             ):
-                return credential_view(settings, user_id)
+                return credential_view(settings, user_id, record.id)
             raise NikeAuthError("NIKE_CREDENTIAL_CHANGED", "绑定已变更，请刷新页面", 409)
         if row.state == NikeAuthState.VERIFYING.value:
             raise NikeAuthError("NIKE_AUTH_IN_PROGRESS", "验证码校验处理中", 409)
@@ -548,9 +599,14 @@ def _install_tokens(
         auth = session.execute(
             select(AuthSession).where(AuthSession.id == auth_session_id)
         ).scalar_one_or_none()
-        record = session.execute(
-            select(Credential).where(Credential.owner_user_id == user_id).with_for_update()
-        ).scalar_one_or_none()
+        base_id = row.base_credential_id if row is not None else None
+        base_record: Credential | None = None
+        if base_id is not None:
+            base_record = session.execute(
+                select(Credential).where(Credential.id == base_id).with_for_update()
+            ).scalar_one_or_none()
+            if base_record is not None and base_record.owner_user_id != user_id:
+                base_record = None
 
         valid = (
             row is not None
@@ -560,8 +616,8 @@ def _install_tokens(
             and (row.operation_deadline_at is None or row.operation_deadline_at >= now)
             and auth is not None
             and auth.revoked_at is None
-            and row.base_credential_id == (record.id if record else None)
-            and row.base_generation == (record.binding_generation if record else 0)
+            and base_id == (base_record.id if base_record else None)
+            and row.base_generation == (base_record.binding_generation if base_record else 0)
         )
         if not valid:
             if row is not None and row.state == NikeAuthState.VERIFYING.value:
@@ -584,7 +640,8 @@ def _install_tokens(
             session.commit()
             raise NikeAuthError("NIKE_PHONE_CONNECT_UNAVAILABLE", "该手机号已绑定其他平台账号", 409)
 
-        if record is None:
+        if base_id is None:
+            # 新增账号：一个平台用户可以绑多个 Nike 账号，各占一行。
             record = Credential(
                 owner_user_id=user_id,
                 binding_generation=1,
@@ -593,6 +650,8 @@ def _install_tokens(
             session.add(record)
             session.flush()
         else:
+            assert base_record is not None  # validated above
+            record = base_record
             record.binding_generation += 1
         apply_tokens_locked(
             record,
@@ -626,20 +685,21 @@ def _install_tokens(
         raise NikeAuthError("NIKE_PHONE_CONNECT_UNAVAILABLE", "该手机号已绑定其他平台账号", 409) from exc
     finally:
         session.close()
-    return credential_view(settings, user_id)
+    return credential_view(settings, user_id, record.id)
 
 
 # ----------------------------------------------------------------- lifecycle
 
 
-def disconnect(*, settings: Settings, user_id: UUID) -> None:
-    """Local disconnect: revoke the binding and cancel every pending attempt."""
+def disconnect(*, settings: Settings, user_id: UUID, credential_id: UUID) -> None:
+    """Local disconnect of one account; cancels this user's pending attempts."""
     now = datetime.now(UTC)
     session = SessionLocal()
     try:
-        service = CredentialService(settings, user_id)
+        service = CredentialService(settings, user_id, credential_id=credential_id)
         service.lock_for_update(session)
-        service.revoke_local(session)
+        if not service.revoke_local(session):
+            raise NikeAuthError("NIKE_CREDENTIAL_NOT_FOUND", "账号不存在或已断开", 404)
         rows = session.execute(
             select(NikeAuthAttempt).where(
                 NikeAuthAttempt.owner_user_id == user_id,
@@ -651,6 +711,26 @@ def disconnect(*, settings: Settings, user_id: UUID) -> None:
         session.commit()
     finally:
         session.close()
+
+
+def disconnect_all(*, settings: Settings, user_id: UUID) -> int:
+    """Revoke every active account of this user (钉钉「确认注销」/全量断开）。"""
+    with SessionLocal() as session:
+        credential_ids = list(
+            session.execute(
+                select(Credential.id).where(
+                    Credential.owner_user_id == user_id,
+                    Credential.status != CredentialStatus.REVOKED.value,
+                )
+            ).scalars()
+        )
+    for credential_id in credential_ids:
+        try:
+            disconnect(settings=settings, user_id=user_id, credential_id=credential_id)
+        except NikeAuthError:
+            # 已被并发断开：无需重复处理，也不该打断其余账号的注销。
+            continue
+    return len(credential_ids)
 
 
 def cancel_for_auth_session(*, user_id: UUID, auth_session_id: UUID) -> int:
@@ -769,12 +849,13 @@ def _advisory_locks(session: Session, user_id: UUID, phone_hash: str, ip_hash: s
 
 
 def _base_binding_unchanged(session: Session, row: NikeAuthAttempt) -> bool:
-    record = session.execute(
-        select(Credential).where(Credential.owner_user_id == row.owner_user_id)
-    ).scalar_one_or_none()
-    return row.base_credential_id == (record.id if record else None) and row.base_generation == (
-        record.binding_generation if record else 0
-    )
+    """基行未被替换/吊销（新增账号的尝试没有基行，任何并发绑定都不影响它）。"""
+    if row.base_credential_id is None:
+        return True
+    record = session.get(Credential, row.base_credential_id)
+    if record is None or record.owner_user_id != row.owner_user_id:
+        return False
+    return row.base_generation == record.binding_generation
 
 
 def _attempt_view(

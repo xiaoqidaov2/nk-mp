@@ -164,7 +164,7 @@ SELECT total_stores, jsonb_array_length(style_codes) FROM scan_job ORDER BY crea
 
 | 步骤 | 端点 | 每轮（147 店 × 31 款 × 20 尺码）| 说明 |
 | --- | --- | --- | --- |
-| ① 取 GTIN | `store_number/{店}?productCodes=…` | 147 × ⌈31/30⌉ = **294** | 门店级；≤30 货号/请求；免 token、0% WAF |
+| ① 取 GTIN | `store_number/{店}?productCodes=…`（批量已于 2026-10-13 被上游收回：401/403，客户端逐款回落，最坏 = 147 × 31 = **4,557**） | 147 × ⌈31/30⌉ = **294** | 门店级；≤30 货号/请求；免 token、0% WAF（回落路径同域、仍不计费，但请求数变多） |
 | ② 可用性 | `PUT/GET cart_reviews/v2` | 147 × ⌈620/50⌉ × 2 = **3,822** | 50 GTIN 可跨款；PUT 后立即 GET 即有结果 |
 | ③ 价格 | — | **0** | **线上价**随 feed 回来；**门店价**仍取自 `cart_reviews` 的 `itemCosts.priceInfo` |
 | 合计 | | **4,116** | 现状 13,671 → **−70%** |

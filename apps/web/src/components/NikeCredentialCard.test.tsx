@@ -12,7 +12,7 @@ import { NikeCredentialCard } from "./NikeCredentialCard";
 
 vi.mock("@/data/api", () => ({
   nikeCredentialApi: {
-    status: vi.fn(),
+    list: vi.fn(),
     start: vi.fn(),
     attempt: vi.fn(),
     verify: vi.fn(),
@@ -32,7 +32,7 @@ vi.mock("@/auth/AuthContext", () => ({
   useAuth: () => ({ user: state.user, canWrite: state.canWrite, isOps: false, loading: false }),
 }));
 
-const statusMock = vi.mocked(nikeCredentialApi.status);
+const listMock = vi.mocked(nikeCredentialApi.list);
 const startMock = vi.mocked(nikeCredentialApi.start);
 const attemptMock = vi.mocked(nikeCredentialApi.attempt);
 const verifyMock = vi.mocked(nikeCredentialApi.verify);
@@ -45,12 +45,15 @@ const CONSENT = "我同意本平台使用我的 Nike 账号进行只读采集并
 
 function credential(overrides: Partial<NikeCredentialOut> = {}): NikeCredentialOut {
   return {
+    id: "cred-1",
     status: "NOT_CONNECTED",
     phone_masked: null,
     access_expires_at: null,
     last_refreshed_at: null,
     last_error_code: null,
     binding_generation: null,
+    cooldown_until: null,
+    cooldown_reason: null,
     login_available: true,
     ...overrides,
   };
@@ -162,7 +165,7 @@ describe("NikeCredentialCard", () => {
     state.user = { id: "user-a" };
     state.canWrite = true;
     sessionStorage.clear();
-    statusMock.mockReset();
+    listMock.mockReset();
     startMock.mockReset();
     attemptMock.mockReset();
     verifyMock.mockReset();
@@ -170,7 +173,7 @@ describe("NikeCredentialCard", () => {
     disconnectMock.mockReset();
     bootstrapMock.mockReset();
     startBootstrapMock.mockReset();
-    statusMock.mockResolvedValue(credential());
+    listMock.mockResolvedValue([]);
     attemptMock.mockResolvedValue(attempt());
     bootstrapMock.mockResolvedValue(plan());
   });
@@ -386,10 +389,13 @@ describe("NikeCredentialCard", () => {
   });
 
   it("disables sending when the login switch is off instead of faking success", async () => {
-    statusMock.mockResolvedValue(credential({ login_available: false }));
+    listMock.mockResolvedValue([
+      credential({ status: "NEEDS_AUTHORIZATION", login_available: false }),
+    ]);
 
     renderCard();
-    await openConnectModal();
+    // 已有账号时入口是“再绑一个账号”（connect 模式，不指定 credential_id）。
+    await openConnectModal("再绑一个账号");
     expect(await screen.findByText("Nike 短信验证暂未开放")).toBeInTheDocument();
 
     await fillPhoneAndConsent();
@@ -415,16 +421,16 @@ describe("NikeCredentialCard", () => {
   });
 
   it("disconnects the account and refreshes the credential state", async () => {
-    statusMock.mockResolvedValue(
-      credential({ status: "ACTIVE", phone_masked: "138****0000", binding_generation: 1 }),
-    );
+    listMock.mockResolvedValue([
+      credential({ id: "cred-a", status: "ACTIVE", phone_masked: "138****0000", binding_generation: 1 }),
+    ]);
     disconnectMock.mockResolvedValue(undefined);
 
     renderCard();
     expect(await screen.findByText("已连接（自动续期）")).toBeInTheDocument();
-    // 自动续期下不展示到期时间：只保留“最近续期”，避免误导。
+    // 自动续期下不展示到期时间，避免误导。
     expect(screen.queryByText("有效期至")).not.toBeInTheDocument();
-    expect(screen.getByText("最近续期")).toBeInTheDocument();
+    expect(screen.getByText("138****0000")).toBeInTheDocument();
 
     await click("断开连接");
     // Destructive actions require the §2.2 confirmation dialog.
@@ -433,13 +439,53 @@ describe("NikeCredentialCard", () => {
     ).toBeInTheDocument();
     expect(disconnectMock).not.toHaveBeenCalled();
     await clickModalConfirm("断开连接");
-    await waitFor(() => expect(disconnectMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(disconnectMock).toHaveBeenCalledWith("cred-a"));
+  });
+
+  it("lists every bound account and disconnects only the chosen row", async () => {
+    listMock.mockResolvedValue([
+      credential({ id: "cred-a", status: "ACTIVE", phone_masked: "138****0001", binding_generation: 1 }),
+      credential({
+        id: "cred-b",
+        status: "NEEDS_AUTHORIZATION",
+        phone_masked: "139****0002",
+        binding_generation: 1,
+        cooldown_until: new Date(Date.now() + 1_800_000).toISOString(),
+        cooldown_reason: "throttled",
+      }),
+    ]);
+    disconnectMock.mockResolvedValue(undefined);
+
+    renderCard();
+
+    // 两个账号渲染两行，并显示账号总数。
+    expect(await screen.findByText("共 2 个账号")).toBeInTheDocument();
+    expect(screen.getByText("138****0001")).toBeInTheDocument();
+    expect(screen.getByText("139****0002")).toBeInTheDocument();
+    // 冷却中的账号只显示恢复时刻（HH:MM），不显示后端原因码。
+    expect(screen.getByText(/^冷却至 \d{2}:\d{2}$/)).toBeInTheDocument();
+    expect(screen.queryByText("throttled")).not.toBeInTheDocument();
+
+    const disconnectButtons = screen
+      .queryAllByRole("button")
+      .filter((button) => (button.textContent ?? "").replace(/\s+/g, "") === "断开连接");
+    expect(disconnectButtons).toHaveLength(2);
+    await act(async () => {
+      fireEvent.click(disconnectButtons[1]);
+    });
+
+    expect(
+      await screen.findByText("断开 Nike 账号连接？", { selector: ".ant-modal-confirm-title" }),
+    ).toBeInTheDocument();
+    await clickModalConfirm("断开连接");
+    await waitFor(() => expect(disconnectMock).toHaveBeenCalledWith("cred-b"));
+    expect(disconnectMock).toHaveBeenCalledTimes(1);
   });
 
   it("opens the reauth flow in the modal and warns about rebuilding the baseline", async () => {
-    statusMock.mockResolvedValue(
-      credential({ status: "ACTIVE", phone_masked: "138****0000", binding_generation: 1 }),
-    );
+    listMock.mockResolvedValue([
+      credential({ id: "cred-a", status: "ACTIVE", phone_masked: "138****0000", binding_generation: 1 }),
+    ]);
 
     renderCard();
     await screen.findByText("已连接（自动续期）");

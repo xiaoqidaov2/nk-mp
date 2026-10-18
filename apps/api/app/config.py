@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="NIKE_MP_", extra="ignore")
 
     database_url: str = "postgresql+psycopg://nike_mp:nike_mp@db:5432/nike_mp"
+    #: 连接池：一个 worker 作业里最多 `store_concurrency` 个门店线程各持一个会话
+    #: （外加心跳/主线程），SQLAlchemy 默认 5+10 会被打满（实测出现 QueuePool 超时，
+    #: 门店被标成 UNEXPECTED_STATUS）。
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
     credential_key: str = ""
     session_ttl_hours: int = 12
     cookie_secure: bool = False
@@ -48,6 +53,9 @@ class Settings(BaseSettings):
     request_retry_base_seconds: float = 1.5
     request_retry_max_seconds: float = 8.0
     structure_ttl_days: int = 7
+    #: 负结果（该店该款没有尺码表）的缓存时长（秒）：上游契约变化（如批量端点被收回）
+    #: 绝不能被缓存 7 天——那时所有**新货号**都会全店读成"缺尺码"。
+    structure_missing_ttl_seconds: int = 1800
 
     worker_lease_seconds: int = 120
     #: 绑定后预加载（门店目录）任务的租约时长（秒）。
@@ -68,6 +76,9 @@ class Settings(BaseSettings):
     push_backoff_seconds: str = "60,300,900"
     #: 单个 worker 循环处理的投递条数。
     push_drain_batch: int = 10
+    #: 无任务作业（手动「立即检查」）是否提醒**售罄**：默认关闭（客户要求「售空不要通知」）。
+    #: 定时任务按各自的 notify_on_sold_out 开关，与此无关。
+    push_sold_out_default: bool = False
     #: 允许推送到内网/回环地址（仅离线冒烟需要，生产保持 False）。
     push_allow_private_targets: bool = False
 
@@ -76,7 +87,6 @@ class Settings(BaseSettings):
 
     #: 门店目录缓存的保鲜期（秒）：到期后调度器会用该用户自己的连接自动重取。
     catalog_ttl_seconds: int = 86400
-    worker_heartbeat_seconds: int = 20
     worker_poll_seconds: float = 3.0
     #: 同一任务失败门店自动补跑的总轮数上限（原作业算第 0 轮）。
     job_max_attempts: int = 3
@@ -84,6 +94,19 @@ class Settings(BaseSettings):
     job_retry_delay_seconds: int = 60
     #: 派发粒度：越小越及时，代价是每分钟多一次轻查询（默认 10s）。
     scheduler_interval_seconds: int = 10
+    #: 派发互斥的 advisory lock key（多 scheduler 实例：抢不到锁的跳过这一拍 = 主备自动接替）。
+    dispatch_lock_key: int = 0x4E4B4D500001
+    #: 监控服务轮询间隔（秒）：核对心跳与迟到任务。
+    monitor_interval_seconds: int = 60
+    #: 实例心跳超过这么久没有更新就算掉线（scheduler/worker/monitor 共用）。
+    monitor_stale_seconds: int = 60
+    #: 掉线/换代实例在报告里继续保留多久（秒）：崩溃的实例在窗口内可见并告警，
+    #: 之后自动退场，不让每次发版换掉的容器长期占着"调度心跳超时"。
+    monitor_instance_window_seconds: int = 900
+    #: 心跳行的硬保留时长（秒）：超过就删除（实例 ID 每次启动都不同，表会按实例累积）。
+    monitor_heartbeat_retention_seconds: int = 86400
+    #: 任务超过 ``next_run_at`` 这么久且没有作业/没有可用账号才算"迟到"。
+    monitor_overdue_grace_seconds: int = 300
     default_cadence_seconds: int = 1800
     #: 派发成功后给下一轮时间加的随机右移上限（秒）；实际抖动 ≤ 间隔的 10%。
     #: 多个任务同一间隔时避免同秒齐发、把小时额度瞬间打满。
@@ -93,6 +116,10 @@ class Settings(BaseSettings):
     dispatch_merge_window_seconds: float = 90.0
     #: 每个 (门店, 货号, 尺码) 保留的历史观测条数：间隔小、量大，历史只用于回溯。
     observation_history_limit: int = 30
+    #: 同一 (用户, 账号, 门店, 原因) 的「检查失败」诊断事件的最小间隔（秒）。
+    #: 30 秒档 + 一个缺尺码的货号会让每家门店每轮都失败：不节流会把变化流水
+    #: 刷成整页"检查失败"，真正的补货/售罄反而被埋掉。0 = 每作业一条（旧口径）。
+    scan_failed_event_window_seconds: int = 21600
     daily_review_budget: int = 60000
     quota_hourly_cap: int = 900
     quota_hourly_slow_line: int = 600
@@ -100,8 +127,9 @@ class Settings(BaseSettings):
     throttle_backoff_seconds: str = "300,900,1800,3600"
     #: 同类冷却通知的最小间隔（秒）；默认 8 小时 => 每 24 小时最多 3 条。
     throttle_notice_interval_seconds: int = 28800
-    #: 405 挑战风暴熔断：一轮里这么多家门店被 WAF 挑战打满重试就整轮结束并进入冷却
-    #: （0 = 关闭；需求 D-NFR-RATE-06 的 15% 阈值在 160 店规模上约合 3 家门店）。
+    #: 405 挑战风暴熔断：一轮里这么多家门店被 WAF 挑战打满重试就整轮结束并进入冷却。
+    #: 实际阈值 = max(本值, ceil(0.15 × 本轮门店数))（需求 D-NFR-RATE-06 的 15% 健康线）；
+    #: 本值是**下限**，0 = 关闭熔断。
     waf_storm_store_limit: int = 0
     # ---- 出口池与指纹轮换（见 docs/cadence-throttle.md「容量」）----
     #: 上游出口代理列表（JSON 数组，如 ["http://1.2.3.4:8080"]）；空=直连。

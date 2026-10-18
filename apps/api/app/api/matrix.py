@@ -4,11 +4,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_session, get_db, settings_dep
-from app.config import Settings
+from app.api.deps import get_current_session, get_db
 from app.models import AuthSession, GtinStructure, ObservationLatest, Store, Style, User
 from app.schemas import MatrixCell, MatrixOut
-from app.services.credentials import CredentialError, CredentialService
+from app.services.credentials import current_binding_condition
 
 router = APIRouter(prefix="/matrix", tags=["matrix"])
 
@@ -19,13 +18,13 @@ def get_matrix(
     store_codes: str = Query(default="", description="comma separated store codes"),
     db: Session = Depends(get_db),
     payload: tuple[User, AuthSession] = Depends(get_current_session),
-    settings: Settings = Depends(settings_dep),
 ) -> MatrixOut:
     """Latest personal state for one style.
 
-    Only rows written by the caller's *current* credential binding are shown:
-    a previous account's prices are not the current account's prices. Without
-    a usable binding the page still renders, with empty cells.
+    Only rows written by the caller's *current* accounts are shown: a previous
+    account's prices are not the current account's prices. 一用户多账号时按
+    账号集合过滤（任一仍在、且 generation 未变）。Without any live account the
+    page still renders, with empty cells.
     """
     user = payload[0]
     code = style_code.strip().upper()
@@ -42,21 +41,18 @@ def get_matrix(
     stores = list(db.execute(store_stmt.order_by(Store.store_code)).scalars())
     store_ids = [store.id for store in stores]
 
-    binding = None
-    try:
-        binding = CredentialService(settings, user.id).binding()
-    except CredentialError:
-        binding = None
-
     rows = []
-    if binding is not None and store_ids:
+    if store_ids:
         rows = db.execute(
             select(ObservationLatest).where(
                 ObservationLatest.style_id == style.id,
                 ObservationLatest.store_id.in_(store_ids),
                 ObservationLatest.owner_user_id == user.id,
-                ObservationLatest.credential_id == binding.credential_id,
-                ObservationLatest.credential_generation == binding.generation,
+                current_binding_condition(
+                    user.id,
+                    ObservationLatest.credential_id,
+                    ObservationLatest.credential_generation,
+                ),
             )
         ).scalars().all()
 

@@ -5,7 +5,7 @@ import { Link, useNavigate } from "react-router-dom";
 
 import { EmptyState } from "@/components/EmptyState";
 import { CardRow, ResponsiveList } from "@/components/MobileCardList";
-import { NikeConnectionNotice, isCredentialActive, useNikeCredentialQuery } from "@/components/NikeCredentialCard";
+import { NikeConnectionNotice, isCredentialActive, useNikeCredentialsQuery } from "@/components/NikeCredentialCard";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { StatusPill } from "@/components/StatusPill";
@@ -41,8 +41,8 @@ export function TasksPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { message, modal } = AntdApp.useApp();
-  const credential = useNikeCredentialQuery();
-  const bound = isCredentialActive(credential.data?.status);
+  const credentials = useNikeCredentialsQuery();
+  const bound = credentials.data?.some((row) => isCredentialActive(row.status)) ?? false;
   const [scope, setScope] = useState<{ task: MonitorTask; kind: "sizes" | "stores" | "cadence" } | null>(null);
 
   const tasks = useQuery<MonitorTask[]>({ queryKey: ["tasks"], queryFn: () => taskApi.list() });

@@ -1,11 +1,11 @@
-import { Alert, App as AntdApp, Button, Descriptions, Space, Tag, Typography } from "antd";
+import { Alert, App as AntdApp, Button, Descriptions, Space, Table, Tag, Typography } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
 import { useAuth } from "@/auth/AuthContext";
-import { BTN, ERR, MSG, MODALS, formatDateTimeSeconds } from "@/copy";
+import { ACCOUNT, BTN, ERR, MSG, MODALS, formatClock } from "@/copy";
 import { nikeCredentialApi } from "@/data/api";
 import type { NikeCredentialOut, NikeCredentialStatus } from "@/data/types";
 import { useBootstrapQuery } from "@/hooks/useBootstrapQuery";
@@ -25,12 +25,13 @@ export function isCredentialActive(status: NikeCredentialStatus | undefined): bo
   return status === "ACTIVE" || status === "EXPIRING";
 }
 
-export function useNikeCredentialQuery() {
+/** 本人已绑定的全部 Nike 账号；空数组＝未连接。 */
+export function useNikeCredentialsQuery() {
   const { user } = useAuth();
   const userId = user?.id ?? "";
-  return useQuery<NikeCredentialOut>({
-    queryKey: ["nike-credential", userId],
-    queryFn: () => nikeCredentialApi.status(),
+  return useQuery<NikeCredentialOut[]>({
+    queryKey: ["nike-credentials", userId],
+    queryFn: () => nikeCredentialApi.list(),
     enabled: Boolean(userId),
     retry: false,
     staleTime: 15_000,
@@ -57,8 +58,10 @@ function invalidatePersonalData(client: QueryClient): void {
  * backend still rejects unbound requests independently.
  */
 export function NikeConnectionNotice({ action }: { action: string }) {
-  const credential = useNikeCredentialQuery();
-  if (!credential.data || isCredentialActive(credential.data.status)) return null;
+  const credentials = useNikeCredentialsQuery();
+  const rows = credentials.data;
+  // 未拿到数据前不提示；有一个可用账号即视为已连接。
+  if (!rows || rows.some((row) => isCredentialActive(row.status))) return null;
   return (
     <Alert
       type="warning"
@@ -74,29 +77,33 @@ export function NikeConnectionNotice({ action }: { action: string }) {
 }
 
 /**
- * 连接状态卡：只展示状态与入口动作，绑定/重新验证的输入流程在弹窗内完成。
+ * 连接状态卡：列出本人已绑定的每个 Nike 账号，逐个可重新验证或断开；
+ * 绑定/重新验证的输入流程在弹窗内完成。
  */
 export function NikeCredentialCard() {
   const { user } = useAuth();
   const userId = user?.id ?? "";
   const queryClient = useQueryClient();
   const { message, modal } = AntdApp.useApp();
-  const credential = useNikeCredentialQuery();
+  const credentials = useNikeCredentialsQuery();
   const bootstrap = useBootstrapQuery();
   const [connectOpen, setConnectOpen] = useState(false);
   const [mode, setMode] = useState<"connect" | "reauth">("connect");
+  const [targetId, setTargetId] = useState<string | undefined>(undefined);
+
+  const rows = credentials.data ?? [];
 
   const disconnect = useMutation({
-    mutationFn: () => nikeCredentialApi.disconnect(),
+    mutationFn: (credentialId: string) => nikeCredentialApi.disconnect(credentialId),
     onSuccess: () => {
       message.success(MSG.disconnected());
-      void queryClient.invalidateQueries({ queryKey: ["nike-credential", userId] });
+      void queryClient.invalidateQueries({ queryKey: ["nike-credentials", userId] });
       invalidatePersonalData(queryClient);
     },
     onError: () => message.error(ERR.commonFailure),
   });
 
-  const confirmDisconnect = () => {
+  const confirmDisconnect = (credentialId: string) => {
     const tpl = MODALS.disconnectNike();
     modal.confirm({
       title: tpl.title,
@@ -104,24 +111,30 @@ export function NikeCredentialCard() {
       okText: tpl.okText,
       cancelText: tpl.cancelText,
       okButtonProps: { danger: true },
-      onOk: () => disconnect.mutate(),
+      onOk: () => disconnect.mutateAsync(credentialId),
     });
   };
 
-  const openConnect = (nextMode: "connect" | "reauth") => {
+  const openConnect = (nextMode: "connect" | "reauth", credentialId?: string) => {
     setMode(nextMode);
+    setTargetId(credentialId);
     setConnectOpen(true);
   };
 
-  const status = credential.data?.status ?? "NOT_CONNECTED";
-  const active = isCredentialActive(status);
+  const closeConnect = () => {
+    setConnectOpen(false);
+    setTargetId(undefined);
+  };
+
   const plan = bootstrap.data;
   const retryBootstrap = () => {
     void nikeCredentialApi.startBootstrap().then(() => bootstrap.refetch());
   };
+  // 列表为空时没有账号可读短信开关：默认开放，真实限制由服务端提交时兜底。
+  const loginAvailable = rows.length === 0 || rows.some((row) => row.login_available);
 
   return (
-    <SectionCard title="Nike 账号连接" extra={<Tag color="default">{CARD_SUBTITLE}</Tag>}>
+    <SectionCard title={ACCOUNT.listTitle} extra={<Tag color="default">{CARD_SUBTITLE}</Tag>}>
       <Space direction="vertical" size={12} style={{ width: "100%" }}>
         <Alert type="info" showIcon message={CARD_SUBTITLE} description={CARD_DECLARATION} />
 
@@ -129,55 +142,88 @@ export function NikeCredentialCard() {
           <CatalogProgress plan={plan} compact onRetry={retryBootstrap} />
         ) : null}
 
-        {credential.isLoading ? null : active ? (
+        {credentials.isLoading ? null : rows.length > 0 ? (
           <Space direction="vertical" size={12} style={{ width: "100%" }}>
-            <Descriptions size="small" column={{ xs: 1, md: 2 }}>
-              <Descriptions.Item label="状态">
-                <StatusPill domain="credential" value={status} />
-              </Descriptions.Item>
-              <Descriptions.Item label="已连接手机号">
-                {credential.data?.phone_masked || "—"}
-              </Descriptions.Item>
-              <Descriptions.Item label="最近续期">
-                {credential.data?.last_refreshed_at
-                  ? formatDateTimeSeconds(credential.data.last_refreshed_at)
-                  : "—"}
-              </Descriptions.Item>
-            </Descriptions>
-            <Typography.Text type="secondary">{CARD_RENEWAL_NOTE}</Typography.Text>
+            <Typography.Text type="secondary">{ACCOUNT.count(rows.length)}</Typography.Text>
+            {rows.some((row) => row.status === "NEEDS_AUTHORIZATION") ? (
+              <Alert
+                type="warning"
+                showIcon
+                message="有账号需要重新验证后才能继续读取数据。"
+              />
+            ) : null}
             <Alert type="warning" showIcon message={MODALS.changeAccount().content} />
+            <Table<NikeCredentialOut>
+              size="small"
+              rowKey="id"
+              pagination={false}
+              dataSource={rows}
+              columns={[
+                {
+                  title: ACCOUNT.colStatus,
+                  dataIndex: "status",
+                  width: 170,
+                  render: (value: NikeCredentialStatus) => (
+                    <StatusPill domain="credential" value={value} />
+                  ),
+                },
+                {
+                  title: ACCOUNT.colPhone,
+                  dataIndex: "phone_masked",
+                  render: (value: string | null) => value || "—",
+                },
+                {
+                  title: ACCOUNT.colCooldown,
+                  dataIndex: "cooldown_until",
+                  width: 130,
+                  render: (_: string | null, row) => {
+                    // 只有还没到恢复时间才提示；过期残留值不显示。
+                    if (!row.cooldown_until) return "—";
+                    const until = Date.parse(row.cooldown_until);
+                    if (Number.isNaN(until) || until <= Date.now()) return "—";
+                    return ACCOUNT.coolingUntil(formatClock(row.cooldown_until));
+                  },
+                },
+                {
+                  title: ACCOUNT.colActions,
+                  key: "actions",
+                  width: 210,
+                  render: (_: unknown, row) => (
+                    <Space size={8} wrap>
+                      <Button size="small" onClick={() => openConnect("reauth", row.id)}>
+                        {BTN.reauth}
+                      </Button>
+                      <Button
+                        size="small"
+                        danger
+                        loading={disconnect.isPending && disconnect.variables === row.id}
+                        onClick={() => confirmDisconnect(row.id)}
+                      >
+                        {BTN.disconnect}
+                      </Button>
+                    </Space>
+                  ),
+                },
+              ]}
+            />
+            <Typography.Text type="secondary">{CARD_RENEWAL_NOTE}</Typography.Text>
             <Space wrap>
               <Button
                 type="primary"
                 className="touch-target"
-                onClick={() => openConnect("reauth")}
+                onClick={() => openConnect("connect")}
               >
-                {BTN.reauth}
-              </Button>
-              <Button
-                danger
-                className="touch-target"
-                loading={disconnect.isPending}
-                onClick={confirmDisconnect}
-              >
-                {BTN.disconnect}
+                {ACCOUNT.addAnother}
               </Button>
             </Space>
           </Space>
         ) : (
           <Space direction="vertical" size={12} style={{ width: "100%" }}>
             <Descriptions size="small" column={1}>
-              <Descriptions.Item label="状态">
-                <StatusPill domain="credential" value={status} />
+              <Descriptions.Item label={ACCOUNT.colStatus}>
+                <StatusPill domain="credential" value="NOT_CONNECTED" />
               </Descriptions.Item>
             </Descriptions>
-            {status === "NEEDS_AUTHORIZATION" || status === "REVOKED" ? (
-              <Alert
-                type="warning"
-                showIcon
-                message="当前 Nike 连接不可用，需要重新验证后才能继续读取数据。"
-              />
-            ) : null}
             <Space wrap>
               <Button
                 type="primary"
@@ -193,9 +239,10 @@ export function NikeCredentialCard() {
         <NikeConnectModal
           open={connectOpen}
           mode={mode}
-          onClose={() => setConnectOpen(false)}
-          loginAvailable={credential.data?.login_available ?? false}
-          credentialLoading={credential.isLoading}
+          credentialId={targetId}
+          onClose={closeConnect}
+          loginAvailable={loginAvailable}
+          credentialLoading={credentials.isLoading}
           onConnected={() => invalidatePersonalData(queryClient)}
         />
       </Space>

@@ -71,8 +71,9 @@ def list_tasks(
         )
         .order_by(MonitorTask.created_at.desc())
     ).scalars().all()
-    # 冷却属于账号（不是单个任务）：一次查询复用给整个列表。
-    cooldown = throttle.active(db, [user.id]).get(user.id)
+    # 冷却属于账号（不是单个任务）：一用户多账号时，只要还有可用账号就不显示冷却；
+    # 全部不可用才给出最早结束的窗口。一次查询复用给整个列表。
+    cooldown = throttle.owner_cooldowns(db, [user.id]).get(user.id)
     return [_to_out(row, cooldown) for row in rows]
 
 
@@ -134,7 +135,7 @@ def create_task(
         if "uq_monitor_task_owner_name" in detail or "monitor_task.created_by" in detail:
             return task_name_conflict_response()
         raise
-    return _to_out(task, throttle.active(db, [user.id]).get(user.id))
+    return _to_out(task, throttle.owner_cooldowns(db, [user.id]).get(user.id))
 
 
 @router.get("/{task_id}", response_model=TaskOut)
@@ -144,7 +145,7 @@ def get_task(
     payload: tuple[User, AuthSession] = Depends(get_current_session),
 ) -> TaskOut:
     user = payload[0]
-    return _to_out(_load(db, user, task_id), throttle.active(db, [user.id]).get(user.id))
+    return _to_out(_load(db, user, task_id), throttle.owner_cooldowns(db, [user.id]).get(user.id))
 
 
 @router.patch("/{task_id}", response_model=TaskOut)
@@ -193,7 +194,7 @@ def update_task(
     except StaleDataError as exc:
         db.rollback()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在") from exc
-    return _to_out(task, throttle.active(db, [user.id]).get(user.id))
+    return _to_out(task, throttle.owner_cooldowns(db, [user.id]).get(user.id))
 
 
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -85,7 +85,12 @@ def _persist_structure(
         {"size_label": entry.size_label, "gtin": entry.gtin} for entry in structure.sizes
     ]
     cached.fetched_at = now
-    cached.expires_at = now + timedelta(days=settings.structure_ttl_days)
+    if structure.status == "OK":
+        cached.expires_at = now + timedelta(days=settings.structure_ttl_days)
+    else:
+        # 负结果只在短窗口内有效：上游契约变化（批量端点被收回、货号暂未铺货）
+        # 绝不能被缓存 7 天，否则所有新货号会在全部门店一直读成"缺尺码"。
+        cached.expires_at = now + timedelta(seconds=max(60, settings.structure_missing_ttl_seconds))
     if structure.title and structure.title != style.style_code:
         style.title = structure.title
     return cached, changed

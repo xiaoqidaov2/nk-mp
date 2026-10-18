@@ -17,7 +17,7 @@ from app.models import Credential, NotificationChannel, NotificationDelivery
 from app.security import encrypt_secret, secret_fingerprint
 from app.services import quota, throttle
 
-from .helpers import make_tenant, make_user, store_credential
+from .helpers import add_credential, make_tenant, make_user, store_credential
 
 
 def _seed_owner(*, with_channel: bool = True):
@@ -42,8 +42,8 @@ def _seed_owner(*, with_channel: bool = True):
             )
         db.commit()
         user_id = user.id
-    store_credential(settings, user_id)
-    return settings, user_id
+    binding = store_credential(settings, user_id)
+    return settings, user_id, binding.credential_id
 
 
 def _record(db, owner_id) -> Credential:
@@ -53,44 +53,44 @@ def _record(db, owner_id) -> Credential:
 
 
 def test_throttled_hits_escalate_the_ladder_and_cap_it() -> None:
-    settings, owner_id = _seed_owner()
+    settings, owner_id, credential_id = _seed_owner()
     with SessionLocal() as db:
-        first = throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        first = throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         assert first is not None
         assert 290 <= (first - datetime.now(UTC)).total_seconds() <= 305
         assert _record(db, owner_id).cooldown_level == 1
 
-        second = throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        second = throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         assert second is not None
         assert 890 <= (second - datetime.now(UTC)).total_seconds() <= 905
         assert _record(db, owner_id).cooldown_level == 2
 
-        third = throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        third = throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         assert third is not None and 1790 <= (third - datetime.now(UTC)).total_seconds() <= 1805
         assert _record(db, owner_id).cooldown_level == 3
 
-        fourth = throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        fourth = throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         assert fourth is not None and 3590 <= (fourth - datetime.now(UTC)).total_seconds() <= 3605
         assert _record(db, owner_id).cooldown_level == 4
 
         # 已在末档：继续命中保持 3600 秒，不再升级。
-        fifth = throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        fifth = throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         assert fifth is not None and 3590 <= (fifth - datetime.now(UTC)).total_seconds() <= 3605
         assert _record(db, owner_id).cooldown_level == 4
 
 
 def test_budget_reason_keeps_the_ladder_and_never_shortens_a_window() -> None:
-    settings, owner_id = _seed_owner()
+    settings, owner_id, credential_id = _seed_owner()
     now = datetime.now(UTC)
     expected = quota.resume_at_for("platform_hourly_budget", now)
     assert expected is not None
     with SessionLocal() as db:
-        until = throttle.enter(db, settings, owner_id, "platform_hourly_budget")
+        until = throttle.enter(db, settings, credential_id=credential_id, reason="platform_hourly_budget")
         db.commit()
         assert until is not None
         assert abs((until - expected).total_seconds()) <= 2
@@ -105,7 +105,7 @@ def test_budget_reason_keeps_the_ladder_and_never_shortens_a_window() -> None:
         record.cooldown_reason = throttle.THROTTLED_REASON
         db.commit()
 
-        again = throttle.enter(db, settings, owner_id, "tenant_budget")
+        again = throttle.enter(db, settings, credential_id=credential_id, reason="tenant_budget")
         db.commit()
         record = _record(db, owner_id)
         assert again is not None and abs((again - longer).total_seconds()) <= 2
@@ -114,9 +114,9 @@ def test_budget_reason_keeps_the_ladder_and_never_shortens_a_window() -> None:
 
 
 def test_notices_are_gated_by_the_interval() -> None:
-    settings, owner_id = _seed_owner()
+    settings, owner_id, credential_id = _seed_owner()
     with SessionLocal() as db:
-        throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         rows = db.execute(select(NotificationDelivery)).scalars().all()
         assert len(rows) == 1
@@ -126,7 +126,7 @@ def test_notices_are_gated_by_the_interval() -> None:
         assert "被 Nike 限速" in notice.body and "自动继续" in notice.body
 
         # 间隔内再次进入（含升级）不再发第二条。
-        throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         assert len(db.execute(select(NotificationDelivery)).scalars().all()) == 1
 
@@ -136,17 +136,17 @@ def test_notices_are_gated_by_the_interval() -> None:
             seconds=settings.throttle_notice_interval_seconds + 60
         )
         db.commit()
-        throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
         assert len(db.execute(select(NotificationDelivery)).scalars().all()) == 2
 
 
 def test_clear_resets_the_ladder_but_keeps_an_active_window() -> None:
-    settings, owner_id = _seed_owner(with_channel=False)
+    settings, owner_id, credential_id = _seed_owner(with_channel=False)
     with SessionLocal() as db:
-        throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
         db.commit()
-        throttle.clear(db, owner_id)
+        throttle.clear(db, credential_id)
         db.commit()
         record = _record(db, owner_id)
         # 仍在生效的窗口不提前解除，但阶梯已复位。
@@ -155,24 +155,51 @@ def test_clear_resets_the_ladder_but_keeps_an_active_window() -> None:
 
         record.cooldown_until = datetime.now(UTC) - timedelta(seconds=1)
         db.commit()
-        throttle.clear(db, owner_id)
+        throttle.clear(db, credential_id)
         db.commit()
         record = _record(db, owner_id)
         assert record.cooldown_until is None
         assert record.cooldown_reason is None
 
 
-def test_active_reports_only_future_windows() -> None:
-    settings, owner_id = _seed_owner(with_channel=False)
+def test_owner_cooldown_is_reported_only_when_no_account_can_run() -> None:
+    """一用户多账号：还有可用账号时不显示冷却；全部冷却时取最早结束的窗口。"""
+    settings, owner_id, credential_id = _seed_owner(with_channel=False)
+    second_id = add_credential(settings, owner_id)
+    now = datetime.now(UTC)
     with SessionLocal() as db:
-        throttle.enter(db, settings, owner_id, throttle.THROTTLED_REASON)
+        first = db.get(Credential, credential_id)
+        first.cooldown_until = now + timedelta(minutes=30)
+        first.cooldown_reason = throttle.THROTTLED_REASON
         db.commit()
-        cooldown = throttle.current(db, owner_id)
+        # 另一个账号仍然可用：用户的页面/钉钉里不应该出现"冷却"。
+        assert throttle.owner_cooldowns(db, [owner_id]) == {}
+
+        second = db.get(Credential, second_id)
+        second.cooldown_until = now + timedelta(minutes=10)
+        second.cooldown_reason = "tenant_budget"
+        db.commit()
+        cooldown = throttle.owner_cooldowns(db, [owner_id]).get(owner_id)
+        assert cooldown is not None
+        assert abs((cooldown.until - (now + timedelta(minutes=10))).total_seconds()) < 1
+        assert cooldown.reason == "tenant_budget"
+
+        # 账号被断开（没有冷却记录）不算冷却：它只是不可用。
+        db.get(Credential, second_id).status = "REVOKED"
+        under_test = db.get(Credential, credential_id)
+        under_test.cooldown_until = now - timedelta(seconds=5)
+        db.commit()
+        assert throttle.owner_cooldowns(db, [owner_id]) == {}
+    settings, owner_id, credential_id = _seed_owner(with_channel=False)
+    with SessionLocal() as db:
+        throttle.enter(db, settings, credential_id=credential_id, reason=throttle.THROTTLED_REASON)
+        db.commit()
+        cooldown = throttle.current(db, credential_id)
         assert cooldown is not None and cooldown.reason == throttle.THROTTLED_REASON
-        assert owner_id in throttle.active(db, [owner_id])
+        assert credential_id in throttle.active(db, [credential_id])
 
         record = _record(db, owner_id)
         record.cooldown_until = datetime.now(UTC) - timedelta(seconds=5)
         db.commit()
-        assert throttle.current(db, owner_id) is None
-        assert throttle.active(db, [owner_id]) == {}
+        assert throttle.current(db, credential_id) is None
+        assert throttle.active(db, [credential_id]) == {}

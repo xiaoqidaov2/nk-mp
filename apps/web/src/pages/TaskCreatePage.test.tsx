@@ -14,7 +14,7 @@ vi.mock("@/data/api", () => ({
   catalogApi: { stores: vi.fn(), styles: vi.fn() },
   taskApi: { create: vi.fn(), list: vi.fn() },
   scanApi: { create: vi.fn() },
-  nikeCredentialApi: { status: vi.fn() },
+  nikeCredentialApi: { list: vi.fn() },
 }));
 
 vi.mock("@/auth/AuthContext", () => ({
@@ -26,16 +26,19 @@ const stylesMock = vi.mocked(catalogApi.styles);
 const createTaskMock = vi.mocked(taskApi.create);
 const listTasksMock = vi.mocked(taskApi.list);
 const createScanMock = vi.mocked(scanApi.create);
-const credentialMock = vi.mocked(nikeCredentialApi.status);
+const credentialMock = vi.mocked(nikeCredentialApi.list);
 
 function activeCredential(): NikeCredentialOut {
   return {
+    id: "cred-1",
     status: "ACTIVE",
     phone_masked: "138****0000",
     access_expires_at: null,
     last_refreshed_at: null,
     last_error_code: null,
     binding_generation: 1,
+    cooldown_until: null,
+    cooldown_reason: null,
     login_available: true,
   };
 }
@@ -93,7 +96,7 @@ describe("TaskCreatePage wizard", () => {
     createTaskMock.mockResolvedValue({ id: "task-1" } as MonitorTask);
     listTasksMock.mockResolvedValue([]);
     createScanMock.mockResolvedValue({ id: "job-1" } as ScanJob);
-    credentialMock.mockResolvedValue(activeCredential());
+    credentialMock.mockResolvedValue([activeCredential()]);
   });
 
   it("submits every field that was entered on the earlier steps", async () => {
@@ -119,7 +122,7 @@ describe("TaskCreatePage wizard", () => {
       name: "我的监控任务",
       cadence_seconds: 1800,
       notify_on_restock: true,
-      notify_on_sold_out: true,
+      notify_on_sold_out: false,
       notify_on_price_change: true,
       style_codes: ["DN3707-202"],
       store_codes: [],

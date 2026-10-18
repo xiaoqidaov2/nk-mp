@@ -22,7 +22,7 @@ vi.mock("@/auth/AuthContext", () => ({
 vi.mock("@/components/NikeCredentialCard", () => ({
   NikeConnectionNotice: () => null,
   isCredentialActive: (status?: string) => status === "ACTIVE",
-  useNikeCredentialQuery: () => ({ data: { status: "ACTIVE" } }),
+  useNikeCredentialsQuery: () => ({ data: [{ status: "ACTIVE" }] }),
 }));
 
 vi.mock("@/components/PushChannelsCard", () => ({

@@ -38,8 +38,22 @@
 
 ## 账号级冷却
 
-冷却属于**账号**（`credential` 行），该账号的所有任务共享；冷却中调度器不派发
-（`next_run_at = cooldown_until`），到点自动继续。
+冷却属于**单个 Nike 账号**（`credential` 行），该账号的所有任务共享；冷却中调度器不会用这个
+账号派发（`next_run_at = cooldown_until`），到点自动继续。
+
+一用户多账号（同一个平台用户绑了多个 Nike 账号）时：
+
+- 派发按「未冷却的账号里**最近最少使用**」选号（`credentials.pick_ready`，LRU 键是
+  `credential.last_used_at`），派发成功后写 `last_used_at` 推进轮换（`mark_used`），
+  所以额度/风控只影响命中的那个账号；
+- 只要**还有**可用账号，任务照常派发，页面/钉钉不显示冷却；
+- **所有**账号都不可用（冷却或断开）时才暂停该用户的任务，并取最早结束的冷却窗口
+  （`throttle.owner_cooldowns`）；单账号被限速只冷却它自己——作业收尾（`jobs._finalize`）
+  也不会把任务顺延到该账号的窗口（只有"沿用同一账号的补跑"会等它）；
+- 同一拍同一用户的任务共用选中的账号，且**账号进合并键**：一个作业只冻结一个绑定，
+  跨账号不会合并。
+- `credential.last_attempt_at` 是**续期尝试**的时间戳（失败退避用），与派发轮换无关；
+  两者刻意分开，避免高频派发把续期退避的时间戳一直往后推。
 
 ### 进入条件
 
@@ -68,7 +82,9 @@
 - 数据库：`credential.cooldown_until / cooldown_level / cooldown_reason / cooldown_notified_at`；
   `scan_job.not_before / retry_round`；门店级原因见 `scan_job_store.error_code`（`BUDGET_EXHAUSTED`、
   `THROTTLED`）。
-- 接口：任务列表/详情返回 `cooldown_until`、`cooldown_reason`；页面显示「冷却中 · 将在 HH:mm 自动继续」。
+- 接口：任务列表/详情返回 `cooldown_until`、`cooldown_reason`（只在"没有任何可用账号"时非空）；
+  页面显示「冷却中 · 将在 HH:mm 自动继续」；`GET /ops/scheduler-health` 列出全部冷却中的账号。
+- 调度：多副本时用事务级 advisory lock（`NIKE_MP_DISPATCH_LOCK_KEY`）互斥，抢不到锁的实例跳过本拍。
 - 日志：`nike_mp.throttle`（cooldown entered / notice queued）、`nike_mp.quota`（quota rejected）、
   `nike_mp.jobs`（scheduled retry ...）。
 
@@ -100,8 +116,15 @@
 | 售罄 | `SOLD_OUT` | `notify_on_sold_out` |
 | 变价 | `PRICE_CHANGE` | `notify_on_price_change` |
 
-- **无任务作业**（手动「立即检查」、任务删除后遗留的补跑）没有任务开关可依，
-  按四类全发（标题统一为「门店检查」），不再静默丢消息。
+- **变化流水**（`GET /changes`）默认只列上表四类真实变化；诊断事件（`SCAN_FAILED`/`STRUCTURE_CHANGED`）
+  不算变化，要显式 `?event_type=SCAN_FAILED` 才返回——否则门店页/流水页会被"检查失败"刷满，
+  真正的补货与售罄被埋掉（客户实测反馈）。
+
+- **无任务作业**（手动「立即检查」、任务删除后遗留的补跑）没有任务开关可依，按平台默认
+  分类通知：补货 / 到店上新 / 变价照发，**售罄默认不发**（客户要求「售空不要通知」，
+  `NIKE_MP_PUSH_SOLD_OUT_DEFAULT=true` 可改回四类全发；标题统一为「门店检查」）。
+- **任务默认开关**：`notify_on_sold_out` 默认 **false**（迁移 `0016_sold_out_notify_off` 同时把存量
+  任务关掉）；售罄仍会写进变化流水，只是不推送。需要时在任务里单独打开。
 - 价格只在**在货尺码**上抓取，所以「一直没在货」的门店价格会缺失（`price_status=MISSING`），
   这是上游事实而不是推送故障；一旦在货并取到价格，变价即按上表推送。
 - 每用户每日推送上限（`push_max_per_day`，默认 200）到顶时不再静默丢弃：
@@ -329,10 +352,15 @@ HTTPS 到 Nike 的大陆出口）。剩下的唯一变量只有**付费的大陆
   判定标准：比直连低 ≥20pp 才认为地理/类型是有效杠杆。
 - 注意：这两轮里 **403 与 405 都是拦截**（同一 URL 两种码），统计时必须一起算。
 
-**405 挑战风暴熔断**：线上实测（160 店/轮）worker 日志里 405 占全部上游尝试的 **57%**，
-一轮 7–11 家门店因 `WAF_CHALLENGE` 变成 UNKNOWN，整轮要 42–58 分钟。熔断阈值
-（默认 3 家 ≈ 需求 D-NFR-RATE-06 的 15% 在 160 店规模上的折算）到达时：整轮立即结束、
-账号按风控阶梯进入冷却，剩余门店自动排补跑——把"一小时耗在墙上"换成"退避 5 分钟再来"。
+**405 挑战风暴熔断**：线上实测（160 店/轮）405 占全部上游尝试的 **57–60%**——这个占比从每轮
+汇总行读（`job <id> upstream: … challenged_405=… (..%)`，见 `jobs._log_upstream_stats`；
+原来的 httpx 逐请求行已按"日志降量"关掉），
+一轮 7–11 家门店因 `WAF_CHALLENGE` 变成 UNKNOWN，整轮要 42–58 分钟。熔断阈值取
+**"配置下限"与"这一轮门店数的 15%"（需求 D-NFR-RATE-06 健康线）的较大者**：
+`max(waf_storm_store_limit, ceil(0.15 × 本轮门店数))`——固定 3 家会把 160 店轮次里
+"5–10 家打满重试"的正常波动误判成风暴（实测一天 1996 轮里 50 轮被整轮中止并顺带冷却账号）。
+达到阈值时：整轮立即结束、账号按风控阶梯进入冷却，剩余门店自动排补跑——把"一小时耗在墙上"
+换成"退避 5 分钟再来"。`NIKE_MP_WAF_STORM_STORE_LIMIT=0` 关闭熔断。
 
 `NIKE_MP_STORE_CONCURRENCY > 1` 时：每个门店在自己的线程 / 数据库会话 / 上游客户端里跑，
 检查点仍是逐店独立提交（崩溃/丢租约只影响在跑的那几家）；某个门店命中额度或风控墙时会

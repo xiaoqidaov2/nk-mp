@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Credential
+from app.models import Credential, CredentialStatus
 from app.services import push, quota
 
 logger = logging.getLogger("nike_mp.throttle")
@@ -75,15 +75,43 @@ def _ladder(settings: Settings) -> list[int]:
     return [value for value in values if value > 0] or [300]
 
 
-def current(session: Session, owner_user_id) -> Cooldown | None:
+def current(session: Session, credential_id) -> Cooldown | None:
     """The active cooldown of one account, or ``None`` when it can run now."""
-    if owner_user_id is None:
+    if credential_id is None:
         return None
-    return active(session, [owner_user_id]).get(owner_user_id)
+    return active(session, [credential_id]).get(credential_id)
 
 
-def active(session: Session, owner_ids) -> dict:
-    """Active cooldowns for several owners in one query (``owner_id -> Cooldown``)."""
+def active(session: Session, credential_ids) -> dict:
+    """Active cooldowns for several accounts in one query (``credential_id -> Cooldown``)."""
+    ids = [credential_id for credential_id in dict.fromkeys(credential_ids) if credential_id is not None]
+    if not ids:
+        return {}
+    now = datetime.now(UTC)
+    rows = session.execute(
+        select(
+            Credential.id,
+            Credential.cooldown_until,
+            Credential.cooldown_reason,
+        ).where(
+            Credential.id.in_(ids),
+            Credential.cooldown_until.is_not(None),
+            Credential.cooldown_until > now,
+        )
+    ).all()
+    return {
+        row.id: Cooldown(until=row.cooldown_until, reason=row.cooldown_reason)
+        for row in rows
+    }
+
+
+def owner_cooldowns(session: Session, owner_ids) -> dict:
+    """``owner_id -> Cooldown`` for owners with **no usable account right now**.
+
+    一用户多账号：只要还有一个 ACTIVE/EXPIRING 且未冷却的账号，任务照常派发，
+    冷却对用户不可见；全部账号都不可用时给出最早结束的冷却窗口（页面/钉钉显示
+    "冷却至 HH:MM"）。没有冷却记录（例如账号被吊销）时不出现在结果里。
+    """
     ids = [owner_id for owner_id in dict.fromkeys(owner_ids) if owner_id is not None]
     if not ids:
         return {}
@@ -91,26 +119,43 @@ def active(session: Session, owner_ids) -> dict:
     rows = session.execute(
         select(
             Credential.owner_user_id,
+            Credential.status,
             Credential.cooldown_until,
             Credential.cooldown_reason,
         ).where(
             Credential.owner_user_id.in_(ids),
-            Credential.cooldown_until.is_not(None),
-            Credential.cooldown_until > now,
+            # 已断开/未分配的账号既不算"可用"，也不该把它的残留窗口算成用户的冷却。
+            Credential.status.notin_(
+                [CredentialStatus.REVOKED.value, CredentialStatus.UNASSIGNED.value]
+            ),
         )
     ).all()
+    ready: set = set()
+    active_rows: dict = {}
+    for row in rows:
+        if row.status in (
+            CredentialStatus.ACTIVE.value,
+            CredentialStatus.EXPIRING.value,
+        ) and (row.cooldown_until is None or row.cooldown_until <= now):
+            ready.add(row.owner_user_id)
+            continue
+        if row.cooldown_until is not None and row.cooldown_until > now:
+            current_row = active_rows.get(row.owner_user_id)
+            if current_row is None or row.cooldown_until < current_row.cooldown_until:
+                active_rows[row.owner_user_id] = row
     return {
-        row.owner_user_id: Cooldown(until=row.cooldown_until, reason=row.cooldown_reason)
-        for row in rows
+        owner_id: Cooldown(until=row.cooldown_until, reason=row.cooldown_reason)
+        for owner_id, row in active_rows.items()
+        if owner_id not in ready
     }
 
 
 def enter(
     session: Session,
     settings: Settings,
-    owner_user_id,
-    reason: str,
     *,
+    credential_id,
+    reason: str,
     resume_at: datetime | None = None,
 ) -> datetime | None:
     """Record (or extend) the account cooldown and queue one notice.
@@ -118,13 +163,13 @@ def enter(
     ``resume_at`` carries the precomputed window for budget reasons
     (``QuotaGuard.resume_at()``); the throttled ladder is computed here. The
     returned moment is the stored ``cooldown_until``; an existing longer
-    cooldown is never shortened. Returns ``None`` when the owner has no
-    credential row (nothing to freeze).
+    cooldown is never shortened. Returns ``None`` when the credential row is
+    gone (nothing to freeze).
     """
-    if owner_user_id is None:
+    if credential_id is None:
         return None
     record = session.execute(
-        select(Credential).where(Credential.owner_user_id == owner_user_id)
+        select(Credential).where(Credential.id == credential_id)
     ).scalar_one_or_none()
     if record is None:
         return None
@@ -157,7 +202,7 @@ def enter(
         queued = push.enqueue_system_notification(
             session,
             settings,
-            owner_user_id=owner_user_id,
+            owner_user_id=record.owner_user_id,
             title=NOTICE_TITLE,
             body=_notice_body(reason, until),
         )
@@ -165,27 +210,30 @@ def enter(
             record.cooldown_notified_at = now
             logger.info(
                 "cooldown notice queued owner=%s reason=%s until=%s",
-                owner_user_id,
+                record.owner_user_id,
                 reason,
                 until.isoformat(),
             )
     logger.warning(
-        "cooldown entered owner=%s reason=%s until=%s", owner_user_id, reason, until.isoformat()
+        "cooldown entered owner=%s reason=%s until=%s",
+        record.owner_user_id,
+        reason,
+        until.isoformat(),
     )
     session.flush()
     return until
 
 
-def clear(session: Session, owner_user_id) -> None:
+def clear(session: Session, credential_id) -> None:
     """A fully successful run resets the ladder; an expired window is cleared.
 
     An *active* cooldown is left alone: one lucky success from another manual
     scan must not lift the pause while the window is still running.
     """
-    if owner_user_id is None:
+    if credential_id is None:
         return
     record = session.execute(
-        select(Credential).where(Credential.owner_user_id == owner_user_id)
+        select(Credential).where(Credential.id == credential_id)
     ).scalar_one_or_none()
     if record is None:
         return

@@ -1,5 +1,13 @@
 name: nike-mp
 
+#: 容器日志封顶：worker 会按请求写 INFO 行（实测单体 300MB+）。默认 json-file 不轮转，
+#: 曾经把 40G 盘写满 → Postgres 写不了锁文件 → 全站登录 500。每个服务最多 3×20MB。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 x-api-env: &api-env
   NIKE_MP_DATABASE_URL: postgresql+psycopg://nike_mp:nike_mp@db:5432/nike_mp
   NIKE_MP_CREDENTIAL_KEY: ${NIKE_MP_CREDENTIAL_KEY:-}
@@ -46,6 +54,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    logging: *default-logging
     restart: unless-stopped
 
   migrate:
@@ -56,6 +65,7 @@ services:
       db:
         condition: service_healthy
     command: alembic upgrade head
+    logging: *default-logging
     restart: "no"
 
   api:
@@ -80,6 +90,7 @@ services:
       retries: 12
       start_period: 15s
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    logging: *default-logging
     restart: unless-stopped
 
   worker:
@@ -95,6 +106,7 @@ services:
       migrate:
         condition: service_completed_successfully
     command: python -m app.worker
+    logging: *default-logging
     restart: unless-stopped
 
   scheduler:
@@ -107,6 +119,21 @@ services:
       migrate:
         condition: service_completed_successfully
     command: python -m app.scheduler_main
+    logging: *default-logging
+    restart: unless-stopped
+
+  # 独立的调度监控：核对实例心跳与迟到任务，只告警与提供运维接口，不派发不执行。
+  monitor:
+    build:
+      context: ./apps/api
+    environment: *api-env
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.monitor_main
+    logging: *default-logging
     restart: unless-stopped
 
   proxy-refresh:
@@ -123,6 +150,7 @@ services:
       - ./qa:/qa:ro
       - ./runtime:/data
     command: ["sh", "-c", "while true; do python /qa/fetch_paid_proxies.py > /data/proxies.txt.tmp 2>>/data/fetch.log && [ -s /data/proxies.txt.tmp ] && mv /data/proxies.txt.tmp /data/proxies.txt; sleep $${PROXY_REFRESH_SECONDS:-45}; done"]
+    logging: *default-logging
     restart: unless-stopped
 
   web:
@@ -137,6 +165,7 @@ services:
     ports:
       # 只绑本机：对外统一由反向代理（HTTPS）进入，避免绕过 TLS/安全头。
       - "127.0.0.1:5173:5173"
+    logging: *default-logging
     restart: unless-stopped
 
 volumes:

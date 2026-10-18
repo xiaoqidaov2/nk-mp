@@ -254,8 +254,14 @@ def retry_failed(
     job = _load_job(db, user, job_id)
     if job.status not in TERMINAL:
         raise HTTPException(status.HTTP_409_CONFLICT, "扫描仍在运行")
+    if job.credential_id is None or job.credential_generation is None:
+        return binding_changed_response()
     try:
-        binding = CredentialService(settings, user.id).binding()
+        # 明确按该作业冻结的账号校验：多账号下"自动选号"可能选到另一个账号，
+        # 重试绝不能换账号继续。
+        binding = CredentialService(
+            settings, user.id, credential_id=job.credential_id
+        ).binding()
     except CredentialError as exc:
         return credential_error_response(exc)
     if (

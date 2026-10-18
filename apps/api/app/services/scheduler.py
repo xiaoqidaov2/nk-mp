@@ -9,18 +9,21 @@ account, and the user's ``is_active`` intent is never changed here.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.models import JobStatus, MonitorTask, ScanJob, Store, Tenant, User
 from app.services import throttle
-from app.services.credentials import CredentialError, CredentialService
+from app.services.credentials import CredentialBinding, CredentialService, pick_ready
 from app.services.jobs import enqueue_job
 from app.services.stores import clearance_filter
+
+logger = logging.getLogger("nike_mp.scheduler")
 
 
 def due_tasks(
@@ -109,7 +112,18 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
     抖动必须"组内一致、组间错开"：否则同一批任务被摊到多轮里，每个任务各成一个作业，
     合并永远不成立（生产上前 31 个任务就是这样一分钟一个）。所以这里先把"马上到期"
     的任务收拢进来，再让同组共用同一个 ``next_run_at``。
+
+    多节点：本函数用事务级 advisory lock 做互斥，抢不到锁的 scheduler 跳过这一拍
+    （主备自动接替，不需要 leader 状态机）。一用户多账号：每个 owner 本轮只选一次号
+    （未冷却账号里最近最少使用优先），同 owner 的任务共用该账号；一个账号都不可用时
+    暂停到最早一个冷却结束。
     """
+    acquired = session.execute(
+        select(func.pg_try_advisory_xact_lock(settings.dispatch_lock_key))
+    ).scalar()
+    if not acquired:
+        logger.debug("dispatch tick skipped: another scheduler holds the lock")
+        return 0
     dispatched = 0
     now = datetime.now(UTC)
     window = max(0.0, float(settings.dispatch_merge_window_seconds))
@@ -122,18 +136,31 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
     # 网格对齐只对"下一次"生效；窗口负责把**历史遗留的错位**一次性收拢（最多提前半个间隔）。
     if not tasks:
         return 0
-    cooldowns = throttle.active(session, [task.created_by for task in tasks])
 
-    ready: list[tuple[MonitorTask, object, list[str]]] = []
+    #: 每个 owner 本轮只选一次号（同一拍内该 owner 的任务共用同一个账号）。
+    picks: dict = {}
+    #: owner 不可用时的恢复时刻缓存（没有冷却记录 = 下一轮网格）。
+    resume_hints: dict = {}
+
+    def pick_for(owner_user_id):
+        if owner_user_id not in picks:
+            picks[owner_user_id] = pick_ready(session, owner_user_id)
+        return picks[owner_user_id]
+
+    def resume_at(owner_user_id) -> datetime | None:
+        if owner_user_id not in resume_hints:
+            cooldown = throttle.owner_cooldowns(session, [owner_user_id]).get(owner_user_id)
+            resume_hints[owner_user_id] = cooldown.until if cooldown is not None else None
+        return resume_hints[owner_user_id]
+
+    ready: list[tuple[MonitorTask, CredentialBinding, list[str]]] = []
     #: 已排队但**还没开跑**的单任务作业：本轮若产生合并作业，它们会被取消并由合并作业接管。
     #: 不这么做的话：客户节奏（分钟级）比一次 147 店扫描还快，每个任务永远"有作业在跑"，
     #: 只有恰好同时空出来的两三个任务才合得起来——合并永远拼不齐（生产实测：只能成对合并）。
     superseded: dict[str, ScanJob] = {}
+    #: 本轮真正派出作业的 owner → 选中的账号（派发成功后推进 LRU，保证轮换前进）。
+    used: dict = {}
     for task in tasks:
-        cooldown = cooldowns.get(task.created_by)
-        if cooldown is not None:
-            task.next_run_at = cooldown.until
-            continue
         active = _active_job_for(session, task)
         if active is not None:
             if active.status == JobStatus.QUEUED.value and active.task_id is not None:
@@ -169,15 +196,20 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             )
             continue
 
-        try:
-            binding = CredentialService(settings, task.created_by).binding()
-        except CredentialError:
-            # No fallback credential: resume automatically once the user
-            # re-connects, on the next cadence.
-            task.next_run_at = _next_run_at(
+        record = pick_for(task.created_by)
+        if record is None:
+            # 冷却是账号级的：全部账号都不可用时暂停到最早一个冷却结束；
+            # 没有冷却记录（例如账号被断开）时按下一轮节奏再试。无兜底账号。
+            until = resume_at(task.created_by)
+            task.next_run_at = until if until is not None else _next_run_at(
                 task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
             )
             continue
+        binding = CredentialBinding(
+            owner_user_id=task.created_by,
+            credential_id=record.id,
+            generation=record.binding_generation,
+        )
 
         store_codes = list(task.store_codes or [])
         if not store_codes:
@@ -204,16 +236,18 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
 
     # 按"账号 + 节奏 + 门店集合 + 尺码集合"分组：这几项一致才能合并（节奏不同会互相拖累，
     # 尺码集合是扫描期过滤条件，门店集合决定实际要扫哪些店）。款式取并集——一款一任务时
-    # 正是靠这一点才能把同一批门店合并成一次采集。
-    groups: dict[tuple, list[tuple[MonitorTask, object, list[str]]]] = {}
+    # 正是靠这一点才能把同一批门店合并成一次采集。**账号必须进 key**：一个作业只冻结
+    # 一个绑定，跨账号合并会让部分任务用错账号（绑定校验会整轮失败）。
+    groups: dict[tuple, list[tuple[MonitorTask, CredentialBinding, list[str]]]] = {}
     for entry in ready:
-        task, _binding, store_codes = entry
+        task, binding, store_codes = entry
         key = (
             str(task.created_by),
             str(task.tenant_id),
             int(task.cadence_seconds or 0),
             tuple(sorted(store_codes)),
             tuple(sorted(task.size_labels or [])),
+            str(binding.credential_id),
         )
         groups.setdefault(key, []).append(entry)
 
@@ -243,6 +277,8 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             credential_binding=binding,
             task_ids=[task.id for task, _binding, _stores in entries] if merged else None,
         )
+        # 派发成功：推进该账号的 LRU（下一次选号轮到另一个账号）。
+        used.setdefault(first_task.created_by, binding.credential_id)
         if merged:
             # 合并作业接管这些任务：把还没开跑的单任务作业停掉（没有数据损失，它们一行都还没扫）。
             # 条件更新兜住竞态：worker 若刚好租走（RUNNING），这里就不会命中，那次扫描照常跑完。
@@ -268,5 +304,8 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
         for task, _binding, _stores in entries:
             task.next_run_at = next_at
             dispatched += 1
+    # 选号账目在派发之后独立提交（小事务）：即使本轮派发事务被回滚，轮换也不会原地打转。
+    for owner_user_id, credential_id in used.items():
+        CredentialService(settings, owner_user_id).mark_used(credential_id)
     session.flush()
     return dispatched

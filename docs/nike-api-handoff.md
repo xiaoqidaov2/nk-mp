@@ -78,6 +78,14 @@ GET /o2o/buy/regions/v1?anchor=0&count=200
 ```
 
 ### C. 尺码表 / GTIN（`api-test.nike.com.cn`，**免鉴权，0% 被拦**）
+
+> **2026-10-13 实测：批量端点已被上游收回**。曾经可用的
+> `GET /store/product_details/internal/v1/.../store_number/{store}?productCodes=…`
+> 现在无 token → **401**、带 token → **403**（公开的 `v1` 路径带 `productCodes`
+> 返回 200 但空体，`style_color/{a,b}` 直接 400）。客户端现在**先试批量，非 200 即
+> 逐款回落到下面的单款端点**；`gtin_structure` 的**负结果**只缓存
+> `structure_missing_ttl_seconds`（默认 30 分钟），避免再出现"新货号全店缺尺码 7 天"。
+
 ```bash
 GET /store/product_details/v1/marketplace/CN/language/zh-Hans/store_number/{store}/style_color/{style}
 # 200 → productGroupings[0].products[0].sizes[]：

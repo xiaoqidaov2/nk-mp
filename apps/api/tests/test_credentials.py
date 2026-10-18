@@ -43,10 +43,22 @@ PHONE_MASKED = "+86****8000"
 
 
 class _ScalarResult:
+    """Duck-typed result: the stub serves the single row for every query shape.
+
+    ``_load`` takes two shapes now — ``scalar_one_or_none()`` for an addressed
+    row and ``scalars().first()`` for the auto-pick (``pick_ready``) query.
+    """
+
     def __init__(self, value):  # noqa: ANN001 - duck-typed for the test
         self._value = value
 
     def scalar_one_or_none(self):  # noqa: ANN201
+        return self._value
+
+    def scalars(self) -> _ScalarResult:
+        return self
+
+    def first(self):  # noqa: ANN201
         return self._value
 
 

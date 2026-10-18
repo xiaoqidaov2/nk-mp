@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -285,11 +286,28 @@ class OwnerBootstrap(Base):
     error_code: Mapped[str | None] = mapped_column(String(48))
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: 当前持有租约的 worker（多 worker 下只有持有者能续期/写状态）。
+    leased_by: Mapped[str | None] = mapped_column(String(96))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class ServiceHeartbeat(Base):
+    """服务实例心跳：scheduler / worker / monitor 各自定期写一行。
+
+    监控服务按这份心跳实时判断"哪个实例还在跑"，不落调度状态。
+    """
+
+    __tablename__ = "service_heartbeat"
+    __table_args__ = (PrimaryKeyConstraint("service", "instance_id", name="pk_service_heartbeat"),)
+
+    service: Mapped[str] = mapped_column(String(32))
+    instance_id: Mapped[str] = mapped_column(String(96))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[dict] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
 
 
 class Observation(Base):
@@ -382,7 +400,9 @@ class MonitorTask(Base):
     cadence_seconds: Mapped[int] = mapped_column(Integer, default=1800)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_on_restock: Mapped[bool] = mapped_column(Boolean, default=True)
-    notify_on_sold_out: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: 售罄提醒：**默认关闭**（2026-10-15 客户要求「售空不要通知」）；
+    #: 需要时按任务打开，变化流水里的售罄记录不受影响。
+    notify_on_sold_out: Mapped[bool] = mapped_column(Boolean, default=False)
     notify_on_price_change: Mapped[bool] = mapped_column(Boolean, default=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -503,7 +523,13 @@ class ChangeEvent(Base):
 class Credential(Base):
     __tablename__ = "credential"
     __table_args__ = (
-        UniqueConstraint("owner_user_id", name="uq_credential_owner_user"),
+        #: 一个平台用户可以有多个 Nike 账号；派发按 (owner, status, cooldown) 选号。
+        Index(
+            "ix_credential_owner_status_cooldown",
+            "owner_user_id",
+            "status",
+            "cooldown_until",
+        ),
         Index(
             "uq_credential_phone_active",
             "phone_hash",
@@ -523,7 +549,11 @@ class Credential(Base):
     status: Mapped[str] = mapped_column(String(32), default=CredentialStatus.UNASSIGNED.value)
     access_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: 最近一次**尝试续期**的时刻（失败退避用；语义见 ``_refresh_locked``）。
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: 最近一次**被派发使用**的时刻：多账号轮换的 LRU 键（``mark_used`` 写）。
+    #: 与 ``last_attempt_at`` 分开：派发频繁时不能顺带刷新续期退避的时间戳。
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str] = mapped_column(String(300), default="")
     last_error_code: Mapped[str | None] = mapped_column(String(48))
     #: 账号级冷却：额度/风控受限时暂停派发，到点自动恢复（见 services/throttle.py）。

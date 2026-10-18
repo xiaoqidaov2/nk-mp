@@ -24,7 +24,7 @@ vi.mock("@/data/api", () => ({
     handlersRef.current = handlers;
     return () => undefined;
   }),
-  nikeCredentialApi: { status: vi.fn() },
+  nikeCredentialApi: { list: vi.fn() },
 }));
 
 vi.mock("@/auth/AuthContext", () => ({
@@ -34,16 +34,19 @@ vi.mock("@/auth/AuthContext", () => ({
 const jobMock = vi.mocked(scanApi.get);
 const storesMock = vi.mocked(scanApi.stores);
 const retryMock = vi.mocked(scanApi.retryFailed);
-const credentialMock = vi.mocked(nikeCredentialApi.status);
+const credentialMock = vi.mocked(nikeCredentialApi.list);
 
 function activeCredential(): NikeCredentialOut {
   return {
+    id: "cred-1",
     status: "ACTIVE",
     phone_masked: "138****0000",
     access_expires_at: null,
     last_refreshed_at: null,
     last_error_code: null,
     binding_generation: 1,
+    cooldown_until: null,
+    cooldown_reason: null,
     login_available: true,
   };
 }
@@ -123,7 +126,7 @@ describe("ScanDetailPage", () => {
     storesMock.mockReset();
     retryMock.mockReset();
     credentialMock.mockReset();
-    credentialMock.mockResolvedValue(activeCredential());
+    credentialMock.mockResolvedValue([activeCredential()]);
     storesMock.mockResolvedValue([]);
   });
 

@@ -157,24 +157,31 @@ export interface Dashboard {
 }
 
 /**
- * Personal Nike connection state, mirroring the backend `me/nike-credential`
+ * Personal Nike connection state, mirroring the backend `me/nike-credentials`
  * DTO. `NOT_CONNECTED` replaces the old shared/`UNASSIGNED` credential: the
  * platform never exposes a default or another user's binding.
  */
 export type NikeCredentialStatus =
   | "NOT_CONNECTED"
+  | "UNASSIGNED"
   | "ACTIVE"
   | "EXPIRING"
   | "NEEDS_AUTHORIZATION"
   | "REVOKED";
 
 export interface NikeCredentialOut {
+  /** 一行 = 一个已绑定的 Nike 账号；断开服务端按此 id 定位。 */
+  id: string;
   status: NikeCredentialStatus;
   phone_masked: string | null;
   access_expires_at: string | null;
   last_refreshed_at: string | null;
   last_error_code: string | null;
   binding_generation: number | null;
+  /** 非空且晚于当前时刻＝该账号正在冷却，到点自动恢复。 */
+  cooldown_until: string | null;
+  /** 后端原因码（如 "throttled"）；界面只显示中文解释，不直接展示。 */
+  cooldown_reason: string | null;
   login_available: boolean;
 }
 
@@ -298,4 +305,51 @@ export interface DingTalkLink {
   /** 1 单聊，2 群聊 */
   conversation_type: number;
   created_at: string;
+}
+
+/** 一个调度/执行进程最近一次心跳；`alive` 由服务端按新鲜度判定。 */
+export interface SchedulerHealthInstance {
+  instance_id: string;
+  last_seen_at: string | null;
+  age_seconds: number;
+  alive: boolean;
+}
+
+/** 执行节点在此基础上附上正在跑的作业数。 */
+export interface SchedulerHealthWorker extends SchedulerHealthInstance {
+  running_jobs: number;
+}
+
+export interface SchedulerOverdueTask {
+  task_id: string;
+  name: string;
+  next_run_at: string;
+  overdue_seconds: number;
+  last_finished_at: string | null;
+}
+
+export interface SchedulerCoolingAccount {
+  owner_user_id: string;
+  credential_id: string;
+  /** 后端原因码；界面映射成中文，不直接展示。 */
+  reason: string | null;
+  until: string;
+}
+
+/** 运维接口 `GET /ops/scheduler-health` 的实时快照（不做落库）。 */
+export interface SchedulerDisk {
+  total_gb: number;
+  used_gb: number;
+  free_gb: number;
+  used_percent: number;
+  warning: boolean;
+}
+
+export interface SchedulerHealth {
+  scheduler: SchedulerHealthInstance[];
+  workers: SchedulerHealthWorker[];
+  overdue_tasks: SchedulerOverdueTask[];
+  cooling_accounts: SchedulerCoolingAccount[];
+  queue: Record<"QUEUED" | "RUNNING" | "SUCCEEDED" | "PARTIAL" | "FAILED" | "CANCELLED", number>;
+  disk: SchedulerDisk;
 }

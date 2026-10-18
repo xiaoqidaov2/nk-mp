@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db import SessionLocal
 from app.models import (
     ChangeEvent,
@@ -279,10 +279,58 @@ def test_scan_failure_events_carry_the_job_owner(world) -> None:
         )
         db.commit()
         mark_failed_job_event(
-            db, world["tenant_id"], job, world["store_id"], "EMPTY_COMPLETED"
+            db, get_settings(), world["tenant_id"], job, world["store_id"], "EMPTY_COMPLETED"
         )
         db.commit()
         event = db.execute(select(ChangeEvent)).scalar_one()
         assert event.tenant_id == world["tenant_id"]
         assert event.owner_user_id == world["user_id"]
         assert event.event_type == "SCAN_FAILED"
+
+
+
+def test_scan_failed_events_are_windowed_across_jobs() -> None:
+    """同一 (账号, 门店, 原因) 在窗口内只留一条诊断事件；窗口=0 则每作业一条。
+
+    30 秒档 + 缺尺码的货号会让每家门店每轮都失败：不节流会把变化流水刷成整页
+    "检查失败"，真正的补货/售罄被埋掉。
+    """
+    settings = get_settings()
+    windowed = Settings(credential_key="test-key-for-unit-tests")
+    per_job = Settings(
+        credential_key="test-key-for-unit-tests", scan_failed_event_window_seconds=0
+    )
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant)
+        store = make_store(db, owner=user, code="S001")
+        db.flush()
+        tenant_id, user_id, store_id = tenant.id, user.id, store.id
+        db.commit()
+    binding = store_credential(settings, user_id)
+
+    def _job(db):
+        job = enqueue_job(
+            db,
+            tenant_id=tenant_id,
+            store_codes=["S001"],
+            style_codes=["DN3707-202"],
+            owner_user_id=user_id,
+            credential_binding=binding,
+        )
+        db.commit()
+        return job
+
+    with SessionLocal() as db:
+        first, second = _job(db), _job(db)
+        mark_failed_job_event(db, windowed, tenant_id, first, store_id, "WAF_CHALLENGE")
+        mark_failed_job_event(db, windowed, tenant_id, second, store_id, "WAF_CHALLENGE")
+        db.commit()
+        assert len(db.execute(select(ChangeEvent)).scalars().all()) == 1
+
+    with SessionLocal() as db:
+        third, fourth = _job(db), _job(db)
+        mark_failed_job_event(db, per_job, tenant_id, third, store_id, "WAF_CHALLENGE")
+        mark_failed_job_event(db, per_job, tenant_id, fourth, store_id, "WAF_CHALLENGE")
+        db.commit()
+        assert len(db.execute(select(ChangeEvent)).scalars().all()) == 3

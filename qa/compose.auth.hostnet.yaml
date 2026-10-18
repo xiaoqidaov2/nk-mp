@@ -136,6 +136,23 @@ services:
     command: python -m app.scheduler_main
     restart: unless-stopped
 
+  # 独立调度监控进程（与根 compose.yaml 同构）：写心跳 + 实时核对迟到任务，
+  # 供 GET /api/v1/ops/scheduler-health 与双 scheduler 主备验收使用。
+  monitor:
+    build:
+      context: ../apps/api
+    network_mode: host
+    environment: *auth-env
+    depends_on:
+      db:
+        condition: service_healthy
+      stub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.monitor_main
+    restart: unless-stopped
+
   web:
     build:
       context: ../apps/web

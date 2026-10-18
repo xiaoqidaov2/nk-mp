@@ -63,7 +63,7 @@ class TaskIn(BaseModel):
     cadence_seconds: int = Field(default=1800, ge=30, le=86400)
     is_active: bool = True
     notify_on_restock: bool = True
-    notify_on_sold_out: bool = True
+    notify_on_sold_out: bool = False  # 默认不提醒售罄（客户要求），需要时显式打开
     notify_on_price_change: bool = True
 
     @field_validator("store_codes", "style_codes")
@@ -142,7 +142,8 @@ class TaskOut(BaseModel):
     created_at: datetime
     store_count: int
     style_count: int
-    #: 账号级冷却（额度/风控受限）：页面显示"冷却中，将在 HH:mm 自动继续"。
+    #: 账号级冷却（额度/风控受限）：只在**全部账号都不可用**时给出最早结束的窗口，
+    #: 页面显示"冷却中，将在 HH:mm 自动继续"；只要还有一个可用账号就为空。
     cooldown_until: datetime | None = None
     cooldown_reason: str | None = None
 
@@ -257,12 +258,17 @@ class HealthOut(BaseModel):
 
 
 class NikeCredentialOut(BaseModel):
+    #: 账号行 id；列表/验证响应里始终有值（仅"未连接"占位视图为空）。
+    id: uuid.UUID | None = None
     status: str
     phone_masked: str | None
     access_expires_at: datetime | None
     last_refreshed_at: datetime | None
     last_error_code: str | None
     binding_generation: int | None
+    #: 账号冷却：非空表示该账号到该时刻前不派发（额度/风控受限）。
+    cooldown_until: datetime | None = None
+    cooldown_reason: str | None = None
     login_available: bool
 
 
@@ -281,6 +287,8 @@ class NikeAuthSessionIn(BaseModel):
     phone: str = Field(min_length=5, max_length=32)
     consent: bool
     request_id: uuid.UUID
+    #: 指定要重新验证的账号；不传 = 新增一个 Nike 账号（一用户多账号）。
+    credential_id: uuid.UUID | None = None
 
     @field_validator("phone")
     @classmethod

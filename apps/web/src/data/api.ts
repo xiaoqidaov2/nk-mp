@@ -16,6 +16,7 @@ import type {
   NotificationPlatform,
   ScanJob,
   ScanStore,
+  SchedulerHealth,
   StoreOut,
   StyleOut,
 } from "./types";
@@ -94,6 +95,8 @@ export const opsApi = {
     api.get<{ queue_depth: number; running_jobs: number; stores: number; styles: number; nike_api_base: string }>(
       "/ops/health/detail",
     ),
+  /** 调度实例、执行节点与冷却账号的实时快照。 */
+  schedulerHealth: () => api.get<SchedulerHealth>("/ops/scheduler-health"),
 };
 
 /**
@@ -101,14 +104,20 @@ export const opsApi = {
  * attempts are always derived from the登录 session server-side.
  */
 export const nikeCredentialApi = {
-  status: () => api.get<NikeCredentialOut>("/me/nike-credential"),
-  start: (payload: { phone: string; consent: true; request_id: string }) =>
-    api.post<NikeAuthAttemptOut>("/me/nike-auth/sessions", payload),
+  /** 本人已绑定的全部 Nike 账号（空数组 = 未连接）。 */
+  list: () => api.get<NikeCredentialOut[]>("/me/nike-credentials"),
+  start: (payload: {
+    phone: string;
+    consent: true;
+    request_id: string;
+    /** 带上＝重新验证该账号；不带＝再绑一个账号。 */
+    credential_id?: string;
+  }) => api.post<NikeAuthAttemptOut>("/me/nike-auth/sessions", payload),
   attempt: (id: string) => api.get<NikeAuthAttemptOut>(`/me/nike-auth/sessions/${id}`),
   verify: (id: string, payload: { code: string }) =>
     api.post<NikeCredentialOut>(`/me/nike-auth/sessions/${id}/verify`, payload),
   cancel: (id: string) => api.delete<void>(`/me/nike-auth/sessions/${id}`),
-  disconnect: () => api.delete<void>("/me/nike-credential"),
+  disconnect: (id: string) => api.delete<void>(`/me/nike-credentials/${id}`),
   /** 绑定后预加载进度（门店目录按用户缓存）。 */
   bootstrap: () => api.get<NikeBootstrapOut>("/me/bootstrap"),
   /** 重新排队预加载（失败重试 / 手动刷新缓存）。 */

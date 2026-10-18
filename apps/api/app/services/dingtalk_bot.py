@@ -263,7 +263,7 @@ def _tasks_reply(session: Session, owner_user_id) -> str:
     if not rows:
         return "你还没有监控任务。到网页的「监控任务 → 新建监控任务」建一个，我再帮你盯。"
     lines = [f"你的监控任务（{len(rows)} 个）："]
-    cooldown = throttle.current(session, owner_user_id)
+    cooldown = throttle.owner_cooldowns(session, [owner_user_id]).get(owner_user_id)
     for task in rows:
         state = "启用" if task.is_active else "暂停"
         styles = len(task.style_codes or [])
@@ -361,12 +361,18 @@ def _styles_reply(session: Session, owner_user_id) -> str:
 
 
 def _status_reply(session: Session, owner_user_id) -> str:
-    credential = session.execute(
-        select(Credential).where(Credential.owner_user_id == owner_user_id)
-    ).scalar_one_or_none()
-    state = credential.status if credential is not None else "NOT_CONNECTED"
-    state_label = {"ACTIVE": "已连接", "EXPIRING": "即将到期", "REVOKED": "已断开"}.get(state, "未连接")
-    return f"Nike 连接：{state_label}"
+    statuses = list(
+        session.execute(
+            select(Credential.status).where(Credential.owner_user_id == owner_user_id)
+        ).scalars()
+    )
+    usable = [status for status in statuses if status in ("ACTIVE", "EXPIRING")]
+    if usable:
+        suffix = f"（{len(usable)} 个账号）" if len(usable) > 1 else ""
+        return f"Nike 连接：已连接{suffix}"
+    if any(status == "NEEDS_AUTHORIZATION" for status in statuses):
+        return "Nike 连接：需要重新验证"
+    return "Nike 连接：未连接"
 
 
 def _pick_task(session: Session, owner_user_id, name: str):
@@ -867,8 +873,12 @@ def _retry_failed_reply(session: Session, settings: Settings, owner_user_id, nam
         return f"「{task.name}」还没有检查过。发「检查 {task.name}」马上跑一次。"
     if job.status in {"QUEUED", "RUNNING"}:
         return f"「{task.name}」还在排队或检查中，等这次跑完再说。"
+    if job.credential_id is None or job.credential_generation is None:
+        return f"「{task.name}」的记录缺少账号信息。发「检查 {task.name}」重新跑一轮。"
     try:
-        binding = CredentialService(settings, owner_user_id).binding()
+        binding = CredentialService(
+            settings, owner_user_id, credential_id=job.credential_id
+        ).binding()
     except CredentialError:
         return "需要先在网页上连接 Nike 账号（「账户与额度」），才能重试。"
     if job.credential_id != binding.credential_id or job.credential_generation != binding.generation:
@@ -885,7 +895,7 @@ def _disconnect_reply(session: Session, settings: Settings, owner_user_id, comma
         return None
     if command.strip().strip("。.!！") != "确认注销":
         return "这一步会断开 Nike 连接、停掉所有自动检查（任务和渠道都保留）。确认请回复：确认注销"
-    nike_auth.disconnect(settings=settings, user_id=owner_user_id)
+    nike_auth.disconnect_all(settings=settings, user_id=owner_user_id)
     return "已断开 Nike 连接，检查会停。想恢复就到网页「账户与额度」重新连接。"
 
 

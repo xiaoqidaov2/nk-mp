@@ -17,7 +17,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
-import { NikeConnectionNotice, isCredentialActive, useNikeCredentialQuery } from "@/components/NikeCredentialCard";
+import { NikeConnectionNotice, isCredentialActive, useNikeCredentialsQuery } from "@/components/NikeCredentialCard";
 import { PageHeader } from "@/components/PageHeader";
 import { useHasEnabledChannel } from "@/components/PushChannelsCard";
 import { SectionCard } from "@/components/SectionCard";
@@ -60,8 +60,8 @@ export function TaskCreatePage() {
   const isMobile = useIsMobile();
   const { message, modal } = AntdApp.useApp();
   const { canWrite } = useAuth();
-  const credential = useNikeCredentialQuery();
-  const bound = isCredentialActive(credential.data?.status);
+  const credentials = useNikeCredentialsQuery();
+  const bound = credentials.data?.some((row) => isCredentialActive(row.status)) ?? false;
   const canCreate = canWrite && bound;
   const [step, setStep] = useState(0);
   const [form] = Form.useForm<TaskDraft>();
@@ -198,7 +198,8 @@ export function TaskCreatePage() {
           name: "新建监控任务",
           cadence_seconds: 1800,
           notify_on_restock: true,
-          notify_on_sold_out: true,
+          // 售罄只记录不提醒（客户要求）；需要时在这里打开。
+          notify_on_sold_out: false,
           notify_on_price_change: true,
         }}
       >
@@ -328,6 +329,7 @@ export function TaskCreatePage() {
                 <Form.Item name="notify_on_price_change" valuePropName="checked" noStyle>
                   <Switch /> <span>{WIZARD.notifyPriceChange}</span>
                 </Form.Item>
+                <Typography.Text type="secondary">{WIZARD.notifySoldOutNote}</Typography.Text>
               </Space>
               <Form.Item noStyle shouldUpdate>
                 {() => {

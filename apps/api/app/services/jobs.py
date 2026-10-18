@@ -13,6 +13,7 @@ silently switching accounts.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -34,8 +35,9 @@ from app.models import (
     Tenant,
     User,
 )
-from app.nike.client import NikeClient, NikeTransportError
+from app.nike.client import NikeClient, NikeTransportError, upstream_stats
 from app.nike.errors import ErrorCode, ScanError
+from app.services import heartbeat as heartbeat_service
 from app.services import push, throttle
 from app.services.credentials import (
     CredentialBinding,
@@ -59,10 +61,25 @@ MAX_STORE_CONCURRENCY = 32
 LIMITED_CODES = (ErrorCode.BUDGET_EXHAUSTED.value, ErrorCode.THROTTLED.value)
 #: 凭证类失败码不能触发自动补跑（补跑前必须先让用户重新验证）。
 CREDENTIAL_CODES = (ErrorCode.AUTH_REQUIRED.value, ORPHAN_JOB_CODE)
+#: 不自动补跑的稳定结论：门店没有该货号的尺码表。补跑只会把整店再空转一遍
+#: （30 秒档下尤其浪费），缺失会在下一轮按 TTL（默认 30 分钟）自然重取。
+NO_RETRY_CODES = (ErrorCode.STRUCTURE_MISSING.value,)
 
 
 class LeaseLost(RuntimeError):
     """Raised when another worker has taken over this job's lease."""
+
+
+def _waf_breaker_threshold(settings: Settings, total_stores: int) -> int:
+    """405 挑战风暴熔断阈值：这一轮有多少家门店被挑战打满重试就整轮中止。
+
+    配置值是**下限**，同时按一轮门店数的 15% 折算（需求 D-NFR-RATE-06 的健康线），
+    取较大者：实测 160 店/轮里 7–11 家门店打满重试是常态，固定 3 家会把正常波动
+    误判成风暴（今日 1996 轮里有 50 轮被整轮中止，并顺带把账号打进冷却）。0 = 关闭。
+    """
+    if settings.waf_storm_store_limit <= 0:
+        return 0
+    return max(settings.waf_storm_store_limit, math.ceil(0.15 * max(1, total_stores)))
 
 
 def _job_task_ids(job: ScanJob) -> list[str]:
@@ -205,6 +222,15 @@ def heartbeat(session: Session, job: ScanJob, settings: Settings, worker_id: str
     )
     if worker_id is not None and result.rowcount == 0:
         raise LeaseLost(f"lease for job {job.id} was taken over by another worker")
+    if worker_id is not None:
+        # 同时刷新**节点**心跳：生产作业是分钟级，只在循环空闲时上报会让监控
+        # 把正在干活的 worker 判成掉线（作业心跳间隔 ≤ max(5s, 租约/3)）。
+        heartbeat_service.heartbeat(
+            session,
+            service="worker",
+            instance_id=worker_id,
+            detail={"job_id": str(job.id)},
+        )
     session.flush()
 
 
@@ -308,7 +334,7 @@ def _run_store(
             # 额度/限速：剩余门店不再逐店空转，整轮冷却后自动补跑。
             session.rollback()
             return _StoreOutcome("limited", code)
-        _fail_store_row(session, job, row, store, code, str(exc))
+        _fail_store_row(session, settings, job, row, store, code, str(exc))
         session.commit()
         return _StoreOutcome("done", code)
     except Exception as exc:  # noqa: BLE001 - never lose a store silently
@@ -316,7 +342,7 @@ def _run_store(
             session.rollback()
             logger.warning("job %s lease lost; discarding failure for %s", job.id, store.store_code)
             return _StoreOutcome("lease_lost")
-        _fail_store_row(session, job, row, store, ErrorCode.UNEXPECTED_STATUS.value, str(exc))
+        _fail_store_row(session, settings, job, row, store, ErrorCode.UNEXPECTED_STATUS.value, str(exc))
         session.commit()
         return _StoreOutcome("done", ErrorCode.UNEXPECTED_STATUS.value)
 
@@ -334,7 +360,9 @@ def _run_store(
         row.status = StoreJobStatus.UNKNOWN.value
         row.error_code = result.error_code
         row.message = result.message[:300]
-        mark_failed_job_event(session, job.tenant_id, job, store.id, result.error_code or "UNKNOWN")
+        mark_failed_job_event(
+            session, settings, job.tenant_id, job, store.id, result.error_code or "UNKNOWN"
+        )
         session.commit()
         return _StoreOutcome("done", result.error_code or "")
 
@@ -379,6 +407,7 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
         _finalize(session, settings, job, JobStatus.FAILED.value, exc.code, worker_id)
         return
 
+    stats_before = upstream_stats()
     client = NikeClient(
         settings,
         token,
@@ -480,10 +509,7 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
                 return
             if outcome.code == ErrorCode.WAF_CHALLENGE.value:
                 waf_failures += 1
-                if (
-                    settings.waf_storm_store_limit
-                    and waf_failures >= settings.waf_storm_store_limit
-                ):
+                if waf_failures >= _waf_breaker_threshold(settings, len(rows)) > 0:
                     # 405 挑战风暴：上游在连续拦我们，整轮结束并进入冷却，
                     # 剩余门店由补跑在窗口结束后处理，别把一小时耗在墙上。
                     logger.warning(
@@ -507,6 +533,7 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
         _finalize(session, settings, job, None, "", worker_id)
     finally:
         client.close()
+        _log_upstream_stats(job, stats_before)
 
 
 def _job_ref(job: ScanJob) -> _JobRef:
@@ -670,7 +697,7 @@ def _run_stores_concurrently(
     waf_failures = sum(
         1 for item in outcomes if item.code == ErrorCode.WAF_CHALLENGE.value
     )
-    if settings.waf_storm_store_limit and waf_failures >= settings.waf_storm_store_limit:
+    if waf_failures >= _waf_breaker_threshold(settings, len(rows)) > 0:
         logger.warning(
             "job %s: %s store(s) exhausted the WAF challenge; aborting the round",
             job_ref.id,
@@ -718,7 +745,7 @@ def _abort_auth_failure(
         row.finished_at = now
         store = stores.get(row.store_id)
         if store is not None:
-            mark_failed_job_event(session, job.tenant_id, job, store.id, code)
+            mark_failed_job_event(session, settings, job.tenant_id, job, store.id, code)
     _finalize(session, settings, job, JobStatus.FAILED.value, code, worker_id)
 
 
@@ -754,8 +781,8 @@ def _abort_limited(
         row.finished_at = now
         store = stores.get(row.store_id)
         if store is not None:
-            mark_failed_job_event(session, job.tenant_id, job, store.id, code)
-    if job.owner_user_id is not None:
+            mark_failed_job_event(session, settings, job.tenant_id, job, store.id, code)
+    if job.credential_id is not None:
         if reason is None:
             reason = (
                 throttle.THROTTLED_REASON
@@ -764,17 +791,17 @@ def _abort_limited(
             )
         resume_at = quota.resume_at() if reason in throttle.BUDGET_REASONS else None
         throttle.enter(
-            session, settings, job.owner_user_id, reason, resume_at=resume_at
+            session, settings, credential_id=job.credential_id, reason=reason, resume_at=resume_at
         )
     _finalize(session, settings, job, JobStatus.FAILED.value, code, worker_id)
 
 
-def _fail_store_row(session, job, row, store, code: str, message: str) -> None:
+def _fail_store_row(session, settings, job, row, store, code: str, message: str) -> None:
     row.status = StoreJobStatus.FAILED.value
     row.error_code = code
     row.message = message[:300]
     row.finished_at = datetime.now(UTC)
-    mark_failed_job_event(session, job.tenant_id, job, store.id, code)
+    mark_failed_job_event(session, settings, job.tenant_id, job, store.id, code)
     session.flush()
 
 
@@ -825,19 +852,28 @@ def _finalize(
     job.leased_by = None
     session.flush()
 
-    cooldown = throttle.current(session, job.owner_user_id)
+    #: 该作业**冻结账号**的冷却：只有"继续用同一个账号的补跑"需要等它。
+    job_cooldown = throttle.current(session, job.credential_id)
     if settings is not None and job.status == JobStatus.SUCCEEDED.value:
         # 整轮全部成功说明账号已恢复：重置风控阶梯；仍在生效的窗口不提前解除。
-        throttle.clear(session, job.owner_user_id)
+        throttle.clear(session, job.credential_id)
+
+    #: 任务级暂停只在**该用户所有账号都不可用**时才生效（取最早结束的窗口）：
+    #: 单账号被限速不该让另一个可用账号的下一轮白等一个冷却窗口。
+    pause = (
+        throttle.owner_cooldowns(session, [job.owner_user_id]).get(job.owner_user_id)
+        if job.owner_user_id is not None
+        else None
+    )
 
     tasks = _job_tasks(session, job)
     task = tasks[0] if tasks else None
     now = datetime.now(UTC)
     for item in tasks:
         next_run_at = now + timedelta(seconds=item.cadence_seconds)
-        if cooldown is not None and cooldown.until > next_run_at:
-            # 冷却窗口内的任务不派发；到点由调度器自动继续。
-            next_run_at = cooldown.until
+        if pause is not None and pause.until > next_run_at:
+            # 全部账号都在冷却：任务暂停到最早一个窗口结束，到点由调度器自动继续。
+            next_run_at = pause.until
         item.last_run_at = now
         item.next_run_at = next_run_at
     if tasks:
@@ -846,7 +882,7 @@ def _finalize(
     # 检查结束后按任务的提醒开关聚合推送；提交由调用方负责。
     if settings is not None:
         push.enqueue_for_job(session, settings, job)
-        _schedule_retry(session, settings, job, task, cooldown)
+        _schedule_retry(session, settings, job, task, job_cooldown)
 
 
 def _is_credential_code(code: str | None) -> bool:
@@ -887,7 +923,11 @@ def _schedule_retry(
             ),
         )
     ).scalars().all()
-    store_ids = [row.store_id for row in rows if not _is_credential_code(row.error_code)]
+    store_ids = [
+        row.store_id
+        for row in rows
+        if not _is_credential_code(row.error_code) and row.error_code not in NO_RETRY_CODES
+    ]
     if not store_ids:
         return None
     # 防重叠：这些任务已有作业排队/运行时不补跑（下一轮自然会覆盖）。
@@ -971,3 +1011,29 @@ def requeue_failed_stores(session: Session, job: ScanJob) -> int:
     job.attempt = 0
     session.flush()
     return len(rows)
+
+
+def _log_upstream_stats(job: ScanJob, before: dict[str, int]) -> None:
+    """一轮结束打一行上游响应汇总（替代 httpx 的每请求一行）。
+
+    405 挑战 / 403 / 429 的占比是风控分析的关键指标，保留这一行就够了；
+    原始逐请求行让单个 worker 的日志涨到 300MB+（曾把磁盘写满）。
+    """
+    after = upstream_stats()
+    delta = {
+        status: count - before.get(status, 0)
+        for status, count in after.items()
+        if count - before.get(status, 0) > 0
+    }
+    if not delta:
+        return
+    total = sum(delta.values())
+    challenged = delta.get("405", 0)
+    logger.info(
+        "job %s upstream: %s attempts=%s challenged_405=%s (%.0f%%)",
+        job.id,
+        ",".join(f"{status}={count}" for status, count in sorted(delta.items())),
+        total,
+        challenged,
+        100.0 * challenged / total if total else 0.0,
+    )

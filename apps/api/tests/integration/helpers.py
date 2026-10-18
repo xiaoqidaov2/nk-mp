@@ -131,3 +131,43 @@ def credential_binding(settings, user_id):
     from app.services.credentials import CredentialService
 
     return CredentialService(settings, user_id).binding()
+
+
+def add_credential(
+    settings,
+    user_id,
+    *,
+    phone: str | None = None,
+    access_token: str = "second-access",
+    refresh_token: str = "second-refresh",
+):
+    """Bound a *second* Nike account to a user; returns the new credential row id.
+
+    一用户多账号：``store_credential`` 只建第一条；这里直接插一行，模拟用户再绑一个
+    手机号后的库存状态（不进 HTTP 绑定流程，避免把测试绑死在短信契约上）。
+    """
+    from app.db import SessionLocal
+    from app.models import Credential, CredentialStatus
+    from app.nike.phone_auth import mask_phone
+    from app.security import secret_fingerprint
+    from app.services.credentials import apply_tokens_locked
+
+    with SessionLocal() as db:
+        record = Credential(
+            owner_user_id=user_id,
+            binding_generation=1,
+            status=CredentialStatus.ACTIVE.value,
+        )
+        if phone:
+            record.phone_masked = mask_phone(phone)
+            record.phone_hash = secret_fingerprint(phone, purpose="phone")
+        db.add(record)
+        db.flush()
+        apply_tokens_locked(
+            record,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            client_id="test-client",
+        )
+        db.commit()
+        return record.id

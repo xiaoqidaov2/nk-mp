@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_session, get_db, settings_dep
-from app.config import Settings
+from app.api.deps import get_current_session, get_db
 from app.models import (
     AuthSession,
     ChangeEvent,
+    Credential,
     CredentialStatus,
     EventType,
     JobStatus,
@@ -23,7 +23,7 @@ from app.models import (
     User,
 )
 from app.schemas import DashboardOut
-from app.services.credentials import CredentialError, CredentialService
+from app.services.credentials import current_binding_condition, effective_status
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -33,11 +33,45 @@ def _today_window() -> datetime:
     return datetime(now.year, now.month, now.day, tzinfo=UTC)
 
 
+def _credential_summary(db: Session, user_id) -> tuple[str, datetime | None]:
+    """账号聚合视图：任一账号 ACTIVE/EXPIRING 即视为已连接。
+
+    有效期取**最早**到期的可用账号（最保守，先提醒最先需要处理的连接）；
+    一个可用账号都没有时，有需要重新验证的账号就报该状态，否则按未连接。
+    """
+    rows = db.execute(
+        select(Credential).where(Credential.owner_user_id == user_id)
+    ).scalars().all()
+    reviewed = [(effective_status(record), record) for record in rows]
+    usable = [
+        (status, record)
+        for status, record in reviewed
+        if status
+        in (CredentialStatus.ACTIVE.value, CredentialStatus.EXPIRING.value)
+    ]
+    if usable:
+        status = (
+            CredentialStatus.ACTIVE.value
+            if any(item[0] == CredentialStatus.ACTIVE.value for item in usable)
+            else CredentialStatus.EXPIRING.value
+        )
+        expiries = [
+            record.access_expires_at
+            for _status, record in usable
+            if record.access_expires_at is not None
+        ]
+        return status, (min(expiries) if expiries else None)
+    if any(
+        status == CredentialStatus.NEEDS_AUTHORIZATION.value for status, _record in reviewed
+    ):
+        return CredentialStatus.NEEDS_AUTHORIZATION.value, None
+    return CredentialStatus.UNASSIGNED.value, None
+
+
 @router.get("", response_model=DashboardOut)
 def get_dashboard(
     db: Session = Depends(get_db),
     payload: tuple[User, AuthSession] = Depends(get_current_session),
-    settings: Settings = Depends(settings_dep),
 ) -> DashboardOut:
     """Personal dashboard.
 
@@ -48,12 +82,6 @@ def get_dashboard(
     user = payload[0]
     today = _today_window()
     tenant = db.execute(select(Tenant).where(Tenant.id == user.tenant_id)).scalar_one()
-
-    binding = None
-    try:
-        binding = CredentialService(settings, user.id).binding()
-    except CredentialError:
-        binding = None
 
     def _count_events(event_type: EventType) -> int:
         stmt = select(func.count()).select_from(ChangeEvent).where(
@@ -89,25 +117,23 @@ def get_dashboard(
         ).scalar_one()
     )
 
-    latest_filter = [ObservationLatest.owner_user_id == user.id]
-    if binding is not None:
-        latest_filter.extend(
-            [
-                ObservationLatest.credential_id == binding.credential_id,
-                ObservationLatest.credential_generation == binding.generation,
-            ]
-        )
-    monitored_stores = 0
-    last_checked = None
-    if binding is not None:
-        monitored_stores = int(
-            db.execute(
-                select(func.count(func.distinct(ObservationLatest.store_id))).where(*latest_filter)
-            ).scalar_one()
-        )
-        last_checked = db.execute(
-            select(func.max(ObservationLatest.checked_at)).where(*latest_filter)
+    latest_filter = [
+        ObservationLatest.owner_user_id == user.id,
+        # 一用户多账号：任一仍在的账号（generation 未变）写入的当前态都算。
+        current_binding_condition(
+            user.id,
+            ObservationLatest.credential_id,
+            ObservationLatest.credential_generation,
+        ),
+    ]
+    monitored_stores = int(
+        db.execute(
+            select(func.count(func.distinct(ObservationLatest.store_id))).where(*latest_filter)
         ).scalar_one()
+    )
+    last_checked = db.execute(
+        select(func.max(ObservationLatest.checked_at)).where(*latest_filter)
+    ).scalar_one()
 
     job_filter = [
         ScanJob.tenant_id == user.tenant_id,
@@ -134,7 +160,7 @@ def get_dashboard(
     usage_row = db.execute(
         select(UsageDaily).where(UsageDaily.tenant_id == user.tenant_id, UsageDaily.day == today)
     ).scalar_one_or_none()
-    credential = CredentialService(settings, user.id).status()
+    credential_status, credential_expires_at = _credential_summary(db, user.id)
 
     return DashboardOut(
         active_tasks=active_tasks,
@@ -148,10 +174,8 @@ def get_dashboard(
         failed_jobs=failed_jobs,
         running_jobs=running_jobs,
         last_checked_at=last_checked,
-        credential_status=(
-            credential.status if credential else CredentialStatus.UNASSIGNED.value
-        ),
-        credential_expires_at=credential.access_expires_at if credential else None,
+        credential_status=credential_status,
+        credential_expires_at=credential_expires_at,
         review_requests_today=(
             int(usage_row.review_requests) + int(usage_row.price_requests) if usage_row else 0
         ),

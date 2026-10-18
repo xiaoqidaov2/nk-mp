@@ -11,10 +11,14 @@ Covers, against a running QA stack (offline stub only):
    bindings and see *their own* price (699 vs 799), each visible only to its
    owner.
 5. Unbinding A: a new scan/task fails with 409 NIKE_CREDENTIAL_REQUIRED while
-   B keeps scanning; ``GET /me/nike-credential`` stays self-consistent.
+   B keeps scanning; ``GET /me/nike-credentials`` stays self-consistent.
 6. 30 秒档：任务保存 30 秒频率，调度器连续推两轮（一轮接一轮，不叠加）。
 7. 风控冷却：stub ``throttled`` 场景 -> 整轮提前结束（THROTTLED）、账号冷却、
    降速通知、补跑作业在窗口结束后先跑并成功。
+8. 一用户多账号轮换：A 绑第二个 Nike 账号 -> ``GET /me/nike-credentials`` 两行；
+   stub ``accounts2`` 只让第二个账号的 review 轮询 403 -> 该账号冷却，下一轮由
+   第一个账号完成（``GET /__state`` 的 ``reviews_by_identity`` 证明它零调用），
+   任务本身不显示冷却。
 
     apps/api/.venv/bin/python qa/smoke.py
 
@@ -68,8 +72,12 @@ STORE = "QA001"
 OPS_PHONE = "+8613800000000"
 A_PHONE = "+8613800000001"
 B_PHONE = "+8613800000002"
+#: A 的第二个 Nike 账号（一用户多账号）：只有它在 ``accounts2`` 场景下被限速。
+A2_PHONE = "+8613800000003"
+A2_IDENTITY = "A2"
 A_PRICE = 699
 B_PRICE = 799
+A2_PRICE = 899
 
 
 def fail(message: str) -> None:
@@ -141,29 +149,45 @@ class User:
             fail(f"{self.label} credential not usable after verify: {credential}")
         return credential
 
-    def credential(self) -> dict:
-        response = self.client.get("/api/v1/me/nike-credential")
+    def credentials(self) -> list[dict]:
+        """All bound Nike accounts of this platform user (one user, N accounts)."""
+        response = self.client.get("/api/v1/me/nike-credentials")
         if response.status_code != 200:
-            fail(f"{self.label} credential read: {response.status_code} {response.text}")
+            fail(f"{self.label} credentials read: {response.status_code} {response.text}")
         return response.json()
 
-    def unbind(self) -> None:
-        response = self.client.delete("/api/v1/me/nike-credential", headers=self.headers())
+    def credential(self) -> dict:
+        """The first account row, or a NOT_CONNECTED placeholder when unbound."""
+        rows = self.credentials()
+        return rows[0] if rows else {"status": "NOT_CONNECTED", "access_expires_at": None}
+
+    def unbind(self, index: int = 0) -> None:
+        rows = self.credentials()
+        if len(rows) <= index:
+            fail(f"{self.label} has no account at index {index} to unbind: {rows}")
+        target = rows[index]["id"]
+        response = self.client.delete(
+            f"/api/v1/me/nike-credentials/{target}", headers=self.headers()
+        )
         if response.status_code != 204:
             fail(f"{self.label} unbind: {response.status_code} {response.text}")
-        if not self._eventually(
-            lambda: self.credential()["status"] in ("REVOKED", "NOT_CONNECTED")
-        ):
+        if not self._eventually(lambda: len(self.credentials()) <= index):
             fail(f"{self.label}: unbind did not become visible")
 
     # ----------------------------------------------------------- scanning
 
     def create_task(
-        self, name: str, store_codes: list[str], cadence: int | None = None
+        self,
+        name: str,
+        store_codes: list[str],
+        cadence: int | None = None,
+        active: bool | None = None,
     ) -> httpx.Response:
         payload: dict = {"name": name, "store_codes": store_codes, "style_codes": [STYLE]}
         if cadence is not None:
             payload["cadence_seconds"] = cadence
+        if active is not None:
+            payload["is_active"] = active
         response = self.client.post(
             "/api/v1/tasks",
             json=payload,
@@ -413,7 +437,7 @@ def _section_30s(ops: "User") -> None:
     if datetime.fromisoformat(second["created_at"]) <= datetime.fromisoformat(first["finished_at"]):
         fail(f"30s rounds must not stack: {first} -> {second}")
     _pause_task(ops, task_id)
-    print(f"[10/11] 30 秒档闭环：连续两轮（{first['id'][:8]} → {second['id'][:8]}），已暂停")
+    print(f"[10/12] 30 秒档闭环：连续两轮（{first['id'][:8]} → {second['id'][:8]}），已暂停")
 
 
 def _section_throttle(stub: httpx.Client, ops: "User") -> None:
@@ -472,7 +496,133 @@ def _section_throttle(stub: httpx.Client, ops: "User") -> None:
     settled = _task_entry(ops, task_id)
     if settled["cooldown_until"] is not None:
         fail(f"a fully successful round should clear the expired cooldown: {settled}")
-    print("[11/11] 风控冷却闭环：THROTTLED → 冷却 → 补跑成功（无下一轮抢先）")
+    print("[11/12] 风控冷却闭环：THROTTLED → 冷却 → 补跑成功（无下一轮抢先）")
+
+
+def _stub_reviews(stub: httpx.Client) -> dict[str, int]:
+    """Per-identity review traffic (PUT + poll): proves which account served a round."""
+    response = stub.get("/__state")
+    if response.status_code != 200:
+        fail(f"stub state unavailable: {response.status_code} {response.text}")
+    return {
+        str(key): int(value)
+        for key, value in (response.json().get("reviews_by_identity") or {}).items()
+    }
+
+
+def _pause_active_tasks(user: "User") -> int:
+    """Pause every active task of ``user`` (manual rounds must not race the scheduler)."""
+    response = user.client.get("/api/v1/tasks")
+    if response.status_code != 200:
+        fail(f"{user.label} task list read failed: {response.status_code} {response.text}")
+    paused = 0
+    for row in response.json():
+        if row["is_active"]:
+            _pause_task(user, row["id"])
+            paused += 1
+    return paused
+
+
+def _section_multi_account(stub: httpx.Client, a: "User") -> None:
+    """一用户多账号：一个账号被限速冷却后，同一个任务自动换另一个账号继续。
+
+    全程只走 HTTP。账号选择是「未冷却里最近最少使用优先」，所以先用调度器真正
+    派发一轮把第一个账号记成"刚用过"（``mark_used``），第二个账号（从未使用）就
+    会稳定地被优先选中——不靠运气，冒烟可重复。
+    """
+    stub.post("/__scenario", json={"scenario": "baseline"})
+    registered = stub.post(
+        "/__accounts",
+        json={"phone": A2_PHONE, "identity": A2_IDENTITY, "price": A2_PRICE},
+    )
+    if registered.status_code != 200 or not registered.json().get("ok"):
+        fail(f"stub A2 account registration failed: {registered.status_code} {registered.text}")
+
+    # 账号一（identity A）：先绑上，并让调度器派发一次，写掉它的 last_attempt_at。
+    a_first = a.bind(A_PHONE)
+    priming = a.create_task(f"A 轮换预热 {time.strftime('%Y%m%d-%H%M%S')}", [STORE], cadence=30)
+    if priming.status_code != 201:
+        fail(f"priming task create failed: {priming.status_code} {priming.text}")
+    priming_id = priming.json()["id"]
+    primed = _wait_jobs(a, priming_id, minimum=1, timeout=120.0)
+    a.wait_job(primed[0]["id"], timeout=120.0)
+    # 之后 A 的任务全部停用：调度器不得抢派（它会用另一个账号去撞 403，污染计数）。
+    _pause_active_tasks(a)
+
+    # 账号二（identity A2）：作为第二个账号绑定，从未使用 → LRU 排在第一位。
+    a_second = a.bind(A2_PHONE)
+    rows = a.credentials()
+    if len(rows) != 2:
+        fail(f"a user with two Nike accounts must list exactly 2 rows: {rows}")
+    if {row["id"] for row in rows} != {a_first["id"], a_second["id"]}:
+        fail(f"credential rows must be the two bound accounts: {rows}")
+
+    # 只做手动检查的容器任务（停用）：轮换发生在账号选择层，与调度器共用同一段逻辑。
+    rotation = a.create_task(
+        f"A 轮换任务 {time.strftime('%Y%m%d-%H%M%S')}", [STORE], cadence=3600, active=False
+    )
+    if rotation.status_code != 201:
+        fail(f"rotation task create failed: {rotation.status_code} {rotation.text}")
+    rotation_id = rotation.json()["id"]
+
+    stub.post("/__scenario", json={"scenario": "accounts2"})
+    before = _stub_reviews(stub)
+    limited = a.run_scan(rotation_id)
+    after_limited = _stub_reviews(stub)
+    if limited["status"] != "FAILED" or limited["failed_stores"] != 1:
+        fail(f"the limited account round must end early with the store failed: {limited}")
+    store_rows = a.client.get(f"/api/v1/scans/{limited['id']}/stores").json()
+    if {row["error_code"] for row in store_rows} != {"THROTTLED"}:
+        fail(f"store rows should carry THROTTLED: {store_rows}")
+    a2_calls = after_limited.get(A2_IDENTITY, 0) - before.get(A2_IDENTITY, 0)
+    a_calls = after_limited.get("A", 0) - before.get("A", 0)
+    if a2_calls <= 0 or a_calls != 0:
+        fail(f"the limited round must be served by A2 only: A2={a2_calls} A={a_calls}")
+
+    # 冷却只落在被限速的那个账号上；另一个账号照常可用。
+    by_phone = {str(row["phone_masked"]): row for row in a.credentials()}
+    limited_row = by_phone.get(str(a_second["phone_masked"]))
+    healthy_row = by_phone.get(str(a_first["phone_masked"]))
+    if limited_row is None or healthy_row is None:
+        fail(f"credential rows must be addressable by masked phone: {by_phone}")
+    if not limited_row["cooldown_until"] or limited_row["cooldown_reason"] != "throttled":
+        fail(f"the limited account must carry a throttled cooldown: {limited_row}")
+    if healthy_row["cooldown_until"] is not None:
+        fail(f"the healthy account must not be cooling down: {healthy_row}")
+    window_end = datetime.fromisoformat(limited_row["cooldown_until"])
+    if datetime.now(UTC) >= window_end:
+        fail(
+            "the QA cooldown window elapsed before the recovery round (raise "
+            f"QA_THROTTLE_BACKOFF_SECONDS, now {THROTTLE_WINDOW}s)"
+        )
+
+    # 冷却期内下一轮必须落到另一个账号，且被限速账号一次也不许被调用。
+    before_success = _stub_reviews(stub)
+    recovered = a.run_scan(rotation_id)
+    after_success = _stub_reviews(stub)
+    if recovered["status"] != "SUCCEEDED" or recovered["done_stores"] != 1:
+        fail(f"the round after the cooldown must be served by the other account: {recovered}")
+    if after_success.get(A2_IDENTITY, 0) != before_success.get(A2_IDENTITY, 0):
+        fail(
+            "the successful round must not touch the cooling account: "
+            f"A2 {before_success.get(A2_IDENTITY, 0)} → {after_success.get(A2_IDENTITY, 0)}"
+        )
+    if after_success.get("A", 0) <= before_success.get("A", 0):
+        fail(
+            "the successful round must be served by account A: "
+            f"{before_success.get('A', 0)} → {after_success.get('A', 0)}"
+        )
+
+    entry = _task_entry(a, rotation_id)
+    if entry["cooldown_until"] is not None or entry["cooldown_reason"] is not None:
+        fail(f"another account is still usable, so the task must not report a cooldown: {entry}")
+
+    stub.post("/__scenario", json={"scenario": "baseline"})
+    print(
+        f"[12/12] 一用户多账号轮换：{a_second['phone_masked']} 被限速 → 冷却 "
+        f"{limited_row['cooldown_until']}；下一轮由 {a_first['phone_masked']} 完成，"
+        f"被限速账号零调用；任务无冷却"
+    )
 
 
 def _run_quota_cooldown(stub: httpx.Client) -> None:
@@ -571,7 +721,7 @@ def main() -> None:
 
         # --- operator binds its phone and syncs the store catalogue ---
         ops, synced, ops_credential = _bootstrap_ops(stub)
-        print(f"[1/11] ops bound + store sync ok: {synced} stores")
+        print(f"[1/12] ops bound + store sync ok: {synced} stores")
 
         # --- one phone, one platform account: a second binder is refused ---
         a = User("A", "qa-a@qa.local").login()
@@ -582,7 +732,7 @@ def main() -> None:
         b = User("B", "qa-b@qa.local").login()
         b_credential = b.bind(B_PHONE)
         print(
-            f"[2/11] three identities bound (ops={ops_credential['phone_masked']}, "
+            f"[2/12] three identities bound (ops={ops_credential['phone_masked']}, "
             f"A={a_credential['phone_masked']}, B={b_credential['phone_masked']})"
         )
 
@@ -611,7 +761,7 @@ def main() -> None:
         ).json()
         if before_events:
             fail("the first scan must only build a baseline, not a RESTOCK")
-        print("[3/11] baseline scan ok: 40=OUT_OF_STOCK, 42/44/46=IN_STOCK with price")
+        print("[3/12] baseline scan ok: 40=OUT_OF_STOCK, 42/44/46=IN_STOCK with price")
 
         # --- untrusted round: no stock conclusion, no stock events ---
         def stock_event_ids() -> set[int]:
@@ -639,7 +789,7 @@ def main() -> None:
         stores = ops.client.get(f"/api/v1/scans/{untrusted['id']}/stores").json()
         if any(row["status"] != "UNKNOWN" for row in stores):
             fail(f"store rows should be UNKNOWN: {stores}")
-        print(f"[4/11] untrusted round honest: {untrusted['status']} / unknown={untrusted['unknown_stores']}")
+        print(f"[4/12] untrusted round honest: {untrusted['status']} / unknown={untrusted['unknown_stores']}")
 
         # --- retry the incomplete stores after the restock flip ---
         stub.post("/__scenario", json={"scenario": "restock"})
@@ -676,7 +826,7 @@ def main() -> None:
         for token in (STYLE, "40", "QA001", "有货"):
             if token not in restock_notice["body"]:
                 fail(f"restock push body misses {token!r}: {restock_notice['body']!r}")
-        print(f"[5/11] retry + events + push ok: {sorted(restocked)}; quota={dashboard['review_requests_today']}")
+        print(f"[5/12] retry + events + push ok: {sorted(restocked)}; quota={dashboard['review_requests_today']}")
 
         # --- price change must notify: same stock, new price ---
         stub.post("/__scenario", json={"scenario": "price_up"})
@@ -715,7 +865,7 @@ def main() -> None:
         if pushes_after <= pushes_before:
             fail("a task-less manual check pushed nothing")
         print(
-            f"[5b/11] price change notified: {len(new_prices)} 条事件已推送；"
+            f"[5b/12] price change notified: {len(new_prices)} 条事件已推送；"
             f"临时检查（无任务）也推送（{pushes_before} → {pushes_after}）"
         )
 
@@ -745,7 +895,7 @@ def main() -> None:
         # Owner isolation inside one tenant: A must not read B's job.
         if a.client.get(f"/api/v1/scans/{b_job['id']}").status_code != 404:
             fail("A must not be able to read B's scan job")
-        print(f"[6/11] identity prices differ: A={a_cell['total_price']} B={b_cell['total_price']}, owner-scoped")
+        print(f"[6/12] identity prices differ: A={a_cell['total_price']} B={b_cell['total_price']}, owner-scoped")
 
         # --- unbind A: A is locked out, B keeps working ---
         a.unbind()
@@ -767,7 +917,7 @@ def main() -> None:
         b_cell_again = cell_map(b.matrix(STORE)).get((STORE, "42"))
         if not b_cell_again or b_cell_again["total_price"] != B_PRICE:
             fail(f"B price must stay {B_PRICE}: {b_cell_again}")
-        print(f"[7/11] A unbound -> 409 {a_scan.json()['error_code']}; B still scanning at {B_PRICE}")
+        print(f"[7/12] A unbound -> 409 {a_scan.json()['error_code']}; B still scanning at {B_PRICE}")
 
         # --- credential status is self-consistent for all three accounts ---
         a_state = a.credential()
@@ -786,7 +936,7 @@ def main() -> None:
         if stats["send_count"] != 3:
             fail(f"the stub should have counted exactly 3 SMS sends: {stats}")
         print(
-            f"[8/11] credential states ok: A={a_state['status']} "
+            f"[8/12] credential states ok: A={a_state['status']} "
             f"B={b_state['status']} ops={ops_state['status']}; stub sends={stats['send_count']}"
         )
 
@@ -817,11 +967,12 @@ def main() -> None:
         rows = notifications.json()
         if not rows or rows[0]["state"] != "SENT":
             fail(f"推送断言失败：最近记录首条应为已发送（{rows}）")
-        print("[9/11] 推送：测试消息与汇总消息均已送达")
+        print("[9/12] 推送：测试消息与汇总消息均已送达")
         _section_30s(ops)
         _section_throttle(stub, ops)
         _section_new_store(stub, ops)
         _section_waf_billing(stub, ops)
+        _section_multi_account(stub, a)
         print("SMOKE PASS")
 
 

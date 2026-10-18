@@ -108,3 +108,22 @@ def test_forced_status_wins() -> None:
     )
     assert job.status == JobStatus.FAILED.value
     assert job.error_summary == "credential missing"
+
+
+def test_waf_breaker_threshold_scales_with_the_round_size() -> None:
+    """熔断阈值取"配置下限"与"一轮门店数的 15%"的较大者（需求 D-NFR-RATE-06 健康线）。
+
+    160 店/轮里 7–11 家门店打满 405 重试是常态：固定 3 家会把正常波动误判成风暴，
+    整轮中止 + 账号冷却（实测一天 1996 轮里 50 轮）。
+    """
+    from app.config import Settings
+    from app.services.jobs import _waf_breaker_threshold
+
+    configured = Settings(credential_key="k", waf_storm_store_limit=3)
+    assert _waf_breaker_threshold(configured, 160) == 24
+    assert _waf_breaker_threshold(configured, 40) == 6
+    # 小任务：阈值不低于配置下限（2 家店的任务不会被"1 家打满"误伤）。
+    assert _waf_breaker_threshold(configured, 2) == 3
+    assert _waf_breaker_threshold(configured, 1) == 3
+    # 0 = 关闭熔断。
+    assert _waf_breaker_threshold(Settings(credential_key="k", waf_storm_store_limit=0), 160) == 0

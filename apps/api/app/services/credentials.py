@@ -26,7 +26,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -84,12 +84,117 @@ class CredentialBinding:
 
 @dataclass(frozen=True)
 class CredentialStatusInfo:
+    id: UUID
     status: str
     phone_masked: str | None
     access_expires_at: datetime | None
     last_refreshed_at: datetime | None
     last_error_code: str | None
     binding_generation: int
+    cooldown_until: datetime | None
+    cooldown_reason: str | None
+
+
+#: ``pick_ready`` 的"从未用过"占位时刻：空值排前面（先轮换到没用过的账号）。
+_LRU_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def pick_ready(session: Session, owner_user_id: UUID | None) -> Credential | None:
+    """给一个平台用户选一个可派发的 Nike 账号。
+
+    条件：状态 ACTIVE/EXPIRING、不在冷却窗口内；排序：最近最少使用（``last_used_at``
+    升序、空值最前）→ 稳定按 id。全部冷却/不可用时返回 ``None``：调用方暂停该账号的
+    派发，到点自动恢复。冷却落在 ``credential.cooldown_until``（见 services/throttle.py）。
+    """
+    if owner_user_id is None:
+        return None
+    now = datetime.now(UTC)
+    return session.execute(
+        select(Credential)
+        .where(
+            Credential.owner_user_id == owner_user_id,
+            Credential.status.in_(
+                [CredentialStatus.ACTIVE.value, CredentialStatus.EXPIRING.value]
+            ),
+            (Credential.cooldown_until.is_(None)) | (Credential.cooldown_until <= now),
+        )
+        .order_by(func.coalesce(Credential.last_used_at, _LRU_EPOCH).asc(), Credential.id.asc())
+        .limit(1)
+    ).scalars().first()
+
+
+def fallback_credential(session: Session, owner_user_id: UUID | None) -> Credential | None:
+    """没有可用账号时的回落：仍存在、但需要处理（需重验/冷却）的账号。
+
+    只服务"读一个具体账号"的路径（刷新/绑定/状态），让稳定错误码精确到
+    「需要重新验证」而不是笼统的「尚未连接」；派发只用 :func:`pick_ready`。
+    """
+    if owner_user_id is None:
+        return None
+    return session.execute(
+        select(Credential)
+        .where(
+            Credential.owner_user_id == owner_user_id,
+            Credential.status.notin_(
+                [CredentialStatus.REVOKED.value, CredentialStatus.UNASSIGNED.value]
+            ),
+        )
+        .order_by(Credential.updated_at.desc(), Credential.id.asc())
+        .limit(1)
+    ).scalars().first()
+
+
+def effective_status(record: Credential) -> str:
+    """存储状态按"过期且无法续期"修正后的展示状态。
+
+    只有"已过期且没有 refresh token"才是真的需要用户重新验证；可自动续期的账号
+    永远不会因为闲置一小时而被读成"需要重验"。
+    """
+    status = record.status
+    expires_at = record.access_expires_at
+    if (
+        status == CredentialStatus.ACTIVE.value
+        and expires_at is not None
+        and (expires_at - datetime.now(UTC)).total_seconds() < 0
+        and not record.refresh_token_enc
+    ):
+        return CredentialStatus.NEEDS_AUTHORIZATION.value
+    return status
+
+
+def status_info_of(record: Credential) -> CredentialStatusInfo:
+    """把一行 credential 映射成稳定的展示对象（含冷却窗口）。"""
+    return CredentialStatusInfo(
+        id=record.id,
+        status=effective_status(record),
+        phone_masked=record.phone_masked,
+        access_expires_at=record.access_expires_at,
+        last_refreshed_at=record.last_refreshed_at,
+        last_error_code=record.last_error_code,
+        binding_generation=record.binding_generation,
+        cooldown_until=record.cooldown_until,
+        cooldown_reason=record.cooldown_reason,
+    )
+
+
+def current_binding_condition(owner_user_id: UUID, credential_column, generation_column):
+    """SQL 谓词：该行写自该用户**当前**的某个账号（未断开且 generation 未变）。
+
+    一用户多账号下"当前绑定"是账号集合：任一账号按其当前 generation 写入的行仍然
+    属于该用户；换绑（generation+1）或断开（REVOKED）之后旧行不再展示。
+    """
+    return (
+        select(Credential.id)
+        .where(
+            Credential.id == credential_column,
+            Credential.owner_user_id == owner_user_id,
+            Credential.status.notin_(
+                [CredentialStatus.REVOKED.value, CredentialStatus.UNASSIGNED.value]
+            ),
+            Credential.binding_generation == generation_column,
+        )
+        .exists()
+    )
 
 
 def _decode_expiry(access_token: str) -> datetime | None:
@@ -135,16 +240,19 @@ class CredentialService:
         settings: Settings,
         owner_user_id: UUID,
         *,
+        credential_id: UUID | None = None,
         session_factory: Callable[[], Session] = SessionLocal,
     ) -> None:
         self.settings = settings
         self.owner_user_id = owner_user_id
+        #: 明确指定账号时只操作那一行；为空时按 ``pick_ready`` 自动选号。
+        self.credential_id = credential_id
         self._session_factory = session_factory
 
     # ------------------------------------------------------------------ reads
 
     def binding(self) -> CredentialBinding:
-        """Return the owner's current binding, or raise a stable error.
+        """Return a usable binding for this owner (explicit id or auto-picked).
 
         Confirms local ownership and status only; it never talks to Nike.
         """
@@ -170,7 +278,7 @@ class CredentialService:
         """Cheap guard executed before every authoritative upstream action."""
         with self._session_factory() as session:
             self._require_active_scope(session)
-            record = self._load(session)
+            record = self._load(session, binding=binding)
             if record is None:
                 raise CredentialRequired("Nike 账号尚未连接")
             if record.status == CredentialStatus.REVOKED.value:
@@ -194,23 +302,7 @@ class CredentialService:
             record = self._load(session)
             if record is None:
                 return None
-            status = record.status
-            expires_at = record.access_expires_at
-            if status == CredentialStatus.ACTIVE.value and expires_at is not None:
-                remaining = (expires_at - datetime.now(UTC)).total_seconds()
-                if remaining < 0 and not record.refresh_token_enc:
-                    # Only an expired token without a refresh token genuinely
-                    # needs the user; a renewable one is renewed automatically
-                    # and never reads as "expiring".
-                    status = CredentialStatus.NEEDS_AUTHORIZATION.value
-            return CredentialStatusInfo(
-                status=status,
-                phone_masked=record.phone_masked,
-                access_expires_at=expires_at,
-                last_refreshed_at=record.last_refreshed_at,
-                last_error_code=record.last_error_code,
-                binding_generation=record.binding_generation,
-            )
+            return status_info_of(record)
 
     # ----------------------------------------------------------------- tokens
 
@@ -236,7 +328,7 @@ class CredentialService:
         """
         with _lock_for(self.owner_user_id), self._session_factory() as session:
             self._lock_owner(session)
-            record = self._load(session, for_update=True)
+            record = self._load(session, for_update=True, binding=binding)
             if record is None:
                 raise CredentialRequired("Nike 账号尚未连接")
             self._match_binding(record, binding)
@@ -282,7 +374,7 @@ class CredentialService:
         """Refresh once, serialised in-process and across workers."""
         with _lock_for(self.owner_user_id), self._session_factory() as session:
             self._lock_owner(session)
-            record = self._load(session, for_update=True)
+            record = self._load(session, for_update=True, binding=binding)
             if record is None:
                 raise CredentialRequired("Nike 账号尚未连接")
             self._match_binding(record, binding)
@@ -300,12 +392,26 @@ class CredentialService:
     ) -> CredentialBinding:
         """Install a token pair for this owner (CLI / internal use).
 
-        First binding installs generation 1; replacing an existing credential
-        bumps the generation so old jobs can never use the new account.
+        An explicit ``credential_id`` updates that account and bumps its
+        generation so old jobs can never use the new tokens. Without an id the
+        owner must have at most one account: none inserts generation 1, one is
+        replaced, several refuse (the operator must pick a target).
         """
         with _lock_for(self.owner_user_id), self._session_factory() as session:
             self._lock_owner(session)
-            record = self._load(session, for_update=True)
+            if self.credential_id is not None:
+                record = self._load(session, for_update=True)
+                if record is None:
+                    raise CredentialRequired("指定的 Nike 账号不存在")
+            else:
+                records = session.execute(
+                    select(Credential)
+                    .where(Credential.owner_user_id == self.owner_user_id)
+                    .with_for_update()
+                ).scalars().all()
+                if len(records) > 1:
+                    raise CredentialUnavailable("该用户有多个 Nike 账号，请指定账号")
+                record = records[0] if records else None
             if record is None:
                 record = Credential(
                     owner_user_id=self.owner_user_id,
@@ -329,6 +435,22 @@ class CredentialService:
                 generation=record.binding_generation,
             )
 
+    def mark_used(self, credential_id: UUID) -> None:
+        """LRU 前进：派发成功后记录该账号刚被使用（供 ``pick_ready`` 轮换）。
+
+        只写 ``last_used_at``；``last_attempt_at`` 是续期退避的时间戳，派发不能碰它。
+        """
+        with self._session_factory() as session:
+            session.execute(
+                update(Credential)
+                .where(
+                    Credential.id == credential_id,
+                    Credential.owner_user_id == self.owner_user_id,
+                )
+                .values(last_used_at=datetime.now(UTC))
+            )
+            session.commit()
+
     def revoke_local(self, session: Session, *, only_if_active: bool = True) -> bool:
         """Mark this owner's credential as locally disconnected.
 
@@ -349,6 +471,11 @@ class CredentialService:
         record.access_expires_at = None
         record.last_error = ""
         record.last_error_code = None
+        # 断开后不再有任何冷却语义：残留窗口不该暂停该用户其它账号的派发。
+        record.cooldown_until = None
+        record.cooldown_level = 0
+        record.cooldown_reason = None
+        record.cooldown_notified_at = None
         record.updated_at = datetime.now(UTC)
         session.flush()
         return True
@@ -360,8 +487,26 @@ class CredentialService:
         self._lock_owner(session)
         self._load(session, for_update=True)
 
-    def _load(self, session: Session, *, for_update: bool = False) -> Credential | None:
-        stmt = select(Credential).where(Credential.owner_user_id == self.owner_user_id)
+    def _load(
+        self,
+        session: Session,
+        *,
+        for_update: bool = False,
+        binding: CredentialBinding | None = None,
+    ) -> Credential | None:
+        """Load the addressed credential row (binding > explicit id > auto-pick)."""
+        credential_id = binding.credential_id if binding is not None else self.credential_id
+        if credential_id is None:
+            picked = pick_ready(session, self.owner_user_id)
+            if picked is None:
+                picked = fallback_credential(session, self.owner_user_id)
+            if picked is None or not for_update:
+                return picked
+            credential_id = picked.id
+        stmt = select(Credential).where(
+            Credential.id == credential_id,
+            Credential.owner_user_id == self.owner_user_id,
+        )
         if for_update:
             stmt = stmt.with_for_update().execution_options(populate_existing=True)
         return session.execute(stmt).scalar_one_or_none()
@@ -550,9 +695,9 @@ def refresh_expiring(settings: Settings, *, limit: int = 50) -> int:
     """
     threshold = datetime.now(UTC) + timedelta(seconds=REFRESH_MARGIN_SECONDS)
     with SessionLocal() as session:
-        owners = list(
+        rows = list(
             session.execute(
-                select(Credential.owner_user_id)
+                select(Credential.id, Credential.owner_user_id)
                 .where(
                     Credential.owner_user_id.is_not(None),
                     Credential.status.in_(
@@ -567,12 +712,14 @@ def refresh_expiring(settings: Settings, *, limit: int = 50) -> int:
                 )
                 .order_by(Credential.access_expires_at)
                 .limit(limit)
-            ).scalars()
+            ).all()
         )
     renewed = 0
-    for owner_user_id in owners:
+    for credential_id, owner_user_id in rows:
         try:
-            if CredentialService(settings, owner_user_id).try_refresh():
+            if CredentialService(
+                settings, owner_user_id, credential_id=credential_id
+            ).try_refresh():
                 renewed += 1
         except CredentialError:
             # A transient upstream problem is retried on the next tick; a

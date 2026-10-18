@@ -153,10 +153,15 @@ def account(client):
 # ------------------------------------------------------------------ helpers
 
 
-def _start(client, account, request_id, *, session=None, csrf=None, phone=PHONE):  # noqa: ANN001
+def _start(  # noqa: ANN001
+    client, account, request_id, *, session=None, csrf=None, phone=PHONE, credential_id=None
+):
+    payload = {"phone": phone, "consent": True, "request_id": str(request_id)}
+    if credential_id is not None:
+        payload["credential_id"] = credential_id
     return client.post(
         "/api/v1/me/nike-auth/sessions",
-        json={"phone": phone, "consent": True, "request_id": str(request_id)},
+        json=payload,
         headers=csrf_headers(csrf or account["csrf"]),
         cookies=session_cookies(session or account["session"]),
     )
@@ -179,9 +184,10 @@ def _cancel(client, account, attempt_id, *, session=None, csrf=None):  # noqa: A
     )
 
 
-def _disconnect(client, account):  # noqa: ANN001
+def _disconnect(client, account, credential_id):  # noqa: ANN001
     return client.delete(
-        "/api/v1/me/nike-credential", headers=csrf_headers(account["csrf"])
+        f"/api/v1/me/nike-credentials/{credential_id}",
+        headers=csrf_headers(account["csrf"]),
     )
 
 
@@ -355,7 +361,7 @@ def test_upstream_verify_timeout_is_not_replayed(fake_auth, client, account) -> 
     assert fake_auth.verify_calls == 1
 
 
-def test_failed_rebind_keeps_old_binding_and_success_bumps_generation(fake_auth, client, account) -> None:
+def test_failed_reverify_keeps_the_account_and_success_bumps_generation(fake_auth, client, account) -> None:
     settings = get_settings()
     user_id = account["user_id"]
     binding1 = store_credential(settings, user_id, access_token="old-access", refresh_token="old-refresh")
@@ -372,26 +378,76 @@ def test_failed_rebind_keeps_old_binding_and_success_bumps_generation(fake_auth,
     assert _cancel(client, account, failed_id).status_code == 204
     fake_auth.verify_error = None
     fake_auth.tokens = PhoneAuthTokens("new-access", "new-refresh", "cid", None)
-    success_id = _start(client, account, uuid.uuid4()).json()["id"]
-    assert _verify(client, account, success_id).status_code == 200
 
-    binding2 = CredentialService(settings, user_id).binding()
+    # 指定账号重新验证：更新那一行并把 generation 推进，旧绑定立即失效。
+    reverify_id = _start(
+        client, account, uuid.uuid4(), credential_id=str(binding1.credential_id)
+    ).json()["id"]
+    assert _verify(client, account, reverify_id).status_code == 200
+
+    binding2 = CredentialService(
+        settings, user_id, credential_id=binding1.credential_id
+    ).binding()
     assert binding2.credential_id == binding1.credential_id
     assert binding2.generation == binding1.generation + 1
-    assert CredentialService(settings, user_id).access_token(binding=binding2) == "new-access"
+    assert (
+        CredentialService(settings, user_id, credential_id=binding1.credential_id).access_token(
+            binding=binding2
+        )
+        == "new-access"
+    )
     # The old frozen binding can no longer be used.
     with pytest.raises(CredentialChanged):
-        CredentialService(settings, user_id).assert_binding(binding1)
+        CredentialService(settings, user_id, credential_id=binding1.credential_id).assert_binding(binding1)
+
+    # 不指定账号 = 再加一个账号：行数 +1，原账号继续可用。
+    fake_auth.tokens = PhoneAuthTokens("second-access", "second-refresh", "cid", None)
+    added_id = _start(client, account, uuid.uuid4(), phone="+8613800138001").json()["id"]
+    added = _verify(client, account, added_id)
+    assert added.status_code == 200
+    added_credential_id = added.json()["id"]
+    assert added_credential_id != str(binding1.credential_id)
+    with SessionLocal() as db:
+        rows = db.execute(select(Credential)).scalars().all()
+        assert {str(row.id) for row in rows} == {
+            str(binding1.credential_id),
+            added_credential_id,
+        }
+    assert (
+        CredentialService(settings, user_id, credential_id=binding1.credential_id).access_token(
+            binding=binding2
+        )
+        == "new-access"
+    )
 
 
-def test_disconnect_without_credential_cancels_pending_attempt(fake_auth, client, account) -> None:
+def test_disconnect_revokes_the_account_and_cancels_pending_attempts(fake_auth, client, account) -> None:
+    settings = get_settings()
+    binding = store_credential(settings, account["user_id"], access_token="acc", refresh_token="ref")
+    attempt_id = _start(client, account, uuid.uuid4()).json()["id"]
+    assert _attempt_row(attempt_id).state == "CODE_SENT"
+
+    assert _disconnect(client, account, binding.credential_id).status_code == 204
+
+    assert _attempt_row(attempt_id).state == "CANCELLED"
+    with SessionLocal() as db:
+        row = db.get(Credential, binding.credential_id)
+        assert row.status == "REVOKED"
+        assert row.binding_generation == binding.generation + 1
+        assert row.access_token_enc == "" and row.refresh_token_enc == ""
+
+
+def test_disconnect_unknown_credential_is_rejected(fake_auth, client, account) -> None:
     settings = get_settings()
     attempt_id = _start(client, account, uuid.uuid4()).json()["id"]
     assert CredentialService(settings, account["user_id"]).status() is None
 
-    assert _disconnect(client, account).status_code == 204
+    response = _disconnect(client, account, uuid.uuid4())
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "NIKE_CREDENTIAL_NOT_FOUND"
 
-    assert _attempt_row(attempt_id).state == "CANCELLED"
+    # 未命中的断开不会误伤进行中的验证。
+    assert _attempt_row(attempt_id).state == "CODE_SENT"
     with SessionLocal() as db:
         assert db.execute(select(Credential)).scalars().all() == []
 
@@ -404,6 +460,12 @@ def test_late_verify_result_is_not_installed(fake_auth, client, account, action)
     fake_auth.verify_release = release
     fake_auth.tokens = PhoneAuthTokens("late-access", "late-refresh", "cid", None)
 
+    # 「断开」需要一个真实存在的账号行（多账号下逐个断开）。
+    binding = (
+        store_credential(settings, account["user_id"], access_token="acc", refresh_token="ref")
+        if action == "disconnect"
+        else None
+    )
     attempt_id = _start(client, account, uuid.uuid4()).json()["id"]
     outcome: dict[str, object] = {}
 
@@ -423,7 +485,8 @@ def test_late_verify_result_is_not_installed(fake_auth, client, account, action)
     if action == "cancel":
         assert _cancel(client, account, attempt_id).status_code == 204
     elif action == "disconnect":
-        assert _disconnect(client, account).status_code == 204
+        assert binding is not None
+        assert _disconnect(client, account, binding.credential_id).status_code == 204
     else:
         assert client.post("/api/v1/auth/logout").status_code == 200
 
@@ -443,10 +506,12 @@ def test_feature_flag_off_blocks_send_and_verify(fake_auth, client, account, mon
     get_settings.cache_clear()
 
     # Reading the credential still returns the real state, just not available.
-    status = client.get("/api/v1/me/nike-credential")
+    status = client.get("/api/v1/me/nike-credentials")
     assert status.status_code == 200, status.text
-    assert status.json()["login_available"] is False
-    assert status.json()["status"] == "ACTIVE"
+    rows = status.json()
+    assert len(rows) == 1
+    assert rows[0]["login_available"] is False
+    assert rows[0]["status"] == "ACTIVE"
 
     start = _start(client, account, uuid.uuid4())
     assert start.status_code == 503
@@ -459,7 +524,7 @@ def test_feature_flag_off_blocks_send_and_verify(fake_auth, client, account, mon
     assert fake_auth.verify_calls == 0
 
     # Disconnect is a local action and still works while login is off.
-    assert _disconnect(client, account).status_code == 204
+    assert _disconnect(client, account, rows[0]["id"]).status_code == 204
 
 
 def _app():

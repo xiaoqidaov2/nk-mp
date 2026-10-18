@@ -54,10 +54,12 @@ def _attempt_out(view: nike_auth.AttemptView) -> NikeAuthAttemptOut:
     )
 
 
-def _credential_out(settings: Settings, user_id: uuid.UUID) -> NikeCredentialOut:
-    data = nike_auth.credential_view(settings, user_id)
-    data["login_available"] = nike_auth.login_available(settings)
-    return NikeCredentialOut(**data)
+def _credential_list_out(settings: Settings, user_id: uuid.UUID) -> list[NikeCredentialOut]:
+    available = nike_auth.login_available(settings)
+    return [
+        NikeCredentialOut(**{**row, "login_available": available})
+        for row in nike_auth.credential_views(settings, user_id)
+    ]
 
 
 def _not_available() -> JSONResponse:
@@ -68,13 +70,14 @@ def _not_available() -> JSONResponse:
     )
 
 
-@router.get("/nike-credential", response_model=NikeCredentialOut)
-def get_nike_credential(
+@router.get("/nike-credentials", response_model=list[NikeCredentialOut])
+def list_nike_credentials(
     settings: Settings = Depends(settings_dep),
     payload: tuple[User, AuthSession] = Depends(get_current_session),
-) -> NikeCredentialOut:
+) -> list[NikeCredentialOut]:
+    """当前用户已连接的 Nike 账号（一用户多账号；空列表 = 未连接）。"""
     user, _ = payload
-    return _credential_out(settings, user.id)
+    return _credential_list_out(settings, user.id)
 
 
 @router.post("/nike-auth/sessions", response_model=NikeAuthAttemptOut, status_code=201)
@@ -97,6 +100,7 @@ def start_nike_auth_session(
             phone=body.phone,
             request_id=body.request_id,
             client_ip=client_ip,
+            credential_id=body.credential_id,
         )
     except nike_auth.NikeAuthError as exc:
         return _error(exc)
@@ -138,7 +142,7 @@ def verify_nike_auth_session(
     if not nike_auth.login_available(settings):
         return _not_available()
     try:
-        nike_auth.verify_attempt(
+        view = nike_auth.verify_attempt(
             settings=settings,
             user_id=user.id,
             auth_session_id=auth_session.id,
@@ -150,7 +154,9 @@ def verify_nike_auth_session(
     # 绑定成功的瞬间就登记预加载：用该用户自己的连接拉取门店目录并缓存。
     bootstrap_service.ensure_plan(db, user.id)
     db.commit()
-    return _credential_out(settings, user.id)
+    return NikeCredentialOut(
+        **{**view, "login_available": nike_auth.login_available(settings)}
+    )
 
 
 @router.delete("/nike-auth/sessions/{attempt_id}", status_code=204)
@@ -216,11 +222,16 @@ def start_bootstrap(
     )
 
 
-@router.delete("/nike-credential", status_code=204)
+@router.delete("/nike-credentials/{credential_id}", status_code=204)
 def disconnect_nike_credential(
+    credential_id: uuid.UUID,
     settings: Settings = Depends(settings_dep),
     payload: tuple[User, AuthSession] = Depends(require_self_write),
 ) -> Response:
+    """断开指定的一个 Nike 账号；其余账号继续运行。"""
     user, _ = payload
-    nike_auth.disconnect(settings=settings, user_id=user.id)
+    try:
+        nike_auth.disconnect(settings=settings, user_id=user.id, credential_id=credential_id)
+    except nike_auth.NikeAuthError as exc:
+        return _error(exc)
     return Response(status_code=204)

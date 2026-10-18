@@ -92,17 +92,30 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
   - `POST /token/v1` → 同时支持 `authorization_code`（每个 code/身份签发**互相区分**的
     access/refresh token，并校验 PKCE S256）与 `refresh_token`（轮换后保持同一身份）。
 - 身份与数据
+  - 只读接口：`/o2o/buy/regions/v1`（门店清单）与 `/o2o/buy/cart_reviews/v2/{id}`
+    （PUT 提交 + GET 轮询），以及两种尺码结构端点——
+    `…/product_details/v1/…/store_number/{store}/style_color/{style}`
+    （`NikeClient.fetch_structure`）与批量
+    `…/product_details/internal/v1/…/store_number/{store}?productCodes=…`
+    （`NikeClient.fetch_structures`，按 ≤30 货号分块）。未知门店返回空 `products`，
+    响应里缺的货号由客户端按 `MISSING` 处理（未知绝不当作结论）。
   - 压测门店：`STUB_EXTRA_STORES=N` 让 stub 额外生成 `QA003..QA0NN`（各带 40/42/44/46 尺码表），
     用于并发/额度曲线压测；默认 0，冒烟仍是 QA001/QA002 两家、断言不变。
   - `+8613800000000` 为内置的 **default 身份**，走 `baseline`/`restock`/`untrusted`/`throttled`/
     `price_up` 场景开关（`POST /__scenario`）；未携带/未知 token 同样按 default 处理。
     - `throttled`：review 轮询返回 403（风控/限速），用于验收「整轮提前结束 + 账号冷却 +
       到点先补跑失败门店」；已登记的身份（A/B）不受场景开关影响。
+    - `accounts2`：**只**让第二个 Nike 账号（scoped 身份 `A2`）的 review 轮询返回 403；
+      其它身份（`A`/`B`/`default`）行为不变。用于验收「一用户多账号：一个账号被限速冷却，
+      同一个任务下一轮自动换另一个账号继续」。
     - `price_up`：在货状态不变、价格 +100，用于验收「变价必须推送」（冒烟第 5b 步）。
-  - `POST /__accounts {"phone","identity","price"}` 登记身份（smoke 用 A=699、B=799）；
-    已登记的 token 在 o2o 接口返回**自己的固定价格**，不受场景开关影响。
+  - `POST /__accounts {"phone","identity","price"}` 登记身份（smoke 用 A=699、B=799、
+    多账号轮换用 A2=899）；已登记的 token 在 o2o 接口返回**自己的固定价格**，不受场景开关影响。
 - 观测与复位
   - `GET /__stats`（`send_count`/`codes_issued`/`token_grants`/`refresh_grants`/`push_count` 等）。
+  - `GET /__state`：身份级运行态。`reviews_by_identity` 是每个身份（`A`/`A2`/`B`/`default`）
+    的 review 调用数（PUT + 每次轮询），冒烟用它证明**一轮究竟由哪个 Nike 账号在跑**
+    （失败轮 `A2` 增长、随后成功轮 `A2` 不变）。
   - `POST /__reset` 清空全部内存状态（账号除外会重置为仅 default；`pushes` 也一并清空），便于反复冒烟。
 - 推送落点（离线渠道）
   - `POST /__push`：Apprise `json://` 目标收到的载荷记为一条
@@ -119,9 +132,9 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
    `retry-failed` → 尺码 40 的 RESTOCK；配额逐笔增长。
 3. A/B 各自建任务并扫描同一门店同一货号，矩阵中价格互不相同且各自可见
    （A=699、B=799），并验证 A 读不到 B 的扫描任务（同租户、跨 owner 隔离）。
-4. `DELETE /me/nike-credential` 解绑 A → A 新建扫描/任务返回 409
-   `NIKE_CREDENTIAL_REQUIRED`；B 继续扫描成功；`GET /me/nike-credential`
-   三人状态自洽（A 无令牌、B/ops 仍 ACTIVE）。
+4. `DELETE /me/nike-credentials/{id}` 解绑 A 的那个账号 → A 新建扫描/任务返回 409
+   `NIKE_CREDENTIAL_REQUIRED`；B 继续扫描成功；`GET /me/nike-credentials`
+   三人状态自洽（A 空列表 = 未连接、B/ops 仍 ACTIVE）。
 5. stub 计数：`send_count == 3`；未知手机号 404、错误验证码 400 亦在断言内。
 9. 消息推送：渠道创建 → 测试消息 → 检查结束后的汇总消息送达 stub（`/__push`）；
    最近一条投递记录为 `SENT`。
@@ -132,6 +145,16 @@ QA_API=http://127.0.0.1:8000 QA_STUB=http://127.0.0.1:9100 \
     跟随 QA 阶梯）→ 降速通知送达 stub（含「自动继续」）→ 补跑作业排队且在窗口内保持
     `QUEUED`（`not_before` 未到不会被租约）→ 窗口过后按 `baseline` 先补跑并成功 →
     冷却被清空、任务下没有多跑的整轮。
+12. 一用户多账号轮换（12/12，全 HTTP）：stub 登记 `+8613800000003` 为身份 `A2`
+    （价格 899）→ A 先绑回第一个账号（`+8613800000001`，身份 `A`），让调度器真派发一轮
+    把它的 `last_attempt_at` 写掉（「最近最少使用」因此有确定顺序）→ 再绑 `A2` 作为第二个
+    账号 → `GET /me/nike-credentials` **两行** → stub 切 `accounts2` → 手动检查一轮命中
+    `A2`：作业 `FAILED`、门店行 `error_code=THROTTLED`，且 `GET /__state` 的
+    `reviews_by_identity` 显示只有 `A2` 增长 → `A2` 的账号行带 `cooldown_until`（原因
+    `throttled`）、`A` 的行没有 → 紧接着（冷却窗口内）再手动检查一轮由 `A` 完成
+    `SUCCEEDED`，且该轮 `A2` 计数**零增长** → 任务条目 `cooldown_until`/`cooldown_reason`
+    为空（还有可用账号）→ 场景复位 `baseline`。窗口长度由 `QA_THROTTLE_BACKOFF_SECONDS`
+    对齐（被限速账号在整个冷却窗口内不会被再次选中）。
 
 ### 冷却与补跑专项（`QA_SMOKE_MODE=cooldown`，压低小时闸）
 
@@ -171,6 +194,31 @@ stub 叠加文件与自包含 QA 栈默认把节奏压到秒级，便于在冒�
 
 `qa/smoke.py` 用 `QA_THROTTLE_BACKOFF_SECONDS` / `QA_JOB_RETRY_DELAY_SECONDS` 对齐期望窗口，
 换值启动栈时把同样的值传给脚本即可。
+
+### 调度主备与监控（双 scheduler / `monitor` 服务）
+
+自包含 QA 栈（`qa/compose.auth*.yaml`）与根 `compose.yaml` 一样带 `monitor` 服务
+（`python -m app.monitor_main`）：它只写心跳并实时核对每个活跃任务的「上次执行 / 下次
+预期 / 是否迟到」，不落任何调度状态。`scheduler`/`worker`/`monitor` 每个实例每拍往
+`service_heartbeat` upsert 一行。
+
+```bash
+# 双 scheduler：第二个进程抢不到派发事务锁，自动待命（同一任务只派一份作业）
+docker compose -p nike-mp-auth-qa -f qa/compose.auth.yaml -f qa/compose.stub.yaml \
+  up -d --scale scheduler=2
+docker compose -p nike-mp-auth-qa -f qa/compose.auth.yaml -f qa/compose.stub.yaml ps
+docker compose -p nike-mp-auth-qa -f qa/compose.auth.yaml -f qa/compose.stub.yaml \
+  exec -T db psql -U nike_mp -d nike_mp \
+  -c "select service, instance_id, last_seen_at from service_heartbeat order by service, instance_id" \
+  -c "update monitor_task set next_run_at = now() - interval '1 minute' where id = '<task>'::uuid" \
+  -c "select count(*) from scan_job where task_id = '<task>'::uuid and status = 'QUEUED'"
+
+# 运维接口（ops 账号）：实例心跳 / worker 列表 / 迟到任务 / 冷却账号 / 队列深度
+curl -b cookies.txt http://127.0.0.1:18000/api/v1/ops/scheduler-health
+```
+
+等两拍（该栈 `NIKE_MP_SCHEDULER_INTERVAL_SECONDS=5`，约 15 秒）后统计应为 **1**
+（advisory lock 让每一拍只有一个 scheduler 真正派发）。
 
 ### 关于手机号
 
@@ -275,7 +323,7 @@ for i in range(40):
 
 - 登录后立刻请求 → `401 session not found`（实测 ~12%，见上）；
 - `POST /tasks` 201 后立刻 `POST /scans {task_id}` → 可能 `404 任务不存在`；
-- `DELETE /me/nike-credential` 204 后立刻发起扫描 → 可能仍读到旧绑定（不返回 409）；
+- `DELETE /me/nike-credentials/{id}` 204 后立刻发起扫描 → 可能仍读到旧绑定（不返回 409）；
 - `POST /scans/{id}/retry-failed` 后立刻轮询 → 可能先读到重排前的终态快照。
 
 **影响面**：任何“写后紧接读”的自动化/前端快速跳转都可能偶发失败；人工操作的浏览器

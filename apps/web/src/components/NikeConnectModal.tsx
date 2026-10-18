@@ -75,6 +75,8 @@ export interface NikeConnectModalProps {
   open: boolean;
   /** connect：未连接时首次绑定；reauth：已连接时更换/重新验证。 */
   mode: "connect" | "reauth";
+  /** 指定要重新验证的账号；不传＝再绑一个新账号。 */
+  credentialId?: string;
   onClose: () => void;
   /** 上游短信通道是否开放（来自连接状态）。 */
   loginAvailable: boolean;
@@ -90,6 +92,7 @@ export interface NikeConnectModalProps {
 export function NikeConnectModal({
   open,
   mode,
+  credentialId,
   onClose,
   loginAvailable,
   credentialLoading,
@@ -177,9 +180,14 @@ export function NikeConnectModal({
   const finishConnected = (updated?: NikeCredentialOut) => {
     if (userId) {
       clearNikeAttemptId(userId);
-      // 本标签页验证成功时响应里就是最新凭据，直接落缓存；跨标签页完成才需要重取。
-      if (updated) queryClient.setQueryData(["nike-credential", userId], updated);
-      else void queryClient.invalidateQueries({ queryKey: ["nike-credential", userId] });
+      // 本标签页验证成功时响应里就是最新账号，直接并入缓存；跨标签页完成才需要重取。
+      if (updated) {
+        queryClient.setQueryData<NikeCredentialOut[]>(["nike-credentials", userId], (rows) => [
+          ...(rows ?? []).filter((row) => row.id !== updated.id),
+          updated,
+        ]);
+      }
+      void queryClient.invalidateQueries({ queryKey: ["nike-credentials", userId] });
     }
     onConnected();
     message.success(MSG.connected());
@@ -212,8 +220,13 @@ export function NikeConnectModal({
   }, [attempt.data, userId, open]);
 
   const start = useMutation({
-    mutationFn: (target: string) =>
-      nikeCredentialApi.start({ phone: target, consent: true, request_id: newRequestId() }),
+    mutationFn: (target: string) => {
+      const payload = { phone: target, consent: true as const, request_id: newRequestId() };
+      // 带上 credential_id＝重新验证该账号；不传＝再绑一个账号。
+      return credentialId
+        ? nikeCredentialApi.start({ ...payload, credential_id: credentialId })
+        : nikeCredentialApi.start(payload);
+    },
     onSuccess: (created) => {
       setNotice("");
       setNow(Date.now());
@@ -244,7 +257,10 @@ export function NikeConnectModal({
       setNotice("");
       if (userId) {
         clearNikeAttemptId(userId);
-        queryClient.setQueryData(["nike-credential", userId], updated);
+        queryClient.setQueryData<NikeCredentialOut[]>(["nike-credentials", userId], (rows) => [
+          ...(rows ?? []).filter((row) => row.id !== updated.id),
+          updated,
+        ]);
       }
       onConnected();
       setBootstrapping(true);

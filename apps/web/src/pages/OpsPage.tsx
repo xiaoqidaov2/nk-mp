@@ -2,18 +2,36 @@ import { Alert, App as AntdApp, Button, Descriptions, Space, Table, Tag, Typogra
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { CardRow, ResponsiveList } from "@/components/MobileCardList";
-import { NikeConnectionNotice, NikeCredentialCard, isCredentialActive, useNikeCredentialQuery } from "@/components/NikeCredentialCard";
+import { NikeConnectionNotice, NikeCredentialCard, isCredentialActive, useNikeCredentialsQuery } from "@/components/NikeCredentialCard";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
-import { BTN, EMPTY, ERR, MODALS, MSG, OPS, formatCount } from "@/copy";
+import {
+  BTN,
+  EMPTY,
+  ERR,
+  MODALS,
+  MSG,
+  OPS,
+  cooldownReasonText,
+  formatClock,
+  formatCount,
+  formatDateTimeSeconds,
+  formatDuration,
+} from "@/copy";
 import { dashboardApi, opsApi } from "@/data/api";
 import { opApiList } from "@/data/opsTypes";
 import type { TenantRow } from "@/data/opsTypes";
+import type {
+  SchedulerCoolingAccount,
+  SchedulerHealthInstance,
+  SchedulerHealthWorker,
+  SchedulerOverdueTask,
+} from "@/data/types";
 
 export function OpsPage() {
   const queryClient = useQueryClient();
-  const credential = useNikeCredentialQuery();
-  const bound = isCredentialActive(credential.data?.status);
+  const credentials = useNikeCredentialsQuery();
+  const bound = (credentials.data ?? []).some((row) => isCredentialActive(row.status));
   const { message, modal } = AntdApp.useApp();
   const tenants = useQuery({
     queryKey: ["ops", "tenants"],
@@ -23,6 +41,11 @@ export function OpsPage() {
   const health = useQuery({
     queryKey: ["ops", "health"],
     queryFn: () => opsApi.healthDetail(),
+    retry: false,
+  });
+  const schedulerHealth = useQuery({
+    queryKey: ["ops", "scheduler-health"],
+    queryFn: () => opsApi.schedulerHealth(),
     retry: false,
   });
   const upstream = health.data?.nike_api_base ?? "";
@@ -114,6 +137,181 @@ export function OpsPage() {
     />
   );
 
+  const schedulerData = schedulerHealth.data;
+
+  const diskLine = schedulerHealth.data
+    ? OPS.diskUsage(
+        formatCount(schedulerHealth.data.disk.used_gb),
+        formatCount(schedulerHealth.data.disk.total_gb),
+        schedulerHealth.data.disk.used_percent,
+      )
+    : "";
+
+  const schedulerInstances = (
+    <Table<SchedulerHealthInstance>
+      size="small"
+      rowKey="instance_id"
+      pagination={false}
+      dataSource={schedulerData?.scheduler ?? []}
+      locale={{ emptyText: OPS.emptyScheduler }}
+      columns={[
+        {
+          title: OPS.colInstance,
+          dataIndex: "instance_id",
+          render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
+        },
+        {
+          title: OPS.colLastSeen,
+          dataIndex: "last_seen_at",
+          width: 180,
+          render: (value: string | null) => formatDateTimeSeconds(value),
+        },
+        {
+          title: OPS.colState,
+          dataIndex: "alive",
+          width: 140,
+          render: (alive: boolean) =>
+            alive ? (
+              <Tag color="green">{OPS.schedulerAlive}</Tag>
+            ) : (
+              <Tag color="red">{OPS.schedulerStale}</Tag>
+            ),
+        },
+      ]}
+    />
+  );
+
+  const workerNodes = (
+    <Table<SchedulerHealthWorker>
+      size="small"
+      rowKey="instance_id"
+      pagination={false}
+      dataSource={schedulerData?.workers ?? []}
+      locale={{ emptyText: OPS.emptyWorkers }}
+      columns={[
+        {
+          title: OPS.colInstance,
+          dataIndex: "instance_id",
+          render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
+        },
+        {
+          title: OPS.colLastSeen,
+          dataIndex: "last_seen_at",
+          width: 180,
+          render: (value: string | null) => formatDateTimeSeconds(value),
+        },
+        {
+          title: OPS.colRunningJobs,
+          dataIndex: "running_jobs",
+          width: 120,
+          render: (value: number) => formatCount(value),
+        },
+      ]}
+    />
+  );
+
+  const overdueTasks = (
+    <ResponsiveList<SchedulerOverdueTask>
+      items={schedulerData?.overdue_tasks ?? []}
+      rowKey={(row) => row.task_id}
+      empty={<div className="empty-state__description">{OPS.emptyOverdue}</div>}
+      renderCard={(row) => (
+        <>
+          <div className="mobile-card-list__row">
+            <span>{row.name}</span>
+          </div>
+          <CardRow label={OPS.colNextRun}>{formatDateTimeSeconds(row.next_run_at)}</CardRow>
+          <CardRow label={OPS.colOverdue}>{formatDuration(row.overdue_seconds)}</CardRow>
+          <CardRow label={OPS.colLastFinished}>{formatDateTimeSeconds(row.last_finished_at)}</CardRow>
+        </>
+      )}
+      table={
+        <Table<SchedulerOverdueTask>
+          size="small"
+          rowKey="task_id"
+          pagination={false}
+          dataSource={schedulerData?.overdue_tasks ?? []}
+          locale={{ emptyText: OPS.emptyOverdue }}
+          columns={[
+            { title: OPS.colTask, dataIndex: "name" },
+            {
+              title: OPS.colNextRun,
+              dataIndex: "next_run_at",
+              width: 180,
+              render: (value: string) => formatDateTimeSeconds(value),
+            },
+            {
+              title: OPS.colOverdue,
+              dataIndex: "overdue_seconds",
+              width: 110,
+              render: (value: number) => formatDuration(value),
+            },
+            {
+              title: OPS.colLastFinished,
+              dataIndex: "last_finished_at",
+              width: 180,
+              render: (value: string | null) => formatDateTimeSeconds(value),
+            },
+          ]}
+        />
+      }
+    />
+  );
+
+  const coolingAccounts = (
+    <ResponsiveList<SchedulerCoolingAccount>
+      items={schedulerData?.cooling_accounts ?? []}
+      rowKey={(row) => `${row.owner_user_id}:${row.credential_id}`}
+      empty={<div className="empty-state__description">{OPS.emptyCooling}</div>}
+      renderCard={(row) => (
+        <>
+          <div className="mobile-card-list__row">
+            <Typography.Text code>{row.credential_id.slice(0, 8)}</Typography.Text>
+          </div>
+          <CardRow label={OPS.colOwner}>
+            <Typography.Text code>{row.owner_user_id.slice(0, 8)}</Typography.Text>
+          </CardRow>
+          <CardRow label={OPS.colCooldownReason}>{cooldownReasonText(row.reason)}</CardRow>
+          <CardRow label={OPS.colCooldownUntil}>{formatClock(row.until)}</CardRow>
+        </>
+      )}
+      table={
+        <Table<SchedulerCoolingAccount>
+          size="small"
+          rowKey={(row) => `${row.owner_user_id}:${row.credential_id}`}
+          pagination={false}
+          dataSource={schedulerData?.cooling_accounts ?? []}
+          locale={{ emptyText: OPS.emptyCooling }}
+          columns={[
+            {
+              title: OPS.colAccount,
+              dataIndex: "credential_id",
+              width: 140,
+              render: (value: string) => <Typography.Text code>{value.slice(0, 8)}</Typography.Text>,
+            },
+            {
+              title: OPS.colOwner,
+              dataIndex: "owner_user_id",
+              width: 140,
+              render: (value: string) => <Typography.Text code>{value.slice(0, 8)}</Typography.Text>,
+            },
+            {
+              title: OPS.colCooldownReason,
+              dataIndex: "reason",
+              render: (value: string | null) => cooldownReasonText(value),
+            },
+            {
+              title: OPS.colCooldownUntil,
+              dataIndex: "until",
+              width: 120,
+              render: (value: string) => formatClock(value),
+            },
+          ]}
+        />
+      }
+    />
+  );
+
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
       <PageHeader title="管理后台" />
@@ -162,6 +360,37 @@ export function OpsPage() {
       </SectionCard>
 
       <SectionCard title="公司列表">{tenantCards}</SectionCard>
+
+      <SectionCard title={OPS.schedulerCard} description={OPS.schedulerNote}>
+        <Space direction="vertical" size={16} style={{ width: "100%" }}>
+          {schedulerHealth.isError ? (
+            <Alert type="error" showIcon message={ERR.commonFailure} />
+          ) : null}
+          {diskLine ? (
+            <Alert
+              type={schedulerHealth.data?.disk.warning ? "warning" : "info"}
+              showIcon
+              message={diskLine}
+            />
+          ) : null}
+          <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <Typography.Text strong>{OPS.schedulerInstances}</Typography.Text>
+            {schedulerInstances}
+          </Space>
+          <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <Typography.Text strong>{OPS.workerNodes}</Typography.Text>
+            {workerNodes}
+          </Space>
+          <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <Typography.Text strong>{OPS.overdueTasks}</Typography.Text>
+            {overdueTasks}
+          </Space>
+          <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <Typography.Text strong>{OPS.coolingAccounts}</Typography.Text>
+            {coolingAccounts}
+          </Space>
+        </Space>
+      </SectionCard>
     </Space>
   );
 }

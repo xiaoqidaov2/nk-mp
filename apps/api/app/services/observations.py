@@ -22,6 +22,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import Settings
 from app.models import (
     ChangeEvent,
     EventType,
@@ -325,24 +326,38 @@ def _event(
     )
 
 
-def mark_failed_job_event(session: Session, tenant_id, job, store_id, error_code: str) -> None:
+def mark_failed_job_event(
+    session: Session,
+    settings: Settings,
+    tenant_id,
+    job,
+    store_id,
+    error_code: str,
+) -> None:
     """Record a store-level failure without pretending it is a stock change.
 
     Scan failures are personal diagnostics: they belong to the job's frozen
     owner and credential generation, never to another account.
+
+    ``settings.scan_failed_event_window_seconds`` 内的同一个 (账号, 门店, 原因)
+    只留一条：30 秒档 + 一个缺尺码的货号会让每家门店**每轮**都失败，不节流会把
+    变化流水刷成整页"检查失败"，真正的变化反而被埋掉。
     """
     owner_user_id = getattr(job, "owner_user_id", None)
     credential_id = getattr(job, "credential_id", None)
     credential_generation = getattr(job, "credential_generation", None)
+    window = int(settings.scan_failed_event_window_seconds)
+    #: 窗口 <= 0 时退回"每作业一条"的旧口径。
+    bucket = str(int(datetime.now(UTC).timestamp() // window)) if window > 0 else str(job.id)
     key = _payload_hash(
         [
             "SCAN_FAILED",
             str(owner_user_id),
             str(credential_id),
             str(credential_generation),
-            str(job.id),
             str(store_id),
             error_code,
+            bucket,
         ]
     )
     existing = session.execute(

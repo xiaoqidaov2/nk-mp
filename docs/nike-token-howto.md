@@ -98,3 +98,6 @@ python -m app.cli import-credential --user-id <平台用户 uuid> \
   --access-token-file jwt_latest.txt --refresh-token-file mp_refresh.txt
 ```
 （生产机：`docker compose exec -T api python -m app.cli import-credential …`；文件内容各一行。）
+
+一用户多账号时用 `--credential-id <credential 行 uuid>` 指明要更新哪个账号；不填且该用户已有
+多个账号时会拒绝执行（避免覆盖错行），没有账号则新建一条。
