@@ -361,7 +361,7 @@ def test_enterprise_robot_send_mints_a_token_and_posts_the_group_message(monkeyp
     )
 
 
-def test_first_time_arrival_rides_the_restock_switch() -> None:
+def test_first_time_arrival_rides_the_restock_switch(settings) -> None:
     """未铺货→有货（新上架）必须被推送，否则这类变化会被静默丢掉。"""
     on = MonitorTask(
         name="到货任务", store_codes=[], style_codes=[], all_stores=True,
@@ -371,8 +371,8 @@ def test_first_time_arrival_rides_the_restock_switch() -> None:
         name="关闭任务", store_codes=[], style_codes=[], all_stores=True,
         notify_on_restock=False, notify_on_sold_out=False, notify_on_price_change=False,
     )
-    assert push._notified_types(on) == ["RESTOCK", "NEW_ARRIVAL_AT_STORE"]
-    assert push._notified_types(off) == []
+    assert push._notified_types(on, settings) == ["RESTOCK", "NEW_ARRIVAL_AT_STORE"]
+    assert push._notified_types(off, settings) == []
 
 
 def test_message_keeps_arrival_rows_with_price() -> None:
@@ -394,12 +394,14 @@ def test_message_orders_arrival_before_sold_out() -> None:
     assert body.index("补货") < body.index("新上架") < body.index("售罄")
 
 
-def test_task_less_jobs_announce_every_change_category() -> None:
-    """手动检查 / 任务已删的补跑没有任务开关可依：四类真实变化都必须通知。"""
-    assert push._notified_types(None) == [
+def test_task_less_jobs_announce_the_default_categories(settings) -> None:
+    """手动检查 / 任务已删的补跑没有任务开关可依：按平台默认分类通知。
+
+    2026-10-15 客户要求「售空不要通知」后，售罄不再默认包含（其余三类照发）。
+    """
+    assert push._notified_types(None, settings) == [
         "RESTOCK",
         "NEW_ARRIVAL_AT_STORE",
-        "SOLD_OUT",
         "PRICE_CHANGE",
     ]
 
@@ -417,3 +419,104 @@ def test_detail_line_falls_back_to_the_store_code_and_keeps_long_names_bounded()
     line = push._detail_line(_event("RESTOCK", store_code="3402", display_name="店" * 80, after=699))
     assert "店" * push.STORE_LABEL_LIMIT in line
     assert "店" * (push.STORE_LABEL_LIMIT + 1) not in line
+
+
+def test_task_less_rounds_skip_sold_out_by_default(settings) -> None:
+    """无任务作业（手动「立即检查」）默认不提醒售罄（客户要求「售空不要通知」）。
+
+    补货/到店上新/变价照发；``push_sold_out_default=true`` 可改回全发。
+    """
+    assert push._notified_types(None, settings) == [
+        "RESTOCK",
+        "NEW_ARRIVAL_AT_STORE",
+        "PRICE_CHANGE",
+    ]
+    with_sold_out = Settings(credential_key="k", push_sold_out_default=True)
+    assert push._notified_types(None, with_sold_out) == [
+        "RESTOCK",
+        "NEW_ARRIVAL_AT_STORE",
+        "SOLD_OUT",
+        "PRICE_CHANGE",
+    ]
+
+
+def test_task_message_carries_a_link_to_the_task_page() -> None:
+    """机器人消息除了"查看变化流水"，还要能一键跳到该任务的监控详情。
+
+    客户反馈：点"查看"只能到流水，找不到是哪个任务在监控 → 任务作业追加一行
+    ``任务：{base}/tasks/{id}``；无任务作业（手动检查）没有这一行。
+    """
+    events = [_event("NEW_ARRIVAL_AT_STORE", size="42", store_code="3410", after=466.95)]
+    _title, body = push.build_message(
+        "新建监控任务 2",
+        events,
+        base_url="https://example.test",
+        task_id="11111111-2222-3333-4444-555555555555",
+    ) or ("", "")
+    lines = body.splitlines()
+    assert lines[-2] == "查看：https://example.test/changes"
+    assert lines[-1] == "任务：https://example.test/tasks/11111111-2222-3333-4444-555555555555"
+
+    # 无任务作业：只有流水链接，不出现 任务： 行。
+    _title, plain = push.build_message("门店检查", events, base_url="https://example.test") or ("", "")
+    assert "任务：" not in plain
+    assert plain.splitlines()[-1] == "查看：https://example.test/changes"
+
+
+def test_dingtalk_markdown_body_doubles_single_newlines() -> None:
+    """钉钉 markdown 会吃掉单换行：群机器人与企业机器人都必须补成两个换行。
+
+    客户实测：库里正文是 `补货 1 条\n· 货号 …\n查看：…`，钉钉群里收到的是一整行。
+    """
+    body = "补货 1 条\n· DV5477-008 37.5 3999·门店 有货 ¥219.45\n查看：https://x/changes"
+    assert push._markdown_body(body) == body.replace("\n", "\n\n")
+
+    # 已经是空行（\n\n）的不再重复补；CRLF 先归一。
+    assert push._markdown_body("a\n\nb\r\nc") == "a\n\nb\n\nc"
+    # text 类渠道不变：custom/bark 仍按单换行发送。
+    assert push._markdown_body("单行") == "单行"
+
+
+def test_dingtalk_webhook_and_app_send_markdown_with_blank_lines(monkeypatch) -> None:
+    """两条钉钉发送路径都使用补过空行的正文（群机器人走 apprise，企业机器人走 msgParam）。"""
+    sent: list[dict] = []
+
+    class _FakeApprise:
+        def add(self, _target):  # noqa: ANN001, ANN202
+            return True
+
+        def notify(self, **kwargs):  # noqa: ANN003, ANN202
+            sent.append(kwargs)
+            return True
+
+    monkeypatch.setattr(push.apprise, "Apprise", _FakeApprise)
+    webhook = push.build_target("dingtalk", {"access_token": "tok"})
+    assert push.send_now(webhook, "标题", "第一行\n第二行", _settings(push_timeout_seconds=3)) == (
+        True,
+        None,
+    )
+    assert sent[-1]["body"] == "第一行\n\n第二行"
+
+    calls: list[dict] = []
+
+    class _Resp:
+        def __init__(self, status: int, payload: dict) -> None:
+            self.status_code = status
+            self._payload = payload
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_post(url, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        calls.append({"url": url, **kwargs})
+        if url == push.DINGTALK_TOKEN_URL:
+            return _Resp(200, {"accessToken": "tok-123"})
+        return _Resp(200, {})
+
+    monkeypatch.setattr(push.httpx, "post", fake_post)
+    app_target = push.build_target(
+        "dingtalk_app",
+        {"robot_code": "ding", "robot_secret": "s", "conversation_id": "cid"},
+    )
+    assert push.send_now(app_target, "标题", "第一行\n第二行", _settings()) == (True, None)
+    assert '"text": "第一行\\n\\n第二行"' in calls[1]["json"]["msgParam"]

@@ -390,20 +390,27 @@ def _detail_line(event: ChangeEvent) -> str:
 
 
 def build_message(
-    task_name: str, events: list[ChangeEvent], *, base_url: str
+    task_name: str,
+    events: list[ChangeEvent],
+    *,
+    base_url: str,
+    task_id: str | None = None,
 ) -> tuple[str, str] | None:
     """Aggregate one task's notified events into a single message.
 
     Format is frozen: the category order is 补货/新上架/售罄/变价, each category shows
     at most ``DETAIL_LIMIT`` lines, and when a category keeps back rows the
-    footer counts them and links to the changes page. A body longer than
-    ``BODY_LIMIT`` characters is truncated whole-line by whole-line from the
-    tail, never losing the ``查看：`` link. No events means no message.
+    footer counts them and links to the changes page. 任务作业额外带一条
+    ``任务：`` 链接，手机上一键跳到该任务的监控详情（无任务作业没有这一行）。
+    A body longer than ``BODY_LIMIT`` characters is truncated whole-line by
+    whole-line from the tail, never losing the footer links. No events means
+    no message.
     """
     if not events:
         return None
     title = f"【库存提醒】{task_name[:40]}"
     changes_url = f"{base_url}/changes"
+    task_url = f"{base_url}/tasks/{task_id}" if task_id else ""
     entries: list[str] = []
     for event_type, label in _CATEGORIES:
         rows = [event for event in events if event.event_type == event_type]
@@ -420,7 +427,10 @@ def build_message(
             if shown < total
             else f"查看：{changes_url}"
         )
-        return "\n".join([*kept, footer])
+        lines = [*kept, footer]
+        if task_url:
+            lines.append(f"任务：{task_url}")
+        return "\n".join(lines)
 
     while entries and len(render(entries)) > BODY_LIMIT:
         entries.pop()
@@ -496,7 +506,9 @@ def _send_dingtalk_app(
     payload: dict[str, object] = {
         "robotCode": robot_code,
         "msgKey": "sampleMarkdown",
-        "msgParam": json.dumps({"title": title, "text": body}, ensure_ascii=False),
+        "msgParam": json.dumps(
+            {"title": title, "text": _markdown_body(body)}, ensure_ascii=False
+        ),
     }
     if is_dm:
         payload["userIds"] = [user_id]
@@ -521,12 +533,26 @@ def _send_dingtalk_app(
     return True, None
 
 
+def _markdown_body(body: str) -> str:
+    """钉钉的 markdown 渲染会把**单换行**吃掉：每个换行补成两个（已有的空行不重复补）。
+
+    客户实测：库里正文是 ``补货 1 条\n· 货号 …\n查看：…``，钉钉群里收到却是一整行。
+    text 类渠道（自定义 webhook / 邮件 / bark）保持单换行，不在这里改。
+    """
+    text = body.replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"(?<!\n)\n(?!\n)", "\n\n", text)
+
+
 def send_now(
     target: str, title: str, body: str, settings: Settings
 ) -> tuple[bool, str | None]:
     """Send one message now; returns ``(ok, error_code)`` with fixed codes."""
-    if urlsplit(target).scheme.lower() == "dingtalkapp":
+    scheme = urlsplit(target).scheme.lower()
+    if scheme == "dingtalkapp":
         return _send_dingtalk_app(target, title, body, settings)
+    if scheme == "dingtalk":
+        # 群机器人走 ``?format=markdown``（见 build_target）：正文按 markdown 换行规则补空行。
+        body = _markdown_body(body)
     apobj = apprise.Apprise()
     if not apobj.add(target):
         return False, PUSH_TARGET_INVALID
@@ -545,16 +571,21 @@ def send_now(
     return False, PUSH_DELIVERY_FAILED
 
 
-def _notified_types(task: MonitorTask | None) -> list[str]:
+def _notified_types(task: MonitorTask | None, settings: Settings) -> list[str]:
     """Return the change types a job's events should announce.
 
     Task-less jobs (manual "立即检查" rounds, retries spawned after the task was
     deleted) have no per-task switches to honour. Returning nothing for them
-    silently dropped every real change they detected, so they announce all
-    four categories instead.
+    silently dropped every real change they detected, so they announce the
+    categories instead — 其中**售罄默认不发**（客户要求「售空不要通知」，
+    设 ``push_sold_out_default=true`` 可改回）。定时任务按任务自己的开关。
     """
     if task is None:
-        return [event_type for event_type, _ in _CATEGORIES]
+        return [
+            event_type
+            for event_type, _ in _CATEGORIES
+            if event_type != EventType.SOLD_OUT.value or settings.push_sold_out_default
+        ]
     return [
         event_type
         for event_type, enabled in (
@@ -663,7 +694,7 @@ def enqueue_for_job(session: Session, settings: Settings, job: ScanJob) -> int:
     merged_tasks = [item for item in merged_tasks if item is not None]
     if merged_tasks:
         for item in merged_tasks:
-            types = set(_notified_types(item))
+            types = set(_notified_types(item, settings))
             if not types:
                 continue
             style_ids = _task_style_ids(session, item)
@@ -675,16 +706,22 @@ def enqueue_for_job(session: Session, settings: Settings, job: ScanJob) -> int:
                 and (not style_ids or event.style_id in style_ids)
                 and (not sizes or event.size_label in sizes)
             ]
-            message = build_message(item.name, subset, base_url=settings.public_base_url)
+            message = build_message(
+                item.name,
+                subset,
+                base_url=settings.public_base_url,
+                task_id=str(item.id),
+            )
             if message is not None:
                 pending.append((item, message[0], message[1]))
     else:
-        types = _notified_types(task)
+        types = _notified_types(task, settings)
         if types:
             message = build_message(
                 task.name if task is not None else TASK_LESS_TITLE,
                 [event for event in events if event.event_type in types],
                 base_url=settings.public_base_url,
+                task_id=str(task.id) if task is not None else None,
             )
             if message is not None:
                 pending.append((task, message[0], message[1]))
