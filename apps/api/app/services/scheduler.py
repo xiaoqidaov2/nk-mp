@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.models import JobStatus, MonitorTask, ScanJob, Store, Tenant, User
-from app.services import throttle
+from app.services import quiet_hours, throttle
 from app.services.credentials import CredentialBinding, CredentialService, pick_ready
 from app.services.jobs import enqueue_job
 from app.services.stores import clearance_filter
@@ -87,6 +87,11 @@ def _next_run_at(cadence_seconds: int, jitter_seconds: float, key: str | None = 
     return _EPOCH + timedelta(seconds=slot * interval + offset)
 
 
+def _effective_cadence(settings: Settings, cadence_seconds: int) -> int:
+    """夜间窗口内拉长后的实际间隔（窗口外等于原间隔）。"""
+    return quiet_hours.interval(settings, cadence_seconds)
+
+
 def _active_job_for(session: Session, task: MonitorTask) -> ScanJob | None:
     """该任务是否已有排队/运行中的作业（含"合并采集"作业：它把任务 id 记在 task_ids 里）。"""
     return session.execute(
@@ -137,6 +142,14 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
     if not tasks:
         return 0
 
+    def _next_for(task: MonitorTask) -> datetime:
+        """该任务的下一次到期时刻（夜间窗口内自动拉长间隔）。"""
+        return _next_run_at(
+            _effective_cadence(settings, task.cadence_seconds),
+            settings.dispatch_jitter_seconds,
+            key=_clock_key(task),
+        )
+
     #: 每个 owner 本轮只选一次号（同一拍内该 owner 的任务共用同一个账号）。
     picks: dict = {}
     #: owner 不可用时的恢复时刻缓存（没有冷却记录 = 下一轮网格）。
@@ -168,14 +181,10 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
                 superseded[str(task.id)] = active
             else:
                 # Keep the cadence moving without stacking duplicate scans.
-                task.next_run_at = _next_run_at(
-                    task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
-                )
+                task.next_run_at = _next_for(task)
                 continue
         if not task.style_codes or task.created_by is None:
-            task.next_run_at = _next_run_at(
-                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
-            )
+            task.next_run_at = _next_for(task)
             continue
 
         user = session.execute(
@@ -191,9 +200,7 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             or tenant is None
             or not tenant.is_active
         ):
-            task.next_run_at = _next_run_at(
-                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
-            )
+            task.next_run_at = _next_for(task)
             continue
 
         record = pick_for(task.created_by)
@@ -201,9 +208,7 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
             # 冷却是账号级的：全部账号都不可用时暂停到最早一个冷却结束；
             # 没有冷却记录（例如账号被断开）时按下一轮节奏再试。无兜底账号。
             until = resume_at(task.created_by)
-            task.next_run_at = until if until is not None else _next_run_at(
-                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
-            )
+            task.next_run_at = until if until is not None else _next_for(task)
             continue
         binding = CredentialBinding(
             owner_user_id=task.created_by,
@@ -228,9 +233,7 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
                 ).scalars()
             )
         if not store_codes:
-            task.next_run_at = _next_run_at(
-                task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(task)
-            )
+            task.next_run_at = _next_for(task)
             continue
         ready.append((task, binding, store_codes))
 
@@ -255,9 +258,7 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
         first_task, binding, store_codes = entries[0]
         if len(entries) == 1 and str(first_task.id) in superseded:
             # 只有一个任务、且它已有排队作业 → 保留原作业（重复派发等于把扫描频率翻倍）。
-            first_task.next_run_at = _next_run_at(
-                first_task.cadence_seconds, settings.dispatch_jitter_seconds, key=_clock_key(first_task)
-            )
+            first_task.next_run_at = _next_for(first_task)
             continue
         styles: list[str] = []
         for task, _binding, _stores in entries:
@@ -297,10 +298,7 @@ def dispatch_due_tasks(session: Session, settings: Settings) -> int:
                         error_summary="已并入合并采集作业",
                     )
                 )
-        group_key = _clock_key(first_task)
-        next_at = _next_run_at(
-            first_task.cadence_seconds, settings.dispatch_jitter_seconds, key=group_key
-        )
+        next_at = _next_for(first_task)
         for task, _binding, _stores in entries:
             task.next_run_at = next_at
             dispatched += 1

@@ -157,6 +157,7 @@ def enter(
     credential_id,
     reason: str,
     resume_at: datetime | None = None,
+    notify: bool = True,
 ) -> datetime | None:
     """Record (or extend) the account cooldown and queue one notice.
 
@@ -196,8 +197,9 @@ def enter(
     record.cooldown_until = until
 
     notified = record.cooldown_notified_at
-    if notified is None or (
-        (now - notified).total_seconds() >= settings.throttle_notice_interval_seconds
+    if notify and (
+        notified is None
+        or (now - notified).total_seconds() >= settings.throttle_notice_interval_seconds
     ):
         queued = push.enqueue_system_notification(
             session,

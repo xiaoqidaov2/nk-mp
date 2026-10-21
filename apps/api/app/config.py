@@ -127,6 +127,17 @@ class Settings(BaseSettings):
     throttle_backoff_seconds: str = "300,900,1800,3600"
     #: 同类冷却通知的最小间隔（秒）；默认 8 小时 => 每 24 小时最多 3 条。
     throttle_notice_interval_seconds: int = 28800
+    # ---- 夜间降速窗口（北京时间；见 services/quiet_hours.py）----
+    #: 开关：窗口内按比例压低小时额度并拉长任务间隔（避免深夜流量像异常账号）。
+    quiet_hours_enabled: bool = True
+    #: 最慢窗口起点（0 = 凌晨 0 点）。
+    quiet_hours_slow_from_hour: int = 0
+    #: 最慢窗口终点（4 = 凌晨 4 点开始线性恢复）。
+    quiet_hours_slow_until_hour: int = 4
+    #: 恢复终点（6 = 凌晨 6 点回到正常速度）。
+    quiet_hours_recover_until_hour: int = 6
+    #: 最慢窗口的速度比例：0.25 = 间隔 ×4、小时额度 ×25%。
+    quiet_hours_slow_factor: float = 0.25
     #: 405 挑战风暴熔断：一轮里这么多家门店被 WAF 挑战打满重试就整轮结束并进入冷却。
     #: 实际阈值 = max(本值, ceil(0.15 × 本轮门店数))（需求 D-NFR-RATE-06 的 15% 健康线）；
     #: 本值是**下限**，0 = 关闭熔断。

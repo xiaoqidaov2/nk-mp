@@ -141,6 +141,24 @@ def test_notices_are_gated_by_the_interval() -> None:
         assert len(db.execute(select(NotificationDelivery)).scalars().all()) == 2
 
 
+def test_quiet_window_cooldowns_stay_silent() -> None:
+    """夜间降速窗口内的额度撞闸是计划内降速：写入冷却但不推送。"""
+    settings, owner_id, credential_id = _seed_owner()
+    with SessionLocal() as db:
+        throttle.enter(
+            db,
+            settings,
+            credential_id=credential_id,
+            reason=throttle.HOURLY_REASON,
+            notify=False,
+        )
+        db.commit()
+        assert db.execute(select(NotificationDelivery)).scalars().all() == []
+        record = _record(db, owner_id)
+        assert record.cooldown_until is not None
+        assert record.cooldown_notified_at is None
+
+
 def test_clear_resets_the_ladder_but_keeps_an_active_window() -> None:
     settings, owner_id, credential_id = _seed_owner(with_channel=False)
     with SessionLocal() as db:

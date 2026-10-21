@@ -38,7 +38,7 @@ from app.models import (
 from app.nike.client import NikeClient, NikeTransportError, upstream_stats
 from app.nike.errors import ErrorCode, ScanError
 from app.services import heartbeat as heartbeat_service
-from app.services import push, throttle
+from app.services import push, quiet_hours, throttle
 from app.services.credentials import (
     CredentialBinding,
     CredentialError,
@@ -425,6 +425,7 @@ def run_job(session: Session, settings: Settings, job: ScanJob, worker_id: str |
             tenant_budget,
             settings.quota_hourly_cap,
             settings.quota_hourly_slow_line,
+            cap_scale=lambda: quiet_hours.factor(settings),
         )
 
         max_gap_seconds = settings.baseline_max_gap_seconds
@@ -791,7 +792,13 @@ def _abort_limited(
             )
         resume_at = quota.resume_at() if reason in throttle.BUDGET_REASONS else None
         throttle.enter(
-            session, settings, credential_id=job.credential_id, reason=reason, resume_at=resume_at
+            session,
+            settings,
+            credential_id=job.credential_id,
+            reason=reason,
+            resume_at=resume_at,
+            # 夜间窗口内的额度撞闸是计划内降速：不推送"已自动降速"，免得半夜吵人。
+            notify=not quiet_hours.active(settings),
         )
     _finalize(session, settings, job, JobStatus.FAILED.value, code, worker_id)
 
@@ -870,7 +877,12 @@ def _finalize(
     task = tasks[0] if tasks else None
     now = datetime.now(UTC)
     for item in tasks:
-        next_run_at = now + timedelta(seconds=item.cadence_seconds)
+        cadence = (
+            quiet_hours.interval(settings, item.cadence_seconds, now)
+            if settings is not None
+            else int(item.cadence_seconds)
+        )
+        next_run_at = now + timedelta(seconds=cadence)
         if pause is not None and pause.until > next_run_at:
             # 全部账号都在冷却：任务暂停到最早一个窗口结束，到点由调度器自动继续。
             next_run_at = pause.until

@@ -10,6 +10,7 @@ the counters are read ``FOR UPDATE`` so concurrent workers cannot overshoot.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TypeVar
@@ -86,12 +87,15 @@ class QuotaGuard:
         tenant_budget: int,
         hourly_cap: int = 900,
         hourly_slow_line: int = 600,
+        cap_scale: Callable[[], float] | None = None,
     ) -> None:
         self.tenant_id = tenant_id
         self.global_budget = global_budget
         self.tenant_budget = tenant_budget
         self.hourly_cap = hourly_cap
         self.hourly_slow_line = hourly_slow_line
+        #: 小时上限的实时缩放（夜间降速窗口）；每次记账前求值，跨窗口边界自动生效。
+        self._cap_scale = cap_scale or (lambda: 1.0)
         #: 最近一次被哪个闸拒绝（tenant_budget / platform_daily_budget /
         #: platform_hourly_budget）；job 用它决定冷却原因与恢复时刻。
         self.last_rejection: str | None = None
@@ -146,7 +150,7 @@ class QuotaGuard:
             platform_day_total=int(day_row.transactions),
             platform_day_budget=self.global_budget,
             platform_hour_total=int(hour_row.transactions),
-            platform_hour_budget=self.hourly_cap,
+            platform_hour_budget=max(1, int(self.hourly_cap * self._cap_scale())),
         )
         return snapshot, hour_row, day_row, tenant_row
 

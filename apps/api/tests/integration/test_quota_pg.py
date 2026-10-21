@@ -76,6 +76,22 @@ def test_hourly_cap_blocks_before_the_daily_limit(tenants) -> None:
         assert db.execute(select(PlatformUsageHourly)).scalar_one().transactions == 2
 
 
+def test_hourly_cap_scales_with_the_night_window(tenants) -> None:
+    """夜间降速：小时上限按比例压低（8 × 0.25 = 2 次）。"""
+    guard = QuotaGuard(
+        tenants["b"],
+        global_budget=1000,
+        tenant_budget=1000,
+        hourly_cap=8,
+        cap_scale=lambda: 0.25,
+    )
+    with SessionLocal() as db:
+        assert guard.consume_transaction(db) is True
+        assert guard.consume_transaction(db) is True
+        assert guard.consume_transaction(db) is False
+        assert guard.last_rejection == "platform_hourly_budget"
+
+
 def test_concurrent_consumers_never_exceed_the_budget(tenants) -> None:
     budget = 10
     successes: list[int] = []

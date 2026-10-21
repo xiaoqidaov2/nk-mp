@@ -27,7 +27,7 @@ from app.models import (
 from app.security import encrypt_secret, secret_fingerprint
 from app.services import push
 from app.services.credentials import CredentialService, refresh_expiring
-from app.services.scheduler import dispatch_due_tasks
+from app.services.scheduler import _effective_cadence, dispatch_due_tasks
 
 from .helpers import make_store, make_style, make_tenant, make_user, store_credential
 
@@ -307,6 +307,34 @@ def test_permanent_rejection_queues_a_reauth_notice(monkeypatch) -> None:
     assert CredentialService(settings, user_id).try_refresh(force=True) is False
     with SessionLocal() as db:
         assert len(db.execute(select(NotificationDelivery)).scalars().all()) == 1
+
+
+def test_night_window_stretches_the_next_run(monkeypatch) -> None:
+    """夜间降速：派发后的下一轮按 1/factor 拉长（30 秒档 → 2 分钟）。"""
+    settings = get_settings()
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email="night@example.com")
+        make_store(db, owner=user, code="S1", region_id="R1")
+        make_style(db, owner=user, code="DN3707-202")
+        task = _make_task(db, tenant.id, created_by=user.id)
+        task.cadence_seconds = 30
+        db.commit()
+        task_id, user_id = task.id, user.id
+    store_credential(settings, user_id)
+
+    monkeypatch.setattr("app.services.quiet_hours.factor", lambda *_args, **_kw: 0.25)
+    assert _effective_cadence(settings, 30) == 120
+    started = datetime.now(UTC)
+    with SessionLocal() as db:
+        assert dispatch_due_tasks(db, settings) == 1
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.get(MonitorTask, task_id)
+        assert task.next_run_at is not None
+        # 网格对齐：下一轮落在 (now, now + 120s] 内，不会更早也不会更晚。
+        assert started < task.next_run_at <= started + timedelta(seconds=121)
 
 
 def test_cooling_account_is_not_dispatched_until_the_window_ends() -> None:

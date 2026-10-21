@@ -88,6 +88,26 @@
 - 日志：`nike_mp.throttle`（cooldown entered / notice queued）、`nike_mp.quota`（quota rejected）、
   `nike_mp.jobs`（scheduled retry ...）。
 
+## 夜间降速（北京时间 0–4 点最慢、4–6 点线性恢复）
+
+深夜没有业务收益，却会让上游看到一个"作息异常"的账号——这是风控最容易盯上的形态。
+窗口内用**同一个比例**同时压低两个旋钮，避免整点台阶式的流量突变：
+
+| 时段（北京） | 比例 | 实际效果（默认 `slow_factor=0.25`） |
+|---|---|---|
+| 00:00–04:00 | 0.25 | 任务间隔 ×4、平台小时额度 ×25% |
+| 04:00–06:00 | 0.25 → 1.0 线性 | 05:00 时约 0.625：间隔 ×1.6、额度 ×62.5% |
+| 其他时段 | 1.0 | 正常 |
+
+- 实现：`services/quiet_hours.py::factor()` 是唯一真值来源；调度器（`_effective_cadence`）
+  与作业收尾（`_finalize`）用它拉长下一轮间隔，`QuotaGuard(cap_scale=...)` 用它压低小时上限。
+- **窗口内额度撞闸属于计划内降速**：仍写冷却、仍按窗口恢复，但**不推送**"检查已自动降速"
+  （`throttle.enter(..., notify=False)`），避免半夜吵人。
+- 关闭：`NIKE_MP_QUIET_HOURS_ENABLED=false`；改窗口：`..._SLOW_FROM_HOUR` / `..._SLOW_UNTIL_HOUR` /
+  `..._RECOVER_UNTIL_HOUR` / `..._SLOW_FACTOR`（0<factor≤1）。
+- 观测：`SELECT cooldown_until, cooldown_reason FROM credential;` + worker 日志
+  `quota rejected upstream request (platform_hourly_budget)`（窗口内是预期行为）。
+
 ## 失败门店自动补跑
 
 作业结束时（`jobs._finalize`）满足以下**全部**条件才创建补跑作业：
