@@ -17,6 +17,7 @@ from app.db import SessionLocal
 from app.services import monitor
 from app.services.heartbeat import heartbeat as write_heartbeat
 from app.services.process_identity import process_id
+from app.services.retention import prune_idle_slice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("nike_mp.monitor")
@@ -48,6 +49,13 @@ def main() -> None:
             pruned = monitor.prune_stale_heartbeats(session, settings)
             if pruned:
                 logger.info("pruned %s stale heartbeat row(s)", pruned)
+            # 观测历史按 key 分片滚动清理：worker 只在空闲时跑，作业满载就永远轮不到
+            # （2026-10-21 生产事故：62M 行 / 23GB，磁盘打满）。monitor 是单实例，
+            # 每拍推进两片，保证清理速度不依赖 worker 空闲。
+            for _ in range(2):
+                removed = prune_idle_slice(keep=settings.observation_history_limit)
+                if removed:
+                    logger.info("pruned %s observation row(s)", removed)
             stale = [item["instance_id"] for item in report["scheduler"] if not item["alive"]]
             if not report["scheduler"]:
                 logger.warning("scheduler health: no scheduler instance has ever reported")
