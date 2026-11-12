@@ -135,3 +135,51 @@ def test_retention_slice_never_touches_a_job_transaction() -> None:
         # 调用方事务依然可用
         assert db.execute(text("SELECT 1")).scalar_one() == 1
     assert deleted >= 0
+
+
+def test_slice_is_row_bounded_so_it_always_finishes() -> None:
+    """单片必须有行数上限：积压时整片超时 → 回滚 → 游标不前进 → 永久卡死（两次磁盘写满）。"""
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email=f"bounded-{uuid.uuid4().hex[:8]}@example.com")
+        store = make_store(db, owner=user, code="SB", name="NIKE有界店")
+        style = make_style(db, owner=user, code="DN3707-202")
+        for size in ("41", "42", "43"):
+            _seed_observations(db, owner=user, store=store, style=style, size_label=size, count=100)
+        db.commit()
+
+        # 3 个 key、每片 2 个 key：删满 50 行就返回，游标停在切片最后一个 key 上，
+        # 下一次从这里继续——单片一定能跑完，游标一定前进。
+        deleted, cursor = prune_observation_slice(db, keep=5, keys=2, max_rows=50)
+        db.commit()
+        assert deleted == 50
+        assert cursor is not None
+        assert cursor[0] == store.id
+        remaining = db.execute(select(func.count()).select_from(Observation)).scalar_one()
+        assert remaining == 250
+
+
+def test_sweep_oldest_bounds_the_table_without_a_cursor() -> None:
+    """硬上限兜底：按最旧优先删固定行数，不依赖 per-key 游标。"""
+    from app.services.retention import observation_stats, sweep_oldest
+
+    with SessionLocal() as db:
+        tenant = make_tenant(db)
+        user = make_user(db, tenant, email=f"sweep-{uuid.uuid4().hex[:8]}@example.com")
+        store = make_store(db, owner=user, code="SS", name="NIKE兜底店")
+        style = make_style(db, owner=user, code="DN3707-202")
+        _seed_observations(db, owner=user, store=store, style=style, size_label="43", count=30)
+        db.commit()
+        oldest = db.execute(select(Observation.id).order_by(Observation.id).limit(1)).scalar_one()
+        total_before = db.execute(select(func.count()).select_from(Observation)).scalar_one()
+
+    removed = sweep_oldest(rows=10)
+    assert removed == 10
+    with SessionLocal() as db:
+        assert db.execute(select(func.count()).select_from(Observation)).scalar_one() == total_before - 10
+        assert db.get(Observation, oldest) is None
+
+    with SessionLocal() as db:
+        size_bytes, rows = observation_stats(db)
+        assert size_bytes > 0
+        assert rows >= 0

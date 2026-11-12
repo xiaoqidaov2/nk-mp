@@ -17,7 +17,7 @@ from app.db import SessionLocal
 from app.services import monitor
 from app.services.heartbeat import heartbeat as write_heartbeat
 from app.services.process_identity import process_id
-from app.services.retention import prune_idle_slice
+from app.services.retention import observation_stats, prune_idle_slice, sweep_oldest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("nike_mp.monitor")
@@ -56,6 +56,21 @@ def main() -> None:
                 removed = prune_idle_slice(keep=settings.observation_history_limit)
                 if removed:
                     logger.info("pruned %s observation row(s)", removed)
+            # 硬上限兜底：per-key 清理在积压时可能整片超时、游标永不前进（两次磁盘写满
+            # 都是这个原因）。这里按最旧优先删，保证表体量与磁盘占用有硬上限。
+            size_bytes, _rows = observation_stats(session)
+            if size_bytes > settings.observation_max_bytes:
+                logger.warning(
+                    "observation table is %.1fGB (limit %.1fGB); sweeping oldest rows",
+                    size_bytes / 1024**3,
+                    settings.observation_max_bytes / 1024**3,
+                )
+                for _ in range(3):
+                    if not sweep_oldest(rows=settings.observation_sweep_rows):
+                        break
+                    size_bytes, _rows = observation_stats(session)
+                    if size_bytes <= settings.observation_max_bytes:
+                        break
             stale = [item["instance_id"] for item in report["scheduler"] if not item["alive"]]
             if not report["scheduler"]:
                 logger.warning("scheduler health: no scheduler instance has ever reported")

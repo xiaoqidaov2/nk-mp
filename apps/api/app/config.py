@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     dispatch_merge_window_seconds: float = 90.0
     #: 每个 (门店, 货号, 尺码) 保留的历史观测条数：间隔小、量大，历史只用于回溯。
     observation_history_limit: int = 30
+    #: 观测表硬上限（字节）：超过就按最旧优先删除，保证磁盘不会被填满（默认 6GB）。
+    observation_max_bytes: int = 6442450944
+    #: 硬上限兜底每拍删除的行数。
+    observation_sweep_rows: int = 50000
     #: 同一 (用户, 账号, 门店, 原因) 的「检查失败」诊断事件的最小间隔（秒）。
     #: 30 秒档 + 一个缺尺码的货号会让每家门店每轮都失败：不节流会把变化流水
     #: 刷成整页"检查失败"，真正的补货/售罄反而被埋掉。0 = 每作业一条（旧口径）。

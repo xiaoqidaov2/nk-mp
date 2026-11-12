@@ -27,6 +27,8 @@ logger = logging.getLogger("nike_mp.retention")
 
 #: 每片处理多少个 key（key 少 → 每片代价小；key 多 → 一轮更快）。
 SLICE_KEYS = 200
+#: 单片最多删除多少行：积压时单片也不至于跑不完（跑不完 = 超时回滚 = 游标不前进 = 永久卡死）。
+SLICE_ROWS = 20000
 #: CLI 一次性清理时的每片 key 数（大一些更快）。
 CLI_SLICE_KEYS = 1000
 
@@ -50,14 +52,20 @@ _SLICE = text(
                  ORDER BY o.checked_at DESC, o.id DESC
                  OFFSET :keep - 1 LIMIT 1) AS cutoff
         FROM keys k
+    ), victims AS (
+        SELECT o.id
+        FROM observation o
+        JOIN cutoffs c
+          ON o.store_id = c.store_id
+         AND o.style_id = c.style_id
+         AND o.size_label = c.size_label
+        WHERE c.cutoff IS NOT NULL
+          AND o.checked_at < c.cutoff
+        LIMIT :max_rows
     )
     DELETE FROM observation o
-    USING cutoffs c
-    WHERE o.store_id = c.store_id
-      AND o.style_id = c.style_id
-      AND o.size_label = c.size_label
-      AND c.cutoff IS NOT NULL
-      AND o.checked_at < c.cutoff
+    USING victims v
+    WHERE o.id = v.id
     """
 )
 
@@ -69,6 +77,7 @@ def prune_observation_slice(
     owner_user_id: UUID | None = None,
     keys: int = SLICE_KEYS,
     after: tuple | None = None,
+    max_rows: int = SLICE_ROWS,
 ) -> tuple[int, tuple | None]:
     """清理一小片 key 的历史，返回 ``(删除行数, 下一片游标)``。
 
@@ -83,6 +92,7 @@ def prune_observation_slice(
             "owner": owner_user_id,
             "keep": keep,
             "keys": keys,
+            "max_rows": max(1, int(max_rows)),
             "after_store": after_store,
             "after_style": after_style,
             "after_size": after_size,
@@ -129,7 +139,7 @@ _cursor: tuple | None = None
 
 
 #: 单片的时间/锁上限：历史表很大时单片可能很慢，宁可跳过也不能拖慢其它工作。
-SLICE_TIMEOUT_MS = 3000
+SLICE_TIMEOUT_MS = 15000
 LOCK_TIMEOUT_MS = 500
 
 
@@ -158,6 +168,55 @@ def prune_idle_slice(*, keep: int, owner_user_id: UUID | None = None) -> int:
         logger.debug("retention slice skipped: %s", exc.__class__.__name__)
         return 0
     _cursor = next_cursor
+    return deleted
+
+
+#: 观测表硬上限检查：表有多大（字节）/ 有多少行。
+_STATS = text(
+    """
+    SELECT pg_total_relation_size('observation')::bigint,
+           (SELECT reltuples::bigint FROM pg_class WHERE relname = 'observation')
+    """
+)
+
+
+def observation_stats(session: Session) -> tuple[int, int]:
+    """``(表字节数, 估算行数)``；用 catalog 计数，避免全表扫描。"""
+    row = session.execute(_STATS).first()
+    if row is None:  # pragma: no cover - catalog always answers
+        return 0, 0
+    return int(row[0] or 0), max(0, int(row[1] or 0))
+
+
+def sweep_oldest(*, rows: int = 50000) -> int:
+    """硬上限兜底：删掉**最旧**的一批行（按 id 顺序），返回删除行数。
+
+    为什么需要它：per-key 保留策略在积压时会因为"单片跑不完 → 超时 → 游标不前进"
+    永久卡住（2026-10-21 与 2026-11-13 两次把磁盘写满）。这个兜底不依赖游标，
+    每拍删固定行数，保证表的体量有硬上限。
+    """
+    from app.db import SessionLocal
+
+    try:
+        with SessionLocal() as session:
+            session.execute(text(f"SET LOCAL statement_timeout = '{SLICE_TIMEOUT_MS}ms'"))
+            session.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
+            result = session.execute(
+                text(
+                    """
+                    DELETE FROM observation
+                     WHERE id IN (SELECT id FROM observation ORDER BY id LIMIT :rows)
+                    """
+                ),
+                {"rows": max(1, int(rows))},
+            )
+            deleted = int(result.rowcount or 0)
+            session.commit()
+    except Exception:  # noqa: BLE001 - 兜底清理失败只跳过这一拍
+        logger.debug("retention sweep skipped", exc_info=True)
+        return 0
+    if deleted:
+        logger.info("swept %s oldest observation row(s)", deleted)
     return deleted
 
 
